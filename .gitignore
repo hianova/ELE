@@ -1,0 +1,10 @@
+*.DS_Store
+build/
+*.o
+*.a
+*.so
+*.dylib
+*.ll
+*.bc
+*.out
+.agents/

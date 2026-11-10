@@ -1,0 +1,35 @@
+name: CI
+
+on:
+  push:
+    branches: [ main, "feat/**", "refactor/**" ]
+    tags: [ "v*" ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  verify-ele:
+    name: C17, Bare-Metal RV32IMAC, LLVM IR & RTL Gate (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ ubuntu-latest, macos-latest ]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Toolchain (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang llvm clang-format verilator
+
+      - name: Ensure Homebrew LLVM (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          brew list llvm >/dev/null 2>&1 || brew install llvm
+
+      - name: Format, Cross-Compile RV32IMAC & Run All Verification Gates
+        run: |
+          make fmt-check
+          make clean && make all && make test
