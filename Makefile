@@ -22,8 +22,8 @@ CFLAGS ?= -std=c17 -Wall -Wextra -Wpedantic -Wmissing-prototypes -Werror -O3
 override CFLAGS += -Iinclude
 
 RV32_FLAGS := --target=riscv32-unknown-none-elf -march=rv32imac -mabi=ilp32 \
-              -ffreestanding -nostdlib -fno-builtin -O3 -Wall -Wextra -Werror \
-              -Iinclude -DELE_BARE_METAL_MMIO=1
+              -ffreestanding -nostdlib -fno-builtin -fno-stack-protector \
+              -O3 -Wall -Wextra -Werror -Iinclude -DELE_BARE_METAL_MMIO=1
 
 BUILD_DIR := build
 LIBELE_A := $(BUILD_DIR)/libele.a
@@ -70,7 +70,7 @@ fmt-check:
 test: $(TEST_BIN) $(RV32_OBJ) $(CORE_LL)
 	@echo "=== [Gate 0] Bare-Metal RISC-V (RV32IMAC) Cross-Compile & Zero-Symbol Verification ==="
 	@$(OBJDUMP) -f $(RV32_OBJ) | grep -E "file format|architecture"
-	@test -z "$$($(NM) -u $(RV32_OBJ))"
+	@test -z "$$($(NM) -u $(RV32_OBJ))" || (echo "ERROR: Undefined symbols in RV32IMAC object:" && $(NM) -u $(RV32_OBJ) && exit 1)
 	@echo "  ✓ Bare-metal RV32IMAC object verified (0 undefined symbols, 0 libc, MMIO ready)"
 	@echo "=== [Gate 1] Zero-Code Silicon Driver & Electro-Thermal Physics Benchmark ==="
 	@$(TEST_BIN)

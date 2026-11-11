@@ -18,13 +18,56 @@ static inline void ele_zero64(void *ptr) {
   p[7] = 0ULL;
 }
 
+static inline uint32_t ele_popcount32(uint32_t x) {
+  x -= (x >> 1U) & 0x55555555U;
+  x = (x & 0x33333333U) + ((x >> 2U) & 0x33333333U);
+  x = (x + (x >> 4U)) & 0x0F0F0F0FU;
+#if defined(__riscv)
+  __asm__ volatile("" : "+r"(x));
+#endif
+  x += x >> 8U;
+  x += x >> 16U;
+  return x & 0x3FU;
+}
+
 static inline uint32_t ele_popcount8(uint8_t x) {
-  uint32_t c = 0U;
-  while (x != 0U) {
-    x &= (uint8_t)(x - 1U);
-    c += 1U;
+  return ele_popcount32((uint32_t)x);
+}
+
+/* 0-ULP 64-by-32 unsigned division using only 32-bit RV32M hardware DIVU and
+ * 32-bit shifts (eliminates __udivdi3 / __divdi3 across all Clang/GCC versions
+ * and optimization levels -O0..-O3/-Os/-Oz). */
+static inline uint64_t ele_div_u64_u32(uint64_t num, uint32_t den) {
+  if (den == 0U) {
+    return 0ULL;
   }
-  return c;
+  uint32_t hi = (uint32_t)(num >> 32U);
+  uint32_t lo = (uint32_t)num;
+  if (hi == 0U) {
+    return (uint64_t)(lo / den);
+  }
+  uint32_t q_hi = hi / den;
+  uint32_t rem = hi - (q_hi * den);
+  if (den <= 0xFFFFU) {
+    uint32_t mid = (rem << 16U) | (lo >> 16U);
+    uint32_t q_mid = mid / den;
+    uint32_t r_mid = mid - (q_mid * den);
+    uint32_t bot = (r_mid << 16U) | (lo & 0xFFFFU);
+    uint32_t q_bot = bot / den;
+    return ((uint64_t)q_hi << 32U) | (uint64_t)((q_mid << 16U) | q_bot);
+  }
+  uint32_t q_lo = 0U;
+  for (uint32_t i = 0U; i < 32U; ++i) {
+    uint32_t carry = rem >> 31U;
+    rem = (rem << 1U) | (lo >> 31U);
+    lo <<= 1U;
+    q_lo <<= 1U;
+    if (carry != 0U || rem >= den) {
+      rem -= den;
+      q_lo |= 1U;
+    }
+  }
+  return ((uint64_t)q_hi << 32U) | (uint64_t)q_lo;
 }
 
 /* ============================================================================
@@ -106,9 +149,8 @@ void ele_hal_record_sleep_us(EleHalPort64 *port, uint32_t sleep_us) {
           ? (port->hp_active_power_uw - port->lp_sleep_power_uw)
           : 0U;
   /* Saved energy (uJ, Q48.16) = P_saved(uW) * t(us) / 10^6 */
-  int64_t saved_uj_q16 =
-      (int64_t)(((uint64_t)net_power_saved_uw * (uint64_t)sleep_us * 65536ULL) /
-                1000000ULL);
+  int64_t saved_uj_q16 = (int64_t)ele_div_u64_u32(
+      ((uint64_t)net_power_saved_uw * (uint64_t)sleep_us) << 16U, 1000000U);
   port->energy_saved_uj_q16 += saved_uj_q16;
 }
 
@@ -296,8 +338,19 @@ static inline int32_t ele_driver_eval_affine_q16(const EleDriverCodec64 *drv,
     }
   }
 
-  int64_t scaled = ((int64_t)signed_raw * (int64_t)scale_q16) >> drv->bit_width;
-  return (int32_t)scaled + offset_q16;
+  int64_t prod = (int64_t)signed_raw * (int64_t)scale_q16;
+  uint8_t bw = drv->bit_width;
+  int32_t scaled;
+  if (bw == 0U) {
+    scaled = (int32_t)prod;
+  } else if (bw >= 32U) {
+    scaled = (int32_t)(prod >> 32U);
+  } else {
+    uint32_t lo = (uint32_t)((uint64_t)prod);
+    uint32_t hi = (uint32_t)((uint64_t)prod >> 32U);
+    scaled = (int32_t)((lo >> bw) | (hi << (32U - bw)));
+  }
+  return scaled + offset_q16;
 }
 
 static inline int32_t ele_driver_coast_jet2_step(EleDriverCodec64 *drv,
@@ -666,14 +719,15 @@ void ele_driver_init_ina226_calorimeter(EleDriverCodec64 *shunt_mv_drv,
                             ELE_CODEC_BIG_ENDIAN, 5368709, 0, (12 << 16));
   }
   if (seq) {
-    const uint64_t ina_ops[4] = {
-        /* PC=0: Configure AVG=16, VBUSCT=1.1ms, VSHCT=1.1ms, Cont Shunt+Bus */
-        ele_bus_op_pack(ELE_OP_RMW_BITS8, 0x00U, 0x0FU, 0x07U, 0U, 0U),
-        /* PC=1 (Loop): Poll MASK_ENABLE (0x06) bit 3 (CVRF == 1), 1.1ms LP */
-        ele_bus_op_pack(ELE_OP_POLL_MASK, 0x06U, 0x08U, 0x08U, 0U, 110U),
-        /* PC=2: Burst Read SHUNT_VOLTAGE (0x01..0x02, 2 bytes) */
-        ele_bus_op_pack(ELE_OP_BURST_READ, 0x01U, 0U, 0U, 2U, 0U),
-        ele_bus_op_pack(ELE_OP_END, 0U, 0U, 0U, 0U, 0U)};
+    uint64_t ina_ops[4];
+    /* PC=0: Configure AVG=16, VBUSCT=1.1ms, VSHCT=1.1ms, Cont Shunt+Bus */
+    ina_ops[0] = ele_bus_op_pack(ELE_OP_RMW_BITS8, 0x00U, 0x0FU, 0x07U, 0U, 0U);
+    /* PC=1 (Loop): Poll MASK_ENABLE (0x06) bit 3 (CVRF == 1), 1.1ms LP */
+    ina_ops[1] =
+        ele_bus_op_pack(ELE_OP_POLL_MASK, 0x06U, 0x08U, 0x08U, 0U, 110U);
+    /* PC=2: Burst Read SHUNT_VOLTAGE (0x01..0x02, 2 bytes) */
+    ina_ops[2] = ele_bus_op_pack(ELE_OP_BURST_READ, 0x01U, 0U, 0U, 2U, 0U);
+    ina_ops[3] = ele_bus_op_pack(ELE_OP_END, 0U, 0U, 0U, 0U, 0U);
     ele_bus_seq64_init(seq, ELE_BUS_PROTO_I2C, addr, 1U, 5000U, 250000U,
                        ina_ops);
   }
@@ -766,19 +820,19 @@ uint32_t ele_wire_transmit_ppm_byte(EleWireLink64 *link, uint8_t pin,
   link->baseline_uart_flips += (uint64_t)uart_flips;
 
   uint64_t v_decivolt = (uint64_t)(link->vdd_mv / 100U);
-  int64_t e_single_flip_pj_q16 =
-      (int64_t)(((uint64_t)link->c_parasitic_ff * v_decivolt * v_decivolt *
-                 65536ULL) /
-                200000ULL);
-  if (e_single_flip_pj_q16 < 65536LL) {
-    e_single_flip_pj_q16 = 65536LL;
+  uint64_t e_single_flip_u64 = ele_div_u64_u32(
+      ((uint64_t)link->c_parasitic_ff * v_decivolt * v_decivolt) << 16U,
+      200000U);
+  if (e_single_flip_u64 < 65536ULL) {
+    e_single_flip_u64 = 65536ULL;
   }
 
-  int64_t e_uart_byte_pj_q16 =
-      (e_single_flip_pj_q16 * (int64_t)uart_flips * 135LL) / 100LL;
-  int64_t geom_factor_num =
-      ((link->z0_ohms_q16 >> 16U) >= 250U) ? 150LL : 100LL;
-  int64_t e_ppm_byte_pj_q16 = (e_single_flip_pj_q16 * geom_factor_num) / 100LL;
+  int64_t e_uart_byte_pj_q16 = (int64_t)ele_div_u64_u32(
+      e_single_flip_u64 * (uint64_t)uart_flips * 135ULL, 100U);
+  uint64_t geom_factor_num =
+      ((link->z0_ohms_q16 >> 16U) >= 250U) ? 150ULL : 100ULL;
+  int64_t e_ppm_byte_pj_q16 =
+      (int64_t)ele_div_u64_u32(e_single_flip_u64 * geom_factor_num, 100U);
 
   link->energy_used_pj_q16 += e_ppm_byte_pj_q16;
   if (e_uart_byte_pj_q16 > e_ppm_byte_pj_q16) {
@@ -917,11 +971,11 @@ uint32_t ele_drive_eval_waste_power_mw(const EleMotorDrive64 *drv,
   if (!drv) {
     return 0U;
   }
-  uint64_t p_bjt_mw =
-      ((uint64_t)current_ma * (uint64_t)drv->v_sat_drop_mv) / 1000ULL;
-  uint64_t p_copper_mw = ((uint64_t)current_ma * (uint64_t)current_ma *
-                          (uint64_t)drv->coil_r_mohm) /
-                         1000000ULL;
+  uint64_t p_bjt_mw = ele_div_u64_u32(
+      (uint64_t)current_ma * (uint64_t)drv->v_sat_drop_mv, 1000U);
+  uint64_t p_copper_mw = ele_div_u64_u32(
+      (uint64_t)current_ma * (uint64_t)current_ma * (uint64_t)drv->coil_r_mohm,
+      1000000U);
   uint64_t p_vib_mw = (uint64_t)(drv->piezo_peak_mv / 25U) +
                       (uint64_t)(drv->mic_diff_rms_uv / 500U);
   return (uint32_t)(p_bjt_mw + p_copper_mw + p_vib_mw);
@@ -941,9 +995,8 @@ EleDrivePhase ele_drive_step_symplectic(EleMotorDrive64 *drv,
   drv->heatsink_dtemp_mk_s = heatsink_dtemp_mk_s;
 
   if (piezo_mv > 100U) {
-    int64_t e_piezo_uj_q16 =
-        (int64_t)((15ULL * (uint64_t)piezo_mv * (uint64_t)piezo_mv * 65536ULL) /
-                  2000000000ULL);
+    int64_t e_piezo_uj_q16 = (int64_t)ele_div_u64_u32(
+        (15ULL * (uint64_t)piezo_mv * (uint64_t)piezo_mv) << 16U, 2000000000U);
     if (e_piezo_uj_q16 < 1024LL) {
       e_piezo_uj_q16 = 1024LL;
     }
@@ -957,11 +1010,11 @@ EleDrivePhase ele_drive_step_symplectic(EleMotorDrive64 *drv,
                                  ? (v_eff_drive_mv - drv->target_bemf_mv)
                                  : 500U;
   uint32_t baseline_pwm_ma = (pwm_headroom_mv * 1000U) / drv->coil_r_mohm;
-  uint64_t baseline_power_mw =
-      (((uint64_t)baseline_pwm_ma * (uint64_t)drv->v_supply_mv) * 125ULL) /
-      100000ULL;
-  int64_t baseline_energy_uj_q16 =
-      (int64_t)((baseline_power_mw * (uint64_t)dt_us * 65536ULL) / 1000ULL);
+  uint64_t baseline_power_mw = ele_div_u64_u32(
+      ((uint64_t)baseline_pwm_ma * (uint64_t)drv->v_supply_mv) * 125ULL,
+      100000U);
+  int64_t baseline_energy_uj_q16 = (int64_t)ele_div_u64_u32(
+      (baseline_power_mw * (uint64_t)dt_us) << 16U, 1000U);
 
   uint32_t hyst_mv = 80U;
   if (measured_bemf_mv > drv->target_bemf_mv + (3U * hyst_mv)) {
@@ -969,9 +1022,8 @@ EleDrivePhase ele_drive_step_symplectic(EleMotorDrive64 *drv,
     drv->pulse_duty_permille = 0U;
     drv->coil_current_ma = 0U;
     uint32_t excess_mv = measured_bemf_mv - drv->target_bemf_mv;
-    int64_t regen_uj_q16 =
-        (int64_t)(((uint64_t)excess_mv * (uint64_t)dt_us * 65536ULL) /
-                  50000ULL);
+    int64_t regen_uj_q16 = (int64_t)ele_div_u64_u32(
+        ((uint64_t)excess_mv * (uint64_t)dt_us) << 16U, 50000U);
     drv->piezo_harvest_uj_q16 += regen_uj_q16;
     drv->energy_saved_uj_q16 += baseline_energy_uj_q16;
     return ELE_DRIVE_REGEN_HARVEST_BRAKE;
@@ -1012,10 +1064,10 @@ EleDrivePhase ele_drive_step_symplectic(EleMotorDrive64 *drv,
                           : 200U;
   drv->coil_current_ma = ((net_v_mv * 1000U) / drv->coil_r_mohm) * duty / 1000U;
 
-  uint64_t pulse_power_mw =
-      ((uint64_t)drv->coil_current_ma * (uint64_t)drv->v_supply_mv) / 1000ULL;
-  int64_t pulse_energy_uj_q16 =
-      (int64_t)((pulse_power_mw * (uint64_t)dt_us * 65536ULL) / 1000ULL);
+  uint64_t pulse_power_mw = ele_div_u64_u32(
+      (uint64_t)drv->coil_current_ma * (uint64_t)drv->v_supply_mv, 1000U);
+  int64_t pulse_energy_uj_q16 = (int64_t)ele_div_u64_u32(
+      (pulse_power_mw * (uint64_t)dt_us) << 16U, 1000U);
 
   drv->energy_input_uj_q16 += pulse_energy_uj_q16;
   if (baseline_energy_uj_q16 > pulse_energy_uj_q16) {
@@ -1154,22 +1206,7 @@ EleCsiFieldRegime ele_csi_ingest_espnow_frame(EleCsiState64 *csi,
  */
 
 static inline uint32_t ele_popcount64(uint64_t x) {
-  x -= (x >> 1U) & 0x5555555555555555ULL;
-  x = (x & 0x3333333333333333ULL) + ((x >> 2U) & 0x3333333333333333ULL);
-  x = (x + (x >> 4U)) & 0x0F0F0F0F0F0F0F0FULL;
-  uint32_t lo = (uint32_t)x + (uint32_t)(x >> 32U);
-  lo += lo >> 8U;
-  lo += lo >> 16U;
-  return lo & 0x7FU;
-}
-
-static inline uint32_t ele_popcount32(uint32_t x) {
-  x -= (x >> 1U) & 0x55555555U;
-  x = (x & 0x33333333U) + ((x >> 2U) & 0x33333333U);
-  x = (x + (x >> 4U)) & 0x0F0F0F0FU;
-  x += x >> 8U;
-  x += x >> 16U;
-  return x & 0x3FU;
+  return ele_popcount32((uint32_t)x) + ele_popcount32((uint32_t)(x >> 32U));
 }
 
 static inline uint32_t ele_clz32(uint32_t x) {
