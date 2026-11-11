@@ -25,7 +25,7 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y clang llvm clang-format verilator
+          sudo apt-get install -y clang llvm clang-format verilator yosys
 
       - name: Ensure Homebrew LLVM (macOS)
         if: runner.os == 'macOS'
@@ -36,3 +36,5 @@ jobs:
         run: |
           make fmt-check
           make clean && make all && make test
+          clang -std=c17 -Wall -Wextra -Wpedantic -Werror -O1 -fsanitize=undefined -fno-sanitize-recover=all -Iinclude src/ele_core.c tests/test_ele_energy.c -o build/test-ele-ubsan
+          ./build/test-ele-ubsan

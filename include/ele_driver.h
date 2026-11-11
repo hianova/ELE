@@ -115,10 +115,10 @@ typedef struct __attribute__((aligned(64))) {
   uint32_t hot_swap_rollbacks;   /* [60..63] Cumulative 1-cycle rollbacks */
 } EleDriverCodec64;
 
-_Static_assert(sizeof(EleDriverCodec64) == 64U,
-               "EleDriverCodec64 must be exactly 64 bytes (1 cache line)");
-_Static_assert(_Alignof(EleDriverCodec64) == 64U,
-               "EleDriverCodec64 must be 64-byte aligned");
+ELE_STATIC_ASSERT(sizeof(EleDriverCodec64) == 64U,
+                  "EleDriverCodec64 must be exactly 64 bytes (1 cache line)");
+ELE_STATIC_ASSERT(ELE_ALIGNOF(EleDriverCodec64) == 64U,
+                  "EleDriverCodec64 must be 64-byte aligned");
 
 /* 64-Byte Cache-Line Univalent Bus Sequencer & Tickless 2-Jet Governor */
 typedef struct __attribute__((aligned(64))) {
@@ -136,10 +136,10 @@ typedef struct __attribute__((aligned(64))) {
   uint8_t last_verdict;        /* [63]     EleSeqVerdict status */
 } EleBusSeq64;
 
-_Static_assert(sizeof(EleBusSeq64) == 64U,
-               "EleBusSeq64 must be exactly 64 bytes (1 cache line)");
-_Static_assert(_Alignof(EleBusSeq64) == 64U,
-               "EleBusSeq64 must be 64-byte aligned");
+ELE_STATIC_ASSERT(sizeof(EleBusSeq64) == 64U,
+                  "EleBusSeq64 must be exactly 64 bytes (1 cache line)");
+ELE_STATIC_ASSERT(ELE_ALIGNOF(EleBusSeq64) == 64U,
+                  "EleBusSeq64 must be 64-byte aligned");
 
 /* Hardware-free CRC-8 calculator (e.g. poly=0x31 Sensirion, poly=0x07 SMBus) */
 uint8_t ele_crc8_compute(const uint8_t *data, uint8_t len, uint8_t poly,

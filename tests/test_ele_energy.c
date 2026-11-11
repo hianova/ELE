@@ -1,7 +1,9 @@
 #include "../include/ele_csi.h"
 #include "../include/ele_drive.h"
 #include "../include/ele_driver.h"
+#include "../include/ele_grid.h"
 #include "../include/ele_hal.h"
+#include "../include/ele_rack_vrm.h"
 #include "../include/ele_silicon.h"
 #include "../include/ele_sync.h"
 #include "../include/ele_wire.h"
@@ -642,6 +644,229 @@ static void test_suite6_silicon_datacenter_power_physics(void) {
          pdn.pdn_energy_saved_mj, tog_save_pct, leak_jet2_mj, leak_reactive_mj);
 }
 
+/* ============================================================================
+ * Suite 7: 48V Multiphase GaN/SiC Digital VRM (Phase-Shedding, ZVS & Active
+ *          Pre-Charge) + 8-Socket Rack Busbar Stranded-Megawatt Unlocker
+ * ============================================================================
+ */
+static void test_suite7_rack_vrm_zvs_and_stranded_power(void) {
+  EleVrmPhase64 vrm;
+  /* 48V -> 0.75V @ 16-phase GaN/DrMOS VRM: 800 uOhm/phase, 3600 mW/phase hard
+   * switching loss, 12,000 uF output decoupling, 15 A/us per-phase slew */
+  ele_vrm64_init(&vrm, 48000U, 750U, 16U, 800U, 3600U, 12000U, 15U);
+
+  /* 1. Exhaustive discrete convex optimality across [0..1200 A]:
+   *    ele_vrm_optimal_phases must match or beat EVERY possible N in [1..16] */
+  for (uint32_t amp = 0U; amp <= 1200U; amp += 5U) {
+    uint8_t n_opt = ele_vrm_optimal_phases(&vrm, amp);
+    ELE_ASSERT(n_opt >= 1U && n_opt <= 16U);
+    uint32_t opt_loss = ele_vrm_eval_loss_mw(&vrm, amp, n_opt, false);
+    for (uint8_t n_any = 1U; n_any <= 16U; ++n_any) {
+      uint32_t any_loss = ele_vrm_eval_loss_mw(&vrm, amp, n_any, false);
+      ELE_ASSERT(opt_loss <= any_loss);
+    }
+  }
+  ELE_ASSERT(ele_vrm_optimal_phases(&vrm, 90U) == 1U);
+  ELE_ASSERT(ele_vrm_optimal_phases(&vrm, 1050U) >= 15U);
+
+  /* Also verify ZVS-aware discrete convex optimality across [0..1200 A] */
+  vrm.zvs_locked = 1U;
+  for (uint32_t amp = 0U; amp <= 1200U; amp += 5U) {
+    uint8_t n_zvs = ele_vrm_optimal_phases(&vrm, amp);
+    ELE_ASSERT(n_zvs >= 1U && n_zvs <= 16U);
+    uint32_t zvs_opt_loss = ele_vrm_eval_loss_mw(&vrm, amp, n_zvs, true);
+    for (uint8_t n_any = 1U; n_any <= 16U; ++n_any) {
+      uint32_t any_loss = ele_vrm_eval_loss_mw(&vrm, amp, n_any, true);
+      ELE_ASSERT(zvs_opt_loss <= any_loss);
+    }
+  }
+  vrm.zvs_locked = 0U;
+
+  /* 2. 1,000 us mixed LLM workload: 80% memory-bound KV decode (90 A) +
+   *    20% Tensor GEMM bursts (1050 A) with 2-us Active Pre-Charge lookahead +
+   *    2-Jet picosecond ZVS dead-time resonant convergence */
+  vrm.inductor_current_a = 90U;
+  int32_t zvs_err_ps = 1800; /* Initial +1.8 ns hard-switching timing offset */
+
+  for (uint32_t us = 0U; us < 1000U; ++us) {
+    uint32_t slot = us % 50U;
+    uint32_t load_a = (slot >= 40U && slot < 50U) ? 1050U : 90U;
+    uint32_t upcoming_a = (slot >= 38U && slot < 50U) ? 1050U : 90U;
+
+    uint8_t phases = ele_vrm_step_us(&vrm, load_a, upcoming_a, zvs_err_ps);
+    ELE_ASSERT(phases >= 1U && phases <= 16U);
+    if (slot == 38U || slot == 39U) {
+      ELE_ASSERT(vrm.precharge_armed == 1U);
+      ELE_ASSERT(phases == 16U);
+    }
+    /* Physical LC switch-node zero-crossing tracks dead-time adjustment */
+    zvs_err_ps = (int32_t)vrm.t_dead_ps - 6200;
+  }
+
+  ELE_ASSERT(vrm.zvs_locked == 1U);
+  ELE_ASSERT(vrm.max_droop_base_mv >= 110U);
+  ELE_ASSERT(vrm.max_droop_active_mv * 2U < vrm.max_droop_base_mv);
+  ELE_ASSERT(vrm.loss_symplectic_nj * 100ULL < vrm.loss_baseline_nj * 40ULL);
+  uint64_t vrm_save_pct =
+      ((vrm.loss_baseline_nj - vrm.loss_symplectic_nj) * 100ULL) /
+      vrm.loss_baseline_nj;
+
+  /* 3. 8-Socket 48V Rack Busbar Symplectic Phase-Interleaving:
+   *    8 GPUs oscillate synchronously between 45 A (AllReduce) and 220 A (GEMM)
+   *    on a 1,250 A substation breaker (500 uOhm busbar).
+   *    Uncoordinated peak = 8 * 220 = 1,760 A (trips breaker; caps rack at 5
+   *    GPUs). Symplectic interleaving caps draw <= 1,250 A with 100% conserved
+   *    compute work, unlocking all 8 GPUs (+60% active GPUs on same breaker).
+   */
+  EleRackBusbar64 rack;
+  ele_rack_busbar64_init(&rack, 1250U, 500U);
+  uint64_t total_req_work = 0ULL;
+  uint64_t total_symp_work = 0ULL;
+
+  for (uint32_t tick = 0U; tick < 208U; ++tick) {
+    uint16_t req[8];
+    bool gemm_wave = (tick < 200U) && ((tick % 10U) < 4U);
+    for (uint8_t k = 0U; k < 8U; ++k) {
+      req[k] = (tick < 200U) ? (gemm_wave ? 220U : 45U) : 0U;
+      total_req_work += (uint64_t)req[k];
+    }
+    uint32_t rack_a = ele_rack_step_interleave8(&rack, req, 90U);
+    ELE_ASSERT(rack_a <= rack.breaker_cap_a);
+    total_symp_work += (uint64_t)rack_a;
+  }
+
+  for (uint8_t k = 0U; k < 8U; ++k) {
+    ELE_ASSERT(rack.slot_backlog_work[k] == 0U);
+  }
+  ELE_ASSERT(total_symp_work == total_req_work); /* 100% Work Conservation! */
+  ELE_ASSERT(rack.peak_sync_rack_a == 1760U);
+  ELE_ASSERT(rack.peak_interleaved_a <= 1250U);
+  ELE_ASSERT(rack.bus_loss_symp_uj < rack.bus_loss_sync_uj);
+
+  uint32_t sync_max_gpus = 0U;
+  uint32_t unlocked_gpus =
+      ele_rack_unlocked_gpu_slots(&rack, 8U, &sync_max_gpus);
+  ELE_ASSERT(sync_max_gpus == 5U);
+  ELE_ASSERT(unlocked_gpus >= 8U);
+  uint64_t bus_i2r_save_pct =
+      ((rack.bus_loss_sync_uj - rack.bus_loss_symp_uj) * 100ULL) /
+      rack.bus_loss_sync_uj;
+
+  printf("  [Suite 7] ele_rack_vrm: 48V 16ph GaN VRM Waste -%" PRIu64
+         "%%, Vdroop %umV->%umV (ZVS Locked) | 8-GPU Rack Peak %uA->%uA "
+         "(Breaker 1250A: %u->%u GPUs Powered, Bus I^2R -%" PRIu64 "%%)\n",
+         vrm_save_pct, vrm.max_droop_base_mv, vrm.max_droop_active_mv,
+         rack.peak_sync_rack_a, rack.peak_interleaved_a, sync_max_gpus,
+         unlocked_gpus, bus_i2r_save_pct);
+}
+
+/* ============================================================================
+ * Suite 8: Diurnal Duck-Curve 800V HVDC & 60Hz GFM Synthetic-Inertia Physics
+ * ============================================================================
+ */
+static void test_suite8_grid_duck_curve_and_gfm_inertia(void) {
+  /* 1. Hardware Zero-Crossing Period-to-mHz & Taiwan 60 Hz Island Contingency:
+   *    -22 MW cloud-edge / generator trip on 35 MW/Hz isolated island feeder.
+   *    GFL (H=0) plunges to 59.372 Hz (< 59.500 Hz UFLS blackout relay!).
+   *    GFM Virtual Synchronous Generator + 1-cycle (16.67ms) compute P-cap
+   *    arrests nadir > 59.850 Hz and absorbs 60.200 Hz midday PV surge. */
+  ELE_ASSERT(ele_grid_period_ns_to_mhz(16666667U) == 60000U);
+  ELE_ASSERT(ele_grid_period_ns_to_mhz(20000000U) == 50000U);
+
+  EleGridInverter64 gfm;
+  ele_grid_inverter64_init(&gfm, 60000U, 25000U, 18000U, 25000U, 30U);
+
+  /* Step A: Midday 60.200 Hz (16,611,296 ns) solar overgeneration -> Sponge! */
+  int32_t p_sponge = ele_grid_step_gfm_cycle(&gfm, 16611296U, 0, 35000U);
+  ELE_ASSERT(gfm.cur_freq_mhz == 60200U);
+  ELE_ASSERT(p_sponge < 0); /* Absorbing excess power into 800V BESS */
+  ELE_ASSERT(gfm.compute_pcap_permille == 1150U);
+
+  /* Return to nominal 60.000 Hz before contingency */
+  (void)ele_grid_step_gfm_cycle(&gfm, 16666667U, 0, 35000U);
+  ELE_ASSERT(gfm.compute_pcap_permille == 1000U);
+
+  /* Step B: Sudden -22,000 kW island contingency (59.800 Hz -> 16,722,408 ns)
+   */
+  int32_t p_arrest = ele_grid_step_gfm_cycle(&gfm, 16722408U, -22000, 35000U);
+  ELE_ASSERT(p_arrest > 18000);
+  ELE_ASSERT(gfm.compute_pcap_permille <= 800U);
+  ELE_ASSERT(gfm.nadir_gfl_mhz < 59500U);  /* GFL trips 59.5 Hz UFLS relay! */
+  ELE_ASSERT(gfm.nadir_gfm_mhz >= 59800U); /* GFM arrests safely >= 59.8 Hz! */
+  ELE_ASSERT(gfm.inertia_energy_kj > 0ULL);
+
+  /* 2. Taiwan Taipower 48h TOU + 16:00-22:00 Night-Peak + Feeder Congestion:
+   *    26 MW colocated PV peak on a constrained 10 MW utility feeder, 6 MW
+   *    rigid + 2.5 MW elastic AI compute + 3 MW chiller cooling, 28 MWh BESS +
+   *    18 MWh_th PCM thermal storage */
+  static const uint32_t pv_profile_kw[24] = {
+      0U,    0U,     0U,     0U,     0U,     0U,     800U,   3500U,
+      9000U, 16500U, 22500U, 25500U, 26000U, 24500U, 20000U, 12000U,
+      3000U, 0U,     0U,     0U,     0U,     0U,     0U,     0U};
+
+  EleDuckMicrogrid64 tw_mg;
+  ele_grid_duck64_init(&tw_mg, 28000U, 12000U, 18000U, 12000U, 10000U, 10000U);
+
+  for (uint32_t step = 0U; step < 48U; ++step) {
+    uint32_t hr = step % 24U;
+    bool night_peak = (hr >= 16U && hr < 22U);
+    int32_t tou_ntd_milli =
+        night_peak ? 9600 : ((hr >= 11U && hr < 15U) ? 2100 : 3200);
+    uint32_t batch_kw = (step < 44U) ? 2500U : 0U;
+    uint32_t cool_kw = (hr >= 10U && hr < 22U) ? 3000U : 1800U;
+    (void)ele_grid_step_duck_hour(&tw_mg, pv_profile_kw[hr], 6000U, batch_kw,
+                                  cool_kw, tou_ntd_milli, night_peak);
+  }
+
+  ELE_ASSERT(tw_mg.batch_backlog_kwh == 0U); /* 100% Compute Conservation */
+  ELE_ASSERT(tw_mg.curtailed_pv_base_kwh > 0U);
+  ELE_ASSERT(tw_mg.curtailed_pv_symp_kwh < tw_mg.curtailed_pv_base_kwh);
+  ELE_ASSERT(tw_mg.peak_evening_symp_kw * 2U < tw_mg.peak_evening_base_kw);
+  ELE_ASSERT(tw_mg.ac_conv_waste_kwh > 40000U);
+  ELE_ASSERT(tw_mg.cost_symplectic_milli * 2LL < tw_mg.cost_baseline_milli);
+
+  /* 3. US ERCOT / CAISO 48h Deregulated Negative-LMP Canyon Arbitrage:
+   *    Midday 10:00-15:00 wholesale LMP = -$35/MWh (-35,000 milli/kWh),
+   *    Evening 17:00-21:00 scarcity spike = +$280/MWh (+280,000 milli/kWh) */
+  EleDuckMicrogrid64 us_mg;
+  ele_grid_duck64_init(&us_mg, 68000U, 8000U, 24000U, 8000U, 14000U, 16000U);
+
+  for (uint32_t step = 0U; step < 48U; ++step) {
+    uint32_t hr = step % 24U;
+    bool scarcity_peak = (hr >= 16U && hr < 22U);
+    int32_t lmp_milli = 42000;
+    if (hr >= 10U && hr < 15U) {
+      lmp_milli = -35000; /* Negative midday solar canyon price! */
+    } else if (hr >= 17U && hr < 21U) {
+      lmp_milli = 280000; /* Sunset ramp scarcity spike! */
+    }
+    uint32_t batch_kw = (step < 44U) ? 2500U : 0U;
+    uint32_t cool_kw = (hr >= 10U && hr < 22U) ? 3000U : 1800U;
+    (void)ele_grid_step_duck_hour(&us_mg, pv_profile_kw[hr], 6000U, batch_kw,
+                                  cool_kw, lmp_milli, scarcity_peak);
+  }
+
+  ELE_ASSERT(us_mg.batch_backlog_kwh == 0U);
+  ELE_ASSERT(us_mg.curtailed_pv_base_kwh > 50000U);
+  ELE_ASSERT(us_mg.curtailed_pv_symp_kwh == 0U);
+  ELE_ASSERT(us_mg.cost_symplectic_milli * 4LL < us_mg.cost_baseline_milli);
+
+  uint32_t tw_peak_cut_pct =
+      ((tw_mg.peak_evening_base_kw - tw_mg.peak_evening_symp_kw) * 100U) /
+      tw_mg.peak_evening_base_kw;
+  int64_t us_cost_cut_pct =
+      ((us_mg.cost_baseline_milli - us_mg.cost_symplectic_milli) * 100LL) /
+      us_mg.cost_baseline_milli;
+
+  printf("  [Suite 8] ele_grid: 60Hz GFM Nadir %u->%u mHz (16.7ms Arrest) | "
+         "TW Night-Peak %u->%u kW (-%u%%, HVDC Saved %u kWh) | US Neg-LMP "
+         "Curtail %u->%u kWh (Cost -%" PRId64 "%%)\n",
+         gfm.nadir_gfl_mhz, gfm.nadir_gfm_mhz, tw_mg.peak_evening_base_kw,
+         tw_mg.peak_evening_symp_kw, tw_peak_cut_pct, tw_mg.ac_conv_waste_kwh,
+         us_mg.curtailed_pv_base_kwh, us_mg.curtailed_pv_symp_kwh,
+         us_cost_cut_pct);
+}
+
 static void run_live_dual_chip_hil(uint32_t c6_phase, uint32_t s3_phase,
                                    uint32_t gpio_loop_ok) {
   ELE_ASSERT(gpio_loop_ok == 1U);
@@ -670,17 +895,73 @@ static void run_live_dual_chip_hil(uint32_t c6_phase, uint32_t s3_phase,
 }
 
 static void test_suite0_abi64_univalence(void) {
-  ELE_ASSERT(sizeof(EleHalPort64) == 64U && _Alignof(EleHalPort64) == 64U);
+  ELE_ASSERT(sizeof(EleHalPort64) == 64U && ELE_ALIGNOF(EleHalPort64) == 64U);
   ELE_ASSERT(sizeof(EleDriverCodec64) == 64U &&
-             _Alignof(EleDriverCodec64) == 64U);
-  ELE_ASSERT(sizeof(EleBusSeq64) == 64U && _Alignof(EleBusSeq64) == 64U);
-  ELE_ASSERT(sizeof(EleWireLink64) == 64U && _Alignof(EleWireLink64) == 64U);
-  ELE_ASSERT(sizeof(EleSyncNode64) == 64U && _Alignof(EleSyncNode64) == 64U);
+             ELE_ALIGNOF(EleDriverCodec64) == 64U);
+  ELE_ASSERT(sizeof(EleBusSeq64) == 64U && ELE_ALIGNOF(EleBusSeq64) == 64U);
+  ELE_ASSERT(sizeof(EleWireLink64) == 64U && ELE_ALIGNOF(EleWireLink64) == 64U);
+  ELE_ASSERT(sizeof(EleSyncNode64) == 64U && ELE_ALIGNOF(EleSyncNode64) == 64U);
   ELE_ASSERT(sizeof(EleMotorDrive64) == 64U &&
-             _Alignof(EleMotorDrive64) == 64U);
-  ELE_ASSERT(sizeof(EleCsiState64) == 64U && _Alignof(EleCsiState64) == 64U);
-  ELE_ASSERT(sizeof(EleCacheBus64) == 64U && _Alignof(EleCacheBus64) == 64U);
-  ELE_ASSERT(sizeof(ElePdnGrid64) == 64U && _Alignof(ElePdnGrid64) == 64U);
+             ELE_ALIGNOF(EleMotorDrive64) == 64U);
+  ELE_ASSERT(sizeof(EleCsiState64) == 64U && ELE_ALIGNOF(EleCsiState64) == 64U);
+  ELE_ASSERT(sizeof(EleCacheBus64) == 64U && ELE_ALIGNOF(EleCacheBus64) == 64U);
+  ELE_ASSERT(sizeof(ElePdnGrid64) == 64U && ELE_ALIGNOF(ElePdnGrid64) == 64U);
+  ELE_ASSERT(sizeof(EleVrmPhase64) == 64U && ELE_ALIGNOF(EleVrmPhase64) == 64U);
+  ELE_ASSERT(sizeof(EleRackBusbar64) == 64U &&
+             ELE_ALIGNOF(EleRackBusbar64) == 64U);
+  ELE_ASSERT(sizeof(EleGridInverter64) == 64U &&
+             ELE_ALIGNOF(EleGridInverter64) == 64U);
+  ELE_ASSERT(sizeof(EleDuckMicrogrid64) == 64U &&
+             ELE_ALIGNOF(EleDuckMicrogrid64) == 64U);
+}
+
+static void test_suite9_adversarial_ub_and_fault_torture(void) {
+  /* 1. INT32_MIN / INT32_MAX & 32-bit signed actuator clamping (0 shift UB) */
+  EleDriverCodec64 act32;
+  ele_driver_codec64_init(&act32, 1U, 0x62U, 0x10U, 0U, 32U,
+                          ELE_CODEC_SIGNED_2C | ELE_CODEC_ACTUATOR_CLAMP,
+                          -65536, 2147483647, (5 << 16));
+  uint8_t b4[4] = {0U, 0U, 0U, 0U};
+  uint32_t w_ext =
+      ele_driver_encode_actuator_raw(&act32, (-2147483647 - 1), b4);
+  ELE_ASSERT(w_ext == 0x7FFFFFFFU);
+
+  /* 2. High-power 48V INA226 shunt monitor without 32-bit numerator wrap:
+   *    V_shunt = 100 mV, V_bus = 48 V, R_shunt = 2 mOhm => 2.400 kW */
+  uint32_t p_48v_uw = ele_driver_eval_ina226_power_uw(100 << 16, 48 << 16, 2U);
+  ELE_ASSERT(p_48v_uw == 2400000000U);
+  ELE_ASSERT(ele_driver_eval_ina226_power_uw(100 << 16, 48 << 16, 1U) ==
+             0xFFFFFFFFU);
+
+  /* 3. Ternary dot-product entropy with INT32_MIN & INT32_MAX activations */
+  const int32_t ext_in[4] = {(-2147483647 - 1), 2147483647, (-2147483647 - 1),
+                             0};
+  const int8_t ext_w[4] = {-1, 1, 1, -1};
+  uint64_t fp_t = 0ULL;
+  uint64_t tr_t = 0ULL;
+  (void)ele_silicon_compare_dot_toggle_entropy(NULL, ext_in, ext_w, 4U, &fp_t,
+                                               &tr_t);
+  int64_t ext_sum =
+      ele_silicon_dot_ternary_sign_grouped(ext_in, ext_w, 4U, NULL);
+  ELE_ASSERT(ext_sum == 2147483647LL);
+
+  /* 4. Uninitialized / zeroed c_out_uf == 0 VRM step & extreme droop safety */
+  EleVrmPhase64 z_vrm;
+  for (size_t i = 0; i < sizeof(z_vrm); ++i) {
+    ((unsigned char *)&z_vrm)[i] = 0U;
+  }
+  (void)ele_vrm_step_us(&z_vrm, 1000000U, 2000000U, (-2147483647 - 1));
+  ELE_ASSERT(z_vrm.active_phases >= 1U);
+  ELE_ASSERT(z_vrm.t_dead_ps >= 1500U && z_vrm.t_dead_ps <= 25000U);
+
+  /* 5. Grid EMI spike (period_ns = 1 ns) & INT32_MIN disturbance safety */
+  ELE_ASSERT(ele_grid_period_ns_to_mhz(1U) == 0xFFFFFFFFU);
+  EleGridInverter64 g_ext;
+  ele_grid_inverter64_init(&g_ext, 50000U, 40000U, 18000U, 25000U, 30U);
+  int32_t p_emi =
+      ele_grid_step_gfm_cycle(&g_ext, 50U, (-2147483647 - 1), 35000U);
+  ELE_ASSERT(p_emi == -40000);
+  ELE_ASSERT(g_ext.rotor_phase_mrad >= -3142 && g_ext.rotor_phase_mrad <= 3142);
 }
 
 int main(int argc, char **argv) {
@@ -693,6 +974,9 @@ int main(int argc, char **argv) {
   test_suite4_drive_symplectic_motor();
   test_suite5_espnow_csi_wave();
   test_suite6_silicon_datacenter_power_physics();
+  test_suite7_rack_vrm_zvs_and_stranded_power();
+  test_suite8_grid_duck_curve_and_gfm_inertia();
+  test_suite9_adversarial_ub_and_fault_torture();
 
   if (argc >= 5 && strcmp(argv[1], "--hil") == 0) {
     uint32_t c6_p = (uint32_t)strtoul(argv[2], NULL, 10);

@@ -1,13 +1,21 @@
 #include "../include/ele_csi.h"
 #include "../include/ele_drive.h"
 #include "../include/ele_driver.h"
+#include "../include/ele_grid.h"
 #include "../include/ele_hal.h"
+#include "../include/ele_rack_vrm.h"
 #include "../include/ele_silicon.h"
 #include "../include/ele_sync.h"
 #include "../include/ele_wire.h"
 
+#if defined(__GNUC__) || defined(__clang__)
+typedef uint64_t __attribute__((__may_alias__)) ele_u64_alias_t;
+#else
+typedef uint64_t ele_u64_alias_t;
+#endif
+
 static inline void ele_zero64(void *ptr) {
-  uint64_t *p = (uint64_t *)ptr;
+  ele_u64_alias_t *p = (ele_u64_alias_t *)ptr;
   p[0] = 0ULL;
   p[1] = 0ULL;
   p[2] = 0ULL;
@@ -16,6 +24,69 @@ static inline void ele_zero64(void *ptr) {
   p[5] = 0ULL;
   p[6] = 0ULL;
   p[7] = 0ULL;
+}
+
+static inline uint32_t ele_abs_i32_u32(int32_t x) {
+  return (x < 0) ? (0U - (uint32_t)x) : (uint32_t)x;
+}
+
+static inline int32_t ele_sat_i64_i32(int64_t x) {
+  if (x > 2147483647LL) {
+    return 2147483647;
+  }
+  if (x < (-2147483647LL - 1LL)) {
+    return (-2147483647 - 1);
+  }
+  return (int32_t)x;
+}
+
+/* 32-bit RV32I-native 64-bit logical shifts (eliminates __ashldi3 / __lshrdi3
+ * across all optimization levels including -Oz). */
+static inline uint64_t ele_shl64(uint64_t x, uint32_t sh) {
+  if (sh == 0U) {
+    return x;
+  }
+  if (sh >= 64U) {
+    return 0ULL;
+  }
+  uint32_t lo = (uint32_t)x;
+  uint32_t hi = (uint32_t)(x >> 32U);
+  if (sh >= 32U) {
+    return (uint64_t)(lo << (sh - 32U)) << 32U;
+  }
+  uint32_t out_hi = (hi << sh) | (lo >> (32U - sh));
+  uint32_t out_lo = lo << sh;
+  return ((uint64_t)out_hi << 32U) | (uint64_t)out_lo;
+}
+
+static inline uint64_t ele_shr64(uint64_t x, uint32_t sh) {
+  if (sh == 0U) {
+    return x;
+  }
+  if (sh >= 64U) {
+    return 0ULL;
+  }
+  uint32_t lo = (uint32_t)x;
+  uint32_t hi = (uint32_t)(x >> 32U);
+  if (sh >= 32U) {
+    return (uint64_t)(hi >> (sh - 32U));
+  }
+  uint32_t out_hi = hi >> sh;
+  uint32_t out_lo = (lo >> sh) | (hi << (32U - sh));
+  return ((uint64_t)out_hi << 32U) | (uint64_t)out_lo;
+}
+
+/* Portable ISO C17 arithmetic right shift (exact floor division by 2^sh,
+ * bit-for-bit identical to SystemVerilog signed `>>>` with zero UB). */
+static inline int64_t ele_asr64(int64_t x, uint32_t sh) {
+  if (sh == 0U) {
+    return x;
+  }
+  if (x >= 0LL) {
+    return (int64_t)ele_shr64((uint64_t)x, sh);
+  }
+  uint64_t bias = ele_shl64(1ULL, sh) - 1ULL;
+  return -(int64_t)ele_shr64((0ULL - (uint64_t)x) + bias, sh);
 }
 
 static inline uint32_t ele_popcount32(uint32_t x) {
@@ -68,6 +139,17 @@ static inline uint64_t ele_div_u64_u32(uint64_t num, uint32_t den) {
     }
   }
   return ((uint64_t)q_hi << 32U) | (uint64_t)q_lo;
+}
+
+static inline int64_t ele_sdiv_i64_u32(int64_t num, uint32_t den) {
+  if (num == 0LL || den == 0U) {
+    return 0LL;
+  }
+  if (num > 0LL) {
+    return (int64_t)ele_div_u64_u32((uint64_t)num, den);
+  }
+  uint64_t mag = 0ULL - (uint64_t)num;
+  return -(int64_t)ele_div_u64_u32(mag, den);
 }
 
 /* ============================================================================
@@ -148,9 +230,12 @@ void ele_hal_record_sleep_us(EleHalPort64 *port, uint32_t sleep_us) {
       (port->hp_active_power_uw > port->lp_sleep_power_uw)
           ? (port->hp_active_power_uw - port->lp_sleep_power_uw)
           : 0U;
-  /* Saved energy (uJ, Q48.16) = P_saved(uW) * t(us) / 10^6 */
-  int64_t saved_uj_q16 = (int64_t)ele_div_u64_u32(
-      ((uint64_t)net_power_saved_uw * (uint64_t)sleep_us) << 16U, 1000000U);
+  /* Saved energy (uJ, Q48.16) = P_saved(uW) * t(us) / 10^6 without 64b wrap */
+  uint64_t prod_uw_us = (uint64_t)net_power_saved_uw * (uint64_t)sleep_us;
+  uint64_t q_whole = ele_div_u64_u32(prod_uw_us, 1000000U);
+  uint64_t rem = prod_uw_us - (q_whole * 1000000ULL);
+  uint64_t q_frac = ele_div_u64_u32(rem << 16U, 1000000U);
+  int64_t saved_uj_q16 = (int64_t)((q_whole << 16U) + q_frac);
   port->energy_saved_uj_q16 += saved_uj_q16;
 }
 
@@ -350,17 +435,18 @@ static inline int32_t ele_driver_eval_affine_q16(const EleDriverCodec64 *drv,
     uint32_t hi = (uint32_t)((uint64_t)prod >> 32U);
     scaled = (int32_t)((lo >> bw) | (hi << (32U - bw)));
   }
-  return scaled + offset_q16;
+  return ele_sat_i64_i32((int64_t)scaled + (int64_t)offset_q16);
 }
 
 static inline int32_t ele_driver_coast_jet2_step(EleDriverCodec64 *drv,
                                                  uint8_t fault_flags) {
   drv->bus_health_state = (uint8_t)(ELE_BUS_COASTING_2JET | fault_flags);
   int32_t extrap =
-      drv->jet_pos_q16 + drv->jet_vel_q16 + (drv->jet_acc_q16 >> 1);
+      ele_sat_i64_i32((int64_t)drv->jet_pos_q16 + (int64_t)drv->jet_vel_q16 +
+                      ele_asr64((int64_t)drv->jet_acc_q16, 1U));
   drv->jet_pos_q16 = extrap;
-  drv->jet_vel_q16 = (drv->jet_vel_q16 * 3) >> 2;
-  drv->jet_acc_q16 = drv->jet_acc_q16 >> 1;
+  drv->jet_vel_q16 = (int32_t)ele_asr64((int64_t)drv->jet_vel_q16 * 3LL, 2U);
+  drv->jet_acc_q16 = (int32_t)ele_asr64((int64_t)drv->jet_acc_q16, 1U);
   return extrap;
 }
 
@@ -396,13 +482,13 @@ int32_t ele_driver_decode_and_heal_step(EleDriverCodec64 *drv,
    */
   if ((drv->codec_flags & ELE_CODEC_INITIALIZED) != 0U &&
       (drv->codec_flags & ELE_CODEC_HOTSWAP_PENDING) != 0U) {
-    int32_t pred_x =
-        drv->jet_pos_q16 + drv->jet_vel_q16 + (drv->jet_acc_q16 >> 1);
-    int32_t diff = x_cal - pred_x;
-    int32_t abs_diff = (diff >= 0) ? diff : -diff;
+    int64_t pred_x64 = (int64_t)drv->jet_pos_q16 + (int64_t)drv->jet_vel_q16 +
+                       ele_asr64((int64_t)drv->jet_acc_q16, 1U);
+    int64_t diff64 = (int64_t)x_cal - pred_x64;
+    int64_t abs_diff64 = (diff64 >= 0LL) ? diff64 : -diff64;
     drv->codec_flags &= (uint8_t)~ELE_CODEC_HOTSWAP_PENDING;
 
-    if (abs_diff > drv->max_slew_jump_q16) {
+    if (abs_diff64 > (int64_t)drv->max_slew_jump_q16) {
       drv->scale_q16 = (int32_t)(uint32_t)(drv->shadow_backup_word >> 32U);
       drv->offset_q16 =
           (int32_t)(uint32_t)(drv->shadow_backup_word & 0xFFFFFFFFULL);
@@ -425,11 +511,15 @@ int32_t ele_driver_decode_and_heal_step(EleDriverCodec64 *drv,
     drv->jet_acc_q16 = 0;
     drv->codec_flags |= ELE_CODEC_INITIALIZED;
   } else {
-    int32_t new_vel = x_cal - drv->jet_pos_q16;
-    int32_t new_acc = new_vel - drv->jet_vel_q16;
+    int32_t new_vel =
+        ele_sat_i64_i32((int64_t)x_cal - (int64_t)drv->jet_pos_q16);
+    int32_t new_acc =
+        ele_sat_i64_i32((int64_t)new_vel - (int64_t)drv->jet_vel_q16);
     drv->jet_pos_q16 = x_cal;
-    drv->jet_vel_q16 = (drv->jet_vel_q16 + new_vel) >> 1;
-    drv->jet_acc_q16 = (drv->jet_acc_q16 + new_acc) >> 1;
+    drv->jet_vel_q16 =
+        (int32_t)ele_asr64((int64_t)drv->jet_vel_q16 + (int64_t)new_vel, 1U);
+    drv->jet_acc_q16 =
+        (int32_t)ele_asr64((int64_t)drv->jet_acc_q16 + (int64_t)new_acc, 1U);
   }
 
   return drv->jet_pos_q16;
@@ -464,33 +554,49 @@ uint32_t ele_driver_encode_actuator_raw(const EleDriverCodec64 *drv,
   if (!drv || drv->scale_q16 == 0) {
     return 0U;
   }
-  /* Inverse affine mapping using 32-bit hardware DIV (0 libgcc __divdi3):
+  /* UB-free inverse affine mapping via 64-by-32 unsigned division (0 __divdi3):
    * target_q16 = ((raw * scale_q16) >> bit_width) + offset_q16
    * => raw = ((target_q16 - offset_q16) << bit_width) / scale_q16
    */
-  int32_t delta = target_q16 - drv->offset_q16;
+  int64_t delta64 = (int64_t)target_q16 - (int64_t)drv->offset_q16;
   uint8_t bw =
-      (drv->bit_width >= 1U && drv->bit_width <= 24U) ? drv->bit_width : 16U;
-  int32_t scale_s8 = (drv->scale_q16 >> 8);
-  if (scale_s8 == 0) {
-    scale_s8 = (drv->scale_q16 > 0) ? 1 : -1;
+      (drv->bit_width >= 1U && drv->bit_width <= 32U) ? drv->bit_width : 16U;
+  uint8_t sh = (drv->bit_shift < 32U) ? drv->bit_shift : 0U;
+  bool neg = (delta64 < 0LL) != (drv->scale_q16 < 0);
+  uint64_t mag_delta =
+      (delta64 < 0LL) ? (0ULL - (uint64_t)delta64) : (uint64_t)delta64;
+  uint32_t mag_scale = ele_abs_i32_u32(drv->scale_q16);
+  uint64_t max_shift_in =
+      (bw >= 32U) ? 0xFFFFFFFFULL : ele_shr64(0xFFFFFFFFFFFFFFFFULL, bw);
+  uint64_t raw_mag = 0ULL;
+  if (mag_delta > max_shift_in) {
+    raw_mag = 0xFFFFFFFFULL;
+  } else {
+    raw_mag = ele_div_u64_u32(ele_shl64(mag_delta, bw), mag_scale);
+    if (raw_mag > 0xFFFFFFFFULL) {
+      raw_mag = 0xFFFFFFFFULL;
+    }
   }
-  int32_t num_s8 = (bw >= 8U) ? (delta << (bw - 8U)) : (delta >> (8U - bw));
-  int32_t raw_i32 = num_s8 / scale_s8;
+  int64_t raw_i64 = neg ? -(int64_t)raw_mag : (int64_t)raw_mag;
 
-  int32_t min_raw =
-      ((drv->codec_flags & ELE_CODEC_SIGNED_2C) != 0U) ? -(1 << (bw - 1U)) : 0;
-  int32_t max_raw = ((drv->codec_flags & ELE_CODEC_SIGNED_2C) != 0U)
-                        ? ((1 << (bw - 1U)) - 1)
-                        : ((int32_t)((1U << bw) - 1U));
-  if (raw_i32 < min_raw) {
-    raw_i32 = min_raw;
-  } else if (raw_i32 > max_raw) {
-    raw_i32 = max_raw;
+  int64_t min_raw = 0LL;
+  int64_t max_raw = 0LL;
+  if ((drv->codec_flags & ELE_CODEC_SIGNED_2C) != 0U) {
+    uint64_t half_range = (uint64_t)(1U << (bw - 1U));
+    min_raw = -(int64_t)half_range;
+    max_raw = (int64_t)(half_range - 1ULL);
+  } else {
+    min_raw = 0LL;
+    max_raw = (bw >= 32U) ? 0xFFFFFFFFLL : (int64_t)((1U << bw) - 1U);
+  }
+  if (raw_i64 < min_raw) {
+    raw_i64 = min_raw;
+  } else if (raw_i64 > max_raw) {
+    raw_i64 = max_raw;
   }
 
-  uint32_t mask = (1U << bw) - 1U;
-  uint32_t word = ((uint32_t)raw_i32 & mask) << drv->bit_shift;
+  uint32_t mask = (bw >= 32U) ? 0xFFFFFFFFU : ((1U << bw) - 1U);
+  uint32_t word = ((uint32_t)(int32_t)raw_i64 & mask) << sh;
 
   if (out_bytes) {
     if ((drv->codec_flags & ELE_CODEC_BIG_ENDIAN) != 0U) {
@@ -548,12 +654,9 @@ uint32_t ele_bus_govern_period_jet2(EleBusSeq64 *seq,
   if (!seq || !drv) {
     return 0U;
   }
-  int32_t abs_v =
-      (drv->jet_vel_q16 >= 0) ? drv->jet_vel_q16 : -drv->jet_vel_q16;
-  int32_t abs_a =
-      (drv->jet_acc_q16 >= 0) ? drv->jet_acc_q16 : -drv->jet_acc_q16;
-  int32_t activity = abs_v + abs_a;
-  int32_t eps = (quiet_eps_q16 >= 0) ? quiet_eps_q16 : 0;
+  uint64_t activity = (uint64_t)ele_abs_i32_u32(drv->jet_vel_q16) +
+                      (uint64_t)ele_abs_i32_u32(drv->jet_acc_q16);
+  uint64_t eps = (quiet_eps_q16 > 0) ? (uint64_t)(uint32_t)quiet_eps_q16 : 0ULL;
 
   if (activity > eps || drv->bus_health_state != ELE_BUS_HEALTHY) {
     /* Physical slew surprise or bus fault -> 1-Cycle Snapback to Max Rate */
@@ -746,8 +849,9 @@ uint32_t ele_driver_eval_ina226_power_uw(int32_t shunt_mv_q16,
   uint64_t prod_mv_v_q16 =
       ((uint64_t)abs_shunt_q16 * (uint64_t)pos_bus_q16) >> 16U;
   /* P_uW * R_mOhm = V_shunt(mV) * V_bus(V) * 10^6 */
-  uint32_t num_uw_mohm = (uint32_t)((prod_mv_v_q16 * 1000000ULL) >> 16U);
-  return num_uw_mohm / r_shunt_mohm;
+  uint64_t num_uw_mohm = (prod_mv_v_q16 * 1000000ULL) >> 16U;
+  uint64_t p_uw = ele_div_u64_u32(num_uw_mohm, r_shunt_mohm);
+  return (p_uw > 0xFFFFFFFFULL) ? 0xFFFFFFFFU : (uint32_t)p_uw;
 }
 
 /* ============================================================================
@@ -893,8 +997,15 @@ EleSyncDecision ele_sync_step_tx_gate(EleSyncNode64 *tx_node,
     return ELE_SYNC_SLEEP_ZERO_BIT;
   }
 
-  int32_t res32 = (int32_t)residual;
-  int32_t dt32 = (int32_t)(tx_node->ticks_since_sync + 1U);
+  int64_t clamped_res = residual;
+  if (clamped_res > 1073741823LL) {
+    clamped_res = 1073741823LL;
+  } else if (clamped_res < -1073741823LL) {
+    clamped_res = -1073741823LL;
+  }
+  int32_t res32 = (int32_t)clamped_res;
+  uint64_t dt64 = (uint64_t)tx_node->ticks_since_sync + 1ULL;
+  int32_t dt32 = (dt64 > 32767ULL) ? 32767 : (int32_t)dt64;
   int32_t dv32 = res32 / dt32;
   int32_t da32 = 0;
   if (tx_node->transmitted_frames >= 1U && dt32 >= 4) {
@@ -930,8 +1041,15 @@ int64_t ele_sync_step_rx_mirror(EleSyncNode64 *rx_node,
     return rx_node->x_q16;
   }
 
-  int32_t res32 = (int32_t)received_delta_q16;
-  int32_t dt32 = (int32_t)(rx_node->ticks_since_sync + 1U);
+  int64_t clamped_res = received_delta_q16;
+  if (clamped_res > 1073741823LL) {
+    clamped_res = 1073741823LL;
+  } else if (clamped_res < -1073741823LL) {
+    clamped_res = -1073741823LL;
+  }
+  int32_t res32 = (int32_t)clamped_res;
+  uint64_t dt64 = (uint64_t)rx_node->ticks_since_sync + 1ULL;
+  int32_t dt32 = (dt64 > 32767ULL) ? 32767 : (int32_t)dt64;
   int32_t dv32 = res32 / dt32;
   int32_t da32 = 0;
   if (rx_node->transmitted_frames >= 1U && dt32 >= 4) {
@@ -1134,8 +1252,8 @@ EleCsiFieldRegime ele_csi_ingest_espnow_frame(EleCsiState64 *csi,
   }
 
   csi->coherence_signature = sig;
-  int64_t energy_q16 = total_energy << 8U;
-  int64_t holonomy_q16 = cross_holonomy << 8U;
+  int64_t energy_q16 = total_energy * 256LL;
+  int64_t holonomy_q16 = cross_holonomy * 256LL;
 
   if (csi->frames_processed == 0U) {
     csi->baseline_energy_q16 = energy_q16;
@@ -1160,9 +1278,9 @@ EleCsiFieldRegime ele_csi_ingest_espnow_frame(EleCsiState64 *csi,
 
   uint32_t adapt_shift = (csi->dwave_q16 < 0LL) ? 1U : 6U;
   csi->baseline_energy_q16 +=
-      (energy_q16 - csi->baseline_energy_q16) >> adapt_shift;
+      ele_asr64(energy_q16 - csi->baseline_energy_q16, adapt_shift);
   csi->baseline_holonomy_q16 +=
-      (holonomy_q16 - csi->baseline_holonomy_q16) >> adapt_shift;
+      ele_asr64(holonomy_q16 - csi->baseline_holonomy_q16, adapt_shift);
   csi->frames_processed += 1U;
 
   int32_t snr_db = (int32_t)rssi_dbm - (int32_t)noise_floor_dbm;
@@ -1192,9 +1310,14 @@ EleCsiFieldRegime ele_csi_ingest_espnow_frame(EleCsiState64 *csi,
     csi->suppressed_beacons += 49U;
   }
 
-  int64_t saved_per_step_uj = (int64_t)(100U - csi->recommended_rate_hz) * 9LL +
-                              (int64_t)(80U - csi->tx_power_qdbm) * 4LL;
-  csi->energy_saved_uj_q16 += (saved_per_step_uj << 16U);
+  int64_t saved_per_step_uj =
+      (int64_t)((csi->recommended_rate_hz < 100U)
+                    ? (100U - csi->recommended_rate_hz)
+                    : 0U) *
+          9LL +
+      (int64_t)((csi->tx_power_qdbm < 80U) ? (80U - csi->tx_power_qdbm) : 0U) *
+          4LL;
+  csi->energy_saved_uj_q16 += (saved_per_step_uj * 65536LL);
 
   return (EleCsiFieldRegime)csi->field_regime;
 }
@@ -1273,9 +1396,11 @@ uint8_t ele_silicon_tx_cacheline64(EleCacheBus64 *bus,
       uint8_t idx = (uint8_t)(beat * 4U + lane);
       uint64_t raw_w = next_line[idx];
       uint64_t prev_w = bus->prev_bus_beat[lane];
+      uint8_t prev_p = (uint8_t)((bus->prev_inv_mask4 >> lane) & 1U);
 
-      /* Baseline uncoded wire flips vs previous physical beat */
-      beat_raw_flips += ele_popcount64(raw_w ^ prev_w);
+      /* Baseline uncoded wire flips vs previous unencoded data beat */
+      uint64_t prev_raw_w = (!pred_line && prev_p != 0U) ? ~prev_w : prev_w;
+      beat_raw_flips += ele_popcount64(raw_w ^ prev_raw_w);
 
       /* 1. Optional 2-Jet / XOR temporal cache-line residual */
       uint64_t cand0 = pred_line ? (raw_w ^ pred_line[idx]) : raw_w;
@@ -1283,7 +1408,6 @@ uint8_t ele_silicon_tx_cacheline64(EleCacheBus64 *bus,
       /* 2. Stateful 65-wire Bus-Invert (64 data + 1 polarity wire):
        *    flips(p=0) + flips(p=1) == 65 => min <= 32 strictly!
        */
-      uint8_t prev_p = (uint8_t)((bus->prev_inv_mask4 >> lane) & 1U);
       uint32_t flips_p0 = ele_popcount64(cand0 ^ prev_w) + (uint32_t)prev_p;
       uint64_t chosen_w = cand0;
       uint32_t chosen_flips = flips_p0;
@@ -1411,8 +1535,10 @@ uint32_t ele_silicon_eval_leakage_mw(int32_t temp_mc, uint32_t base_leak_mw) {
   if (octaves > 6U) {
     octaves = 6U;
   }
-  uint32_t scaled = (base * (12000U + rem_mc)) / 12000U;
-  return scaled << octaves;
+  uint64_t scaled = ele_shl64(
+      ele_div_u64_u32((uint64_t)base * (uint64_t)(12000U + rem_mc), 12000U),
+      octaves);
+  return (scaled > 0xFFFFFFFFULL) ? 0xFFFFFFFFU : (uint32_t)scaled;
 }
 
 uint32_t ele_silicon_step_thermal_jet2(ElePdnGrid64 *pdn,
@@ -1423,24 +1549,36 @@ uint32_t ele_silicon_step_thermal_jet2(ElePdnGrid64 *pdn,
     return 0U;
   }
   uint32_t leak_mw = ele_silicon_eval_leakage_mw(pdn->temp_mc, 15000U);
-  uint32_t total_w = active_power_w + (leak_mw / 1000U);
+  uint64_t total_w = (uint64_t)active_power_w + (uint64_t)(leak_mw / 1000U);
+  if (total_w > 100000ULL) {
+    total_w = 100000ULL;
+  }
 
   /* Silicon junction RC step: heating +8 mC/W, cooling (T - T_amb) / 12 */
-  int32_t cooling_mc = (pdn->temp_mc - ambient_mc) / 12;
-  int32_t next_temp_mc = pdn->temp_mc + (int32_t)(total_w * 8U) - cooling_mc;
-  int32_t new_vel = next_temp_mc - pdn->temp_mc;
-  int32_t new_acc = new_vel - pdn->dtemp_mc_tick;
+  int64_t cooling_mc =
+      ele_sdiv_i64_u32((int64_t)pdn->temp_mc - (int64_t)ambient_mc, 12U);
+  int32_t next_temp_mc = ele_sat_i64_i32(
+      (int64_t)pdn->temp_mc + (int64_t)(total_w * 8ULL) - cooling_mc);
+  int32_t new_vel =
+      ele_sat_i64_i32((int64_t)next_temp_mc - (int64_t)pdn->temp_mc);
+  int32_t new_acc =
+      ele_sat_i64_i32((int64_t)new_vel - (int64_t)pdn->dtemp_mc_tick);
 
   pdn->temp_mc = next_temp_mc;
   pdn->dtemp_mc_tick = new_vel;
-  pdn->ddtemp_mc_tick2 = (pdn->ddtemp_mc_tick2 + new_acc) >> 1;
+  pdn->ddtemp_mc_tick2 =
+      (int32_t)ele_asr64((int64_t)pdn->ddtemp_mc_tick2 + (int64_t)new_acc, 1U);
 
-  int32_t h = (int32_t)((horizon_ticks > 0U) ? horizon_ticks : 4U);
-  int32_t pos_acc = (pdn->ddtemp_mc_tick2 > 0) ? pdn->ddtemp_mc_tick2 : 0;
-  int32_t pred_temp_mc =
-      pdn->temp_mc + (pdn->dtemp_mc_tick * h) + ((pos_acc * h * h) >> 1);
+  int64_t h = (int64_t)((horizon_ticks > 0U)
+                            ? ((horizon_ticks > 1024U) ? 1024U : horizon_ticks)
+                            : 4U);
+  int64_t pos_acc =
+      (pdn->ddtemp_mc_tick2 > 0) ? (int64_t)pdn->ddtemp_mc_tick2 : 0LL;
+  int64_t pred_temp_mc = (int64_t)pdn->temp_mc +
+                         ((int64_t)pdn->dtemp_mc_tick * h) +
+                         ((pos_acc * h * h) >> 1U);
 
-  if (pred_temp_mc >= pdn->temp_knee_mc) {
+  if (pred_temp_mc >= (int64_t)pdn->temp_knee_mc) {
     pdn->thermal_preempts += 1U;
     return 180U; /* Pre-emptive migration / cool-carrier current cap (Amps) */
   }
@@ -1490,8 +1628,9 @@ uint64_t ele_silicon_compare_dot_toggle_entropy(
   for (uint32_t i = 0U; i < len; ++i) {
     int32_t x = inputs_q16[i];
     int8_t w = weights_trit[i];
-    int32_t prod_q16 = (w > 0) ? x : ((w < 0) ? -x : 0);
-    acc_q16 += prod_q16;
+    int64_t prod64 = (w > 0) ? (int64_t)x : ((w < 0) ? -(int64_t)x : 0LL);
+    int32_t prod_q16 = ele_sat_i64_i32(prod64);
+    acc_q16 = (int32_t)((uint32_t)acc_q16 + (uint32_t)prod_q16);
 
     /* 1. IEEE-754 FP32 datapath register toggles (input, weight, FMA, acc) */
     uint32_t fp_in = ele_pack_ieee754_f32_bits_q16(x);
@@ -1593,4 +1732,697 @@ int64_t ele_silicon_dot_ternary_sign_grouped(const int32_t *inputs_q16,
     *out_grouped_toggles = toggles;
   }
   return exact_sum;
+}
+
+/* ============================================================================
+ * 7. ele_rack_vrm: 48V Multiphase GaN/SiC Digital VRM (Phase-Shedding, ZVS &
+ *    Active Pre-Charge) + 8-Socket Rack Busbar Symplectic Phase-Interleaver
+ * ============================================================================
+ */
+
+void ele_vrm64_init(EleVrmPhase64 *vrm, uint32_t v_in_mv, uint32_t v_out_nom_mv,
+                    uint8_t num_phases_max, uint32_t r_phase_uohm,
+                    uint32_t p_sw_phase_mw, uint32_t c_out_uf,
+                    uint32_t slew_phase_a_us) {
+  if (!vrm) {
+    return;
+  }
+  ele_zero64(vrm);
+  uint8_t n_max =
+      (num_phases_max >= 1U && num_phases_max <= 16U) ? num_phases_max : 16U;
+  vrm->v_in_mv = (v_in_mv > 0U) ? v_in_mv : 48000U;
+  vrm->v_out_nom_mv = (v_out_nom_mv > 0U) ? v_out_nom_mv : 750U;
+  vrm->r_phase_uohm = (r_phase_uohm > 0U) ? r_phase_uohm : 800U;
+  vrm->p_sw_phase_mw = p_sw_phase_mw;
+  vrm->c_out_uf = (c_out_uf > 0U) ? c_out_uf : 12000U;
+  vrm->slew_phase_a_us = (slew_phase_a_us > 0U) ? slew_phase_a_us : 15U;
+  vrm->t_dead_ps = 8000U;
+  vrm->num_phases_max = n_max;
+  vrm->active_phases = n_max;
+}
+
+uint8_t ele_vrm_optimal_phases(const EleVrmPhase64 *vrm, uint32_t load_amp) {
+  if (!vrm || vrm->num_phases_max <= 1U) {
+    return 1U;
+  }
+  uint32_t p_sw_eff =
+      (vrm->zvs_locked != 0U) ? (vrm->p_sw_phase_mw >> 2U) : vrm->p_sw_phase_mw;
+  if (p_sw_eff == 0U) {
+    return vrm->num_phases_max;
+  }
+  /* Exact discrete convex minimizer of P(I, N) = I^2*R/(1000*N) + N*P_sw_eff:
+   * P(I, N+1) < P(I, N)  <=>  I^2 * r_uohm > N * (N + 1) * 1000 * p_sw_eff */
+  uint64_t i2_r =
+      (uint64_t)load_amp * (uint64_t)load_amp * (uint64_t)vrm->r_phase_uohm;
+  uint64_t p_sw_scaled = 1000ULL * (uint64_t)p_sw_eff;
+  uint8_t best_n = 1U;
+  for (uint8_t n = 1U; n < vrm->num_phases_max; ++n) {
+    uint64_t rhs = (uint64_t)n * (uint64_t)(n + 1U) * p_sw_scaled;
+    if (i2_r > rhs) {
+      best_n = (uint8_t)(n + 1U);
+    } else {
+      break;
+    }
+  }
+  return best_n;
+}
+
+uint32_t ele_vrm_eval_loss_mw(const EleVrmPhase64 *vrm, uint32_t load_amp,
+                              uint8_t n_phases, bool zvs_soft_switched) {
+  if (!vrm) {
+    return 0U;
+  }
+  uint32_t n = (n_phases >= 1U) ? (uint32_t)n_phases : 1U;
+  uint64_t cond_mw = ele_div_u64_u32((uint64_t)load_amp * (uint64_t)load_amp *
+                                         (uint64_t)vrm->r_phase_uohm,
+                                     1000U * n);
+  /* Under ZVS resonant soft-switching, 1/2 * C_oss * V^2 turn-on energy (~75%
+   * of 48V GaN stage switching loss) is recovered prior to gate turn-on,
+   * leaving only gate-drive Q_g * V_drv (~25%). */
+  uint32_t p_sw_eff =
+      zvs_soft_switched ? (vrm->p_sw_phase_mw >> 2U) : vrm->p_sw_phase_mw;
+  uint64_t sw_mw = (uint64_t)n * (uint64_t)p_sw_eff;
+  return (uint32_t)(cond_mw + sw_mw);
+}
+
+static inline uint16_t ele_vrm_eval_reactive_droop_mv(const EleVrmPhase64 *vrm,
+                                                      uint32_t step_amp) {
+  uint64_t max_slew =
+      (uint64_t)vrm->num_phases_max * (uint64_t)vrm->slew_phase_a_us;
+  if (max_slew == 0ULL || (uint64_t)step_amp <= max_slew ||
+      vrm->c_out_uf == 0U) {
+    return 0U;
+  }
+  uint64_t k_ticks = ele_div_u64_u32((uint64_t)step_amp, (uint32_t)max_slew);
+  uint64_t tri = (k_ticks * (k_ticks + 1ULL)) >> 1U;
+  uint64_t q_def_uc = (k_ticks * (uint64_t)step_amp) - (max_slew * tri);
+  uint64_t droop_mv = ele_div_u64_u32(q_def_uc * 1000ULL, vrm->c_out_uf);
+  return (droop_mv > 0xFFFFULL) ? 0xFFFFU : (uint16_t)droop_mv;
+}
+
+uint8_t ele_vrm_step_us(EleVrmPhase64 *vrm, uint32_t load_amp,
+                        uint32_t upcoming_load_amp,
+                        int32_t measured_zvs_err_ps) {
+  if (!vrm) {
+    return 0U;
+  }
+  uint32_t c_uf = (vrm->c_out_uf > 0U) ? vrm->c_out_uf : 1U;
+  uint8_t n_max = (vrm->num_phases_max >= 1U && vrm->num_phases_max <= 16U)
+                      ? vrm->num_phases_max
+                      : 1U;
+
+  /* 1. Record uncompensated baseline droop if a sharp current step arrives */
+  uint32_t ref_step = 0U;
+  if (upcoming_load_amp > load_amp) {
+    ref_step = upcoming_load_amp - load_amp;
+  }
+  if (load_amp > vrm->inductor_current_a && vrm->precharge_armed == 0U) {
+    uint32_t direct_step = load_amp - vrm->inductor_current_a;
+    if (direct_step > ref_step) {
+      ref_step = direct_step;
+    }
+  }
+  uint16_t base_droop = ele_vrm_eval_reactive_droop_mv(vrm, ref_step);
+  if (base_droop > vrm->max_droop_base_mv) {
+    vrm->max_droop_base_mv = base_droop;
+  }
+
+  /* 2. 2-Jet picosecond Zero-Voltage Switching (ZVS) dead-time resonant loop
+   *    (exact arithmetic right-shift floor match with rtl/ele_vrm_zvs_ctrl.sv)
+   */
+  int64_t err64 = (int64_t)measured_zvs_err_ps;
+  int64_t d_err64 = err64 - (int64_t)vrm->zvs_phase_vel_ps;
+  vrm->zvs_phase_vel_ps = measured_zvs_err_ps;
+  int64_t next_dead =
+      (int64_t)vrm->t_dead_ps - ele_asr64(err64, 1U) - ele_asr64(d_err64, 2U);
+  if (next_dead < 1500LL) {
+    next_dead = 1500LL;
+  } else if (next_dead > 25000LL) {
+    next_dead = 25000LL;
+  }
+  vrm->t_dead_ps = (uint32_t)next_dead;
+
+  uint32_t abs_err = ele_abs_i32_u32(measured_zvs_err_ps);
+  vrm->zvs_locked = (abs_err <= 250U) ? 1U : 0U;
+
+  /* 3. Command-lookahead Active Pre-Charge + ZVS-Aware Phase-Shedding */
+  bool precharge = ((uint64_t)upcoming_load_amp > ((uint64_t)load_amp + 64ULL));
+  vrm->precharge_armed = precharge ? 1U : 0U;
+
+  uint8_t n_act = n_max;
+  uint32_t i_gap = (load_amp >= vrm->inductor_current_a)
+                       ? (load_amp - vrm->inductor_current_a)
+                       : (vrm->inductor_current_a - load_amp);
+  if (!precharge && i_gap <= vrm->slew_phase_a_us &&
+      vrm->v_cap_delta_mv >= -5 && vrm->v_cap_delta_mv <= 5) {
+    n_act = ele_vrm_optimal_phases(vrm, load_amp);
+  }
+  vrm->active_phases = n_act;
+
+  /* 4. Inductor current slew & output capacitor ODE (1 us integration step) */
+  int64_t max_slew = (int64_t)n_act * (int64_t)vrm->slew_phase_a_us;
+  int64_t target_i = (int64_t)load_amp;
+  if (precharge) {
+    /* Deadbeat pre-charge up to +45 mV (+6% transient margin on 750 mV rail) */
+    int64_t headroom_mv = 45LL - (int64_t)vrm->v_cap_delta_mv;
+    if (headroom_mv > 0LL) {
+      int64_t q_head_uc = ele_sdiv_i64_u32(headroom_mv * (int64_t)c_uf, 1000U);
+      int64_t pre_i = (int64_t)load_amp + q_head_uc;
+      target_i = (pre_i < (int64_t)upcoming_load_amp)
+                     ? pre_i
+                     : (int64_t)upcoming_load_amp;
+    }
+  } else if (vrm->v_cap_delta_mv != 0) {
+    /* Critically-damped deadbeat charge restoration bounded by max_slew/2 */
+    int64_t q_err_uc =
+        ele_sdiv_i64_u32((int64_t)vrm->v_cap_delta_mv * (int64_t)c_uf, 1000U);
+    int64_t half_slew = max_slew >> 1U;
+    if (q_err_uc > half_slew) {
+      q_err_uc = half_slew;
+    } else if (q_err_uc < -half_slew) {
+      q_err_uc = -half_slew;
+    }
+    target_i = (int64_t)load_amp - q_err_uc;
+    if (target_i < 0LL) {
+      target_i = 0LL;
+    }
+  }
+
+  int64_t cur_i = (int64_t)vrm->inductor_current_a;
+  int64_t diff_i = target_i - cur_i;
+  if (diff_i > max_slew) {
+    cur_i += max_slew;
+  } else if (diff_i < -max_slew) {
+    cur_i -= max_slew;
+  } else {
+    cur_i = target_i;
+  }
+  if (cur_i < 0LL) {
+    cur_i = 0LL;
+  } else if (cur_i > 0xFFFFFFFFLL) {
+    cur_i = 0xFFFFFFFFLL;
+  }
+  vrm->inductor_current_a = (uint32_t)cur_i;
+
+  int64_t dq_uc = cur_i - (int64_t)load_amp;
+  int64_t dv_mv = ele_sdiv_i64_u32(dq_uc * 1000LL, c_uf);
+  int64_t next_v_delta = (int64_t)vrm->v_cap_delta_mv + dv_mv;
+  int64_t min_v_delta =
+      -(int64_t)((vrm->v_out_nom_mv > 0U && vrm->v_out_nom_mv <= 0x7FFFFFFFU)
+                     ? vrm->v_out_nom_mv
+                     : 750U);
+  if (next_v_delta < min_v_delta) {
+    next_v_delta = min_v_delta;
+  } else if (next_v_delta > 5000LL) {
+    next_v_delta = 5000LL;
+  }
+  vrm->v_cap_delta_mv = (int32_t)next_v_delta;
+
+  if (vrm->v_cap_delta_mv < 0) {
+    uint32_t droop32 = ele_abs_i32_u32(vrm->v_cap_delta_mv);
+    uint16_t droop = (droop32 > 0xFFFFU) ? 0xFFFFU : (uint16_t)droop32;
+    if (droop > vrm->max_droop_active_mv) {
+      vrm->max_droop_active_mv = droop;
+    }
+  }
+
+  /* 5. Exact nanojoule calorimetry (1 mW * 1 us == 1 nJ) */
+  uint32_t base_mw = ele_vrm_eval_loss_mw(vrm, load_amp, n_max, false);
+  uint32_t symp_mw =
+      ele_vrm_eval_loss_mw(vrm, load_amp, n_act, vrm->zvs_locked != 0U);
+  vrm->loss_baseline_nj += (uint64_t)base_mw;
+  vrm->loss_symplectic_nj += (uint64_t)symp_mw;
+
+  return n_act;
+}
+
+void ele_rack_busbar64_init(EleRackBusbar64 *rack, uint32_t breaker_cap_a,
+                            uint32_t r_busbar_uohm) {
+  if (!rack) {
+    return;
+  }
+  ele_zero64(rack);
+  rack->breaker_cap_a = (breaker_cap_a > 0U) ? breaker_cap_a : 1400U;
+  rack->r_busbar_uohm = (r_busbar_uohm > 0U) ? r_busbar_uohm : 500U;
+}
+
+uint32_t ele_rack_step_interleave8(EleRackBusbar64 *rack,
+                                   const uint16_t req_slot_amp[8],
+                                   uint16_t per_slot_slew_a) {
+  if (!rack || !req_slot_amp) {
+    return 0U;
+  }
+
+  /* 1. Uncoordinated synchronous rack draw & harmonic I^2*R busbar waste */
+  uint32_t sync_sum = 0U;
+  uint32_t tank[8];
+  uint32_t alloc[8];
+  uint32_t symp_sum = 0U;
+
+  for (uint8_t k = 0U; k < 8U; ++k) {
+    sync_sum += (uint32_t)req_slot_amp[k];
+    tank[k] = (uint32_t)rack->slot_backlog_work[k] + (uint32_t)req_slot_amp[k];
+    uint32_t des = tank[k];
+    if (per_slot_slew_a > 0U) {
+      uint32_t max_up =
+          (uint32_t)rack->slot_current_a[k] + (uint32_t)per_slot_slew_a;
+      uint32_t lo_lim =
+          (rack->slot_current_a[k] > per_slot_slew_a)
+              ? (uint32_t)(rack->slot_current_a[k] - per_slot_slew_a)
+              : 0U;
+      if (des > max_up) {
+        des = max_up;
+      } else if (des < lo_lim && tank[k] >= lo_lim) {
+        des = lo_lim;
+      }
+    }
+    if (des > 0xFFFFU) {
+      des = 0xFFFFU;
+    }
+    alloc[k] = des;
+    symp_sum += des;
+  }
+
+  if (sync_sum > rack->peak_sync_rack_a) {
+    rack->peak_sync_rack_a = sync_sum;
+  }
+
+  /* 2. Symplectic water-filling ceiling under rack/substation breaker_cap_a:
+   *    Shaves peak crests uniformly with rotating socket fairness. */
+  if (rack->breaker_cap_a > 0U && symp_sum > rack->breaker_cap_a) {
+    uint32_t excess = symp_sum - rack->breaker_cap_a;
+    uint8_t rot_base = (uint8_t)(rack->bus_loss_symp_uj & 7ULL);
+    for (uint8_t pass = 0U; pass < 8U && excess > 0U; ++pass) {
+      uint32_t active_slots = 0U;
+      for (uint8_t k = 0U; k < 8U; ++k) {
+        if (alloc[k] > 0U) {
+          active_slots += 1U;
+        }
+      }
+      if (active_slots == 0U) {
+        break;
+      }
+      uint32_t cut_each = (excess + active_slots - 1U) / active_slots;
+      for (uint8_t ki = 0U; ki < 8U && excess > 0U; ++ki) {
+        uint8_t k = (uint8_t)((ki + rot_base + pass) & 7U);
+        uint32_t cut = (alloc[k] < cut_each) ? alloc[k] : cut_each;
+        if (cut > excess) {
+          cut = excess;
+        }
+        alloc[k] -= cut;
+        excess -= cut;
+      }
+    }
+    symp_sum = 0U;
+    for (uint8_t k = 0U; k < 8U; ++k) {
+      symp_sum += alloc[k];
+    }
+  }
+
+  for (uint8_t k = 0U; k < 8U; ++k) {
+    rack->slot_current_a[k] =
+        (alloc[k] > 0xFFFFU) ? 0xFFFFU : (uint16_t)alloc[k];
+    uint32_t rem = tank[k] - alloc[k];
+    rack->slot_backlog_work[k] = (rem > 0xFFFFU) ? 0xFFFFU : (uint16_t)rem;
+  }
+
+  if (symp_sum > rack->peak_interleaved_a) {
+    rack->peak_interleaved_a = symp_sum;
+  }
+
+  /* 3. Busbar & transformer winding I^2*R loss (uJ per 1ms wave tick) */
+  rack->bus_loss_sync_uj += ele_div_u64_u32(
+      (uint64_t)sync_sum * (uint64_t)sync_sum * (uint64_t)rack->r_busbar_uohm,
+      1000U);
+  rack->bus_loss_symp_uj += ele_div_u64_u32(
+      (uint64_t)symp_sum * (uint64_t)symp_sum * (uint64_t)rack->r_busbar_uohm,
+      1000U);
+
+  return symp_sum;
+}
+
+uint32_t ele_rack_unlocked_gpu_slots(const EleRackBusbar64 *rack,
+                                     uint32_t base_gpu_count,
+                                     uint32_t *out_sync_max_gpus) {
+  if (!rack || base_gpu_count == 0U || rack->peak_sync_rack_a == 0U ||
+      rack->peak_interleaved_a == 0U) {
+    if (out_sync_max_gpus) {
+      *out_sync_max_gpus = 0U;
+    }
+    return 0U;
+  }
+  /* Exact integer capacity without intermediate per-GPU ceiling rounding */
+  uint32_t sync_gpus = (uint32_t)ele_div_u64_u32((uint64_t)rack->breaker_cap_a *
+                                                     (uint64_t)base_gpu_count,
+                                                 rack->peak_sync_rack_a);
+  uint32_t symp_gpus = (uint32_t)ele_div_u64_u32((uint64_t)rack->breaker_cap_a *
+                                                     (uint64_t)base_gpu_count,
+                                                 rack->peak_interleaved_a);
+  if (out_sync_max_gpus) {
+    *out_sync_max_gpus = sync_gpus;
+  }
+  return symp_gpus;
+}
+
+/* ============================================================================
+ * 8. ele_grid: Diurnal Duck-Curve 800V HVDC & 60Hz/50Hz GFM Synthetic Inertia
+ * ============================================================================
+ */
+
+uint32_t ele_grid_period_ns_to_mhz(uint32_t period_ns) {
+  if (period_ns == 0U) {
+    return 0U;
+  }
+  uint64_t num = 1000000000000ULL + (uint64_t)(period_ns >> 1U);
+  uint64_t mhz = ele_div_u64_u32(num, period_ns);
+  return (mhz > 0xFFFFFFFFULL) ? 0xFFFFFFFFU : (uint32_t)mhz;
+}
+
+void ele_grid_inverter64_init(EleGridInverter64 *inv, uint32_t nom_freq_mhz,
+                              uint32_t max_power_kw, uint32_t m_inertia_kw_s_hz,
+                              uint32_t k_droop_kw_hz, uint16_t deadband_mhz) {
+  if (!inv) {
+    return;
+  }
+  ele_zero64(inv);
+  uint32_t f0 = (nom_freq_mhz >= 40000U && nom_freq_mhz <= 100000U)
+                    ? nom_freq_mhz
+                    : 60000U;
+  inv->nom_freq_mhz = f0;
+  inv->cur_freq_mhz = f0;
+  inv->max_power_kw = (max_power_kw > 0U) ? max_power_kw : 25000U;
+  inv->m_inertia_kw_s_hz = m_inertia_kw_s_hz;
+  inv->k_droop_kw_hz = k_droop_kw_hz;
+  inv->deadband_mhz = deadband_mhz;
+  inv->compute_pcap_permille = 1000U;
+  inv->nadir_gfl_mhz = f0;
+  inv->nadir_gfm_mhz = f0;
+}
+
+static inline int32_t ele_scaled_signed_kw(int32_t signed_val,
+                                           uint32_t gain_kw) {
+  if (signed_val == 0 || gain_kw == 0U) {
+    return 0;
+  }
+  bool neg = (signed_val < 0);
+  uint32_t mag = ele_abs_i32_u32(signed_val);
+  uint64_t kw = ele_div_u64_u32((uint64_t)mag * (uint64_t)gain_kw, 1000U);
+  int32_t clamped = (kw > 0x7FFFFFFFULL) ? 0x7FFFFFFF : (int32_t)kw;
+  return neg ? -clamped : clamped;
+}
+
+int32_t ele_grid_step_gfm_cycle(EleGridInverter64 *inv, uint32_t period_ns,
+                                int32_t grid_disturbance_kw,
+                                uint32_t base_grid_stiffness_kw_hz) {
+  if (!inv) {
+    return 0;
+  }
+  uint32_t f_nom = (inv->nom_freq_mhz >= 1000U) ? inv->nom_freq_mhz : 60000U;
+  uint32_t prev_mhz =
+      (inv->cur_freq_mhz >= 10000U && inv->cur_freq_mhz <= 100000U)
+          ? inv->cur_freq_mhz
+          : f_nom;
+  uint32_t meas_mhz =
+      (period_ns > 0U) ? ele_grid_period_ns_to_mhz(period_ns) : f_nom;
+  /* Hardware zero-crossing de-glitch window: [10.000 Hz, 100.000 Hz] */
+  if (meas_mhz < 10000U) {
+    meas_mhz = 10000U;
+  } else if (meas_mhz > 100000U) {
+    meas_mhz = 100000U;
+  }
+  inv->cur_freq_mhz = meas_mhz;
+
+  int32_t df_mhz = (int32_t)meas_mhz - (int32_t)f_nom;
+  int32_t d_step_mhz = (int32_t)meas_mhz - (int32_t)prev_mhz;
+  int64_t cycles_per_s = (int64_t)(f_nom / 1000U);
+  int32_t rocof = ele_sat_i64_i32((int64_t)d_step_mhz * cycles_per_s);
+  inv->rocof_mhz_s = rocof;
+
+  /* 1. Deadband-filtered primary droop + 2-Jet synthetic rotational inertia */
+  int32_t eff_df = 0;
+  int32_t db = (int32_t)inv->deadband_mhz;
+  if (df_mhz > db) {
+    eff_df = df_mhz - db;
+  } else if (df_mhz < -db) {
+    eff_df = df_mhz + db;
+  }
+
+  int32_t p_droop = -ele_scaled_signed_kw(eff_df, inv->k_droop_kw_hz);
+  int32_t p_inert = -ele_scaled_signed_kw(rocof, inv->m_inertia_kw_s_hz);
+  int64_t p_cmd64 =
+      (int64_t)inv->p_setpoint_kw + (int64_t)p_droop + (int64_t)p_inert;
+  int64_t p_lim64 = (inv->max_power_kw > 0x7FFFFFFFU)
+                        ? 0x7FFFFFFFLL
+                        : (int64_t)inv->max_power_kw;
+  if (p_cmd64 > p_lim64) {
+    p_cmd64 = p_lim64;
+  } else if (p_cmd64 < -p_lim64) {
+    p_cmd64 = -p_lim64;
+  }
+  int32_t p_cmd = (int32_t)p_cmd64;
+  inv->p_inject_kw = p_cmd;
+
+  /* 2. Symplectic virtual synchronous rotor angle update wrapped in [-pi, +pi]
+   *    (O(1) 32-bit RV32M hardware division via ele_sdiv_i64_u32, 0 __udivdi3)
+   */
+  int64_t d_theta = ele_sdiv_i64_u32((int64_t)df_mhz * 6283LL, f_nom);
+  int64_t raw_theta = (int64_t)inv->rotor_phase_mrad + d_theta;
+  int64_t turns = ele_sdiv_i64_u32(
+      raw_theta + ((raw_theta >= 0LL) ? 3141LL : -3141LL), 6283U);
+  inv->rotor_phase_mrad = (int32_t)(raw_theta - (turns * 6283LL));
+
+  /* 3. 1-Cycle Zero-Crossing Hardware Compute P-Cap Droop / Solar Sponge
+   *    (RoCoF arrest only triggers below nominal deadband, never when
+   *     recovering downward from over-frequency back toward 60.000 Hz!) */
+  if (df_mhz < -150 || (df_mhz < -db && rocof < -400)) {
+    uint32_t f_pen = (df_mhz < -150) ? (uint32_t)(-df_mhz - 150) : 0U;
+    uint32_t r_pen =
+        (rocof < -400) ? ((ele_abs_i32_u32(rocof) - 400U) >> 2U) : 0U;
+    uint64_t cut = 150ULL + (uint64_t)f_pen + (uint64_t)r_pen;
+    inv->compute_pcap_permille =
+        (cut >= 450ULL) ? 550U : (uint16_t)(1000ULL - cut);
+  } else if (df_mhz > 100) {
+    inv->compute_pcap_permille = 1150U;
+  } else {
+    inv->compute_pcap_permille = 1000U;
+  }
+
+  /* 4. Weak-grid frequency nadir audit: GFL (H=0) vs GFM synthetic inertia */
+  if (grid_disturbance_kw < 0 && base_grid_stiffness_kw_hz > 0U) {
+    uint32_t loss_kw = ele_abs_i32_u32(grid_disturbance_kw);
+    uint32_t gfl_drop_mhz = (uint32_t)ele_div_u64_u32(
+        (uint64_t)loss_kw * 1000ULL, base_grid_stiffness_kw_hz);
+    uint32_t f_gfl = (f_nom > gfl_drop_mhz) ? (f_nom - gfl_drop_mhz) : 0U;
+    if (f_gfl < inv->nadir_gfl_mhz) {
+      inv->nadir_gfl_mhz = f_gfl;
+    }
+
+    uint32_t sup_kw = (p_cmd > 0) ? (uint32_t)p_cmd : 0U;
+    uint32_t rem_kw = (loss_kw > sup_kw) ? (loss_kw - sup_kw) : 0U;
+    uint32_t gfm_drop_mhz = (uint32_t)ele_div_u64_u32(
+        (uint64_t)rem_kw * 1000ULL, base_grid_stiffness_kw_hz);
+    uint32_t f_gfm = (f_nom > gfm_drop_mhz) ? (f_nom - gfm_drop_mhz) : 0U;
+    if (f_gfm < inv->nadir_gfm_mhz) {
+      inv->nadir_gfm_mhz = f_gfm;
+    }
+  }
+  if (meas_mhz < inv->nadir_gfm_mhz) {
+    inv->nadir_gfm_mhz = meas_mhz;
+  }
+
+  if (p_cmd > 0) {
+    inv->inertia_energy_kj +=
+        ele_div_u64_u32((uint64_t)(uint32_t)p_cmd * 1000ULL, f_nom);
+  }
+  inv->cycles_stabilized += 1ULL;
+  return p_cmd;
+}
+
+void ele_grid_duck64_init(EleDuckMicrogrid64 *mg, uint32_t bess_cap_kwh,
+                          uint32_t bess_init_kwh, uint32_t thermal_cap_kwh,
+                          uint32_t thermal_init_kwh,
+                          uint32_t grid_feeder_cap_kw,
+                          uint32_t bess_max_rate_kw) {
+  if (!mg) {
+    return;
+  }
+  ele_zero64(mg);
+  mg->bess_cap_kwh = bess_cap_kwh;
+  mg->bess_soc_kwh =
+      (bess_init_kwh <= bess_cap_kwh) ? bess_init_kwh : bess_cap_kwh;
+  mg->thermal_cap_kwh = thermal_cap_kwh;
+  mg->thermal_soc_kwh = (thermal_init_kwh <= thermal_cap_kwh) ? thermal_init_kwh
+                                                              : thermal_cap_kwh;
+  mg->grid_feeder_cap_kw = grid_feeder_cap_kw;
+  mg->bess_max_rate_kw = bess_max_rate_kw;
+}
+
+uint32_t ele_grid_step_duck_hour(EleDuckMicrogrid64 *mg, uint32_t pv_avail_kw,
+                                 uint32_t rigid_compute_kw,
+                                 uint32_t elastic_batch_kw,
+                                 uint32_t cooling_elec_kw,
+                                 int32_t price_milli_per_kwh,
+                                 bool is_evening_peak) {
+  if (!mg) {
+    return 0U;
+  }
+
+  /* 1. Legacy AC-coupled rigid baseline (PV->AC->Grid->UPS->PFC: +12% IT loss,
+   *    4% PV inverter loss, zero thermal shift, zero compute phase-shift) */
+  uint32_t base_it_kw = rigid_compute_kw + elastic_batch_kw;
+  uint32_t base_conv_loss_kw = (base_it_kw * 120U) / 1000U;
+  uint32_t pv_inv_loss_kw = (pv_avail_kw * 40U) / 1000U;
+  uint32_t usable_ac_pv_kw = pv_avail_kw - pv_inv_loss_kw;
+  uint32_t base_total_kw = base_it_kw + cooling_elec_kw + base_conv_loss_kw;
+
+  if (usable_ac_pv_kw >= base_total_kw) {
+    uint32_t excess_pv = usable_ac_pv_kw - base_total_kw;
+    if (price_milli_per_kwh <= 0) {
+      mg->curtailed_pv_base_kwh += excess_pv;
+    } else if (mg->grid_feeder_cap_kw > 0U &&
+               excess_pv > mg->grid_feeder_cap_kw) {
+      mg->curtailed_pv_base_kwh += (excess_pv - mg->grid_feeder_cap_kw);
+    }
+  } else {
+    uint32_t base_import_kw = base_total_kw - usable_ac_pv_kw;
+    if (is_evening_peak && base_import_kw > mg->peak_evening_base_kw) {
+      mg->peak_evening_base_kw = base_import_kw;
+    }
+    mg->cost_baseline_milli +=
+        (int64_t)base_import_kw * (int64_t)price_milli_per_kwh;
+  }
+
+  /* 2. Symplectic 800V HVDC Direct Busbar + Thermal PCM + Compute Sponge */
+  uint32_t batch_tank = mg->batch_backlog_kwh + elastic_batch_kw;
+  uint32_t run_batch_kw = 0U;
+  uint32_t fallback_cap =
+      (rigid_compute_kw > 0U)
+          ? rigid_compute_kw
+          : ((mg->grid_feeder_cap_kw > 0U) ? mg->grid_feeder_cap_kw
+                                           : batch_tank);
+  bool solar_rich = (pv_avail_kw > (rigid_compute_kw + cooling_elec_kw)) ||
+                    (price_milli_per_kwh <= 0);
+
+  if (is_evening_peak) {
+    /* Defer elastic batch out of 16:00-22:00 evening peak */
+    run_batch_kw = 0U;
+  } else if (solar_rich) {
+    /* Midday solar canyon / negative LMP: open 3x compute sponge */
+    uint32_t cap_batch =
+        (elastic_batch_kw > 0U) ? (elastic_batch_kw * 3U) : fallback_cap;
+    run_batch_kw = (batch_tank < cap_batch) ? batch_tank : cap_batch;
+  } else {
+    /* Off-peak night hours: drain conserved backlog steadily */
+    uint32_t cap_batch =
+        (elastic_batch_kw > 0U) ? (elastic_batch_kw * 2U) : fallback_cap;
+    run_batch_kw = (batch_tank < cap_batch) ? batch_tank : cap_batch;
+  }
+  mg->batch_backlog_kwh = batch_tank - run_batch_kw;
+
+  /* Thermal cooling phase-shift: discharge PCM/ice tank during evening peak */
+  uint32_t active_cool_kw = cooling_elec_kw;
+  if (is_evening_peak && mg->thermal_soc_kwh > 0U) {
+    uint32_t dis_th = (mg->thermal_soc_kwh < active_cool_kw)
+                          ? mg->thermal_soc_kwh
+                          : active_cool_kw;
+    active_cool_kw -= dis_th;
+    mg->thermal_soc_kwh -= dis_th;
+  }
+
+  /* Direct 800V HVDC ZVS DC-DC overhead (~2.5% vs legacy ~12% + 4% PV inv) */
+  uint32_t symp_it_kw = rigid_compute_kw + run_batch_kw;
+  uint32_t hvdc_loss_kw = (symp_it_kw * 25U) / 1000U;
+  uint32_t legacy_equiv_loss = base_conv_loss_kw + pv_inv_loss_kw;
+  if (legacy_equiv_loss > hvdc_loss_kw) {
+    mg->ac_conv_waste_kwh += (legacy_equiv_loss - hvdc_loss_kw);
+  }
+
+  uint32_t dc_demand_kw = symp_it_kw + hvdc_loss_kw + active_cool_kw;
+  uint32_t symp_import_kw = 0U;
+
+  if (pv_avail_kw >= dc_demand_kw) {
+    uint32_t surp = pv_avail_kw - dc_demand_kw;
+    /* Priority A: Charge Thermal Storage (1/5th cost of Li-ion, 0 degradation)
+     */
+    uint32_t th_room = mg->thermal_cap_kwh - mg->thermal_soc_kwh;
+    uint32_t chg_th = (surp < th_room) ? surp : th_room;
+    mg->thermal_soc_kwh += chg_th;
+    surp -= chg_th;
+
+    /* Priority B: Charge 800V LFP BESS directly on DC busbar */
+    uint32_t b_room = mg->bess_cap_kwh - mg->bess_soc_kwh;
+    if (b_room > mg->bess_max_rate_kw) {
+      b_room = mg->bess_max_rate_kw;
+    }
+    uint32_t chg_b = (surp < b_room) ? surp : b_room;
+    mg->bess_soc_kwh += chg_b;
+    surp -= chg_b;
+
+    /* Negative wholesale LMP bonus: soak negative-priced grid power into lower
+     * 25% of BESS while reserving upper 75% for behind-the-meter PV peak */
+    uint32_t low_bess = mg->bess_cap_kwh >> 2U;
+    if (price_milli_per_kwh < 0 && surp == 0U && mg->bess_soc_kwh < low_bess) {
+      uint32_t rem_b = low_bess - mg->bess_soc_kwh;
+      uint32_t rate_left =
+          (mg->bess_max_rate_kw > chg_b) ? (mg->bess_max_rate_kw - chg_b) : 0U;
+      uint32_t grid_sponge = (rem_b < rate_left) ? rem_b : rate_left;
+      if (mg->grid_feeder_cap_kw > 0U && grid_sponge > mg->grid_feeder_cap_kw) {
+        grid_sponge = mg->grid_feeder_cap_kw;
+      }
+      mg->bess_soc_kwh += grid_sponge;
+      symp_import_kw = grid_sponge;
+    } else if (surp > 0U) {
+      if (price_milli_per_kwh <= 0) {
+        mg->curtailed_pv_symp_kwh += surp;
+      } else if (mg->grid_feeder_cap_kw > 0U && surp > mg->grid_feeder_cap_kw) {
+        mg->curtailed_pv_symp_kwh += (surp - mg->grid_feeder_cap_kw);
+      }
+    }
+  } else {
+    uint32_t def_kw = dc_demand_kw - pv_avail_kw;
+    if (is_evening_peak ||
+        (mg->grid_feeder_cap_kw > 0U && def_kw > mg->grid_feeder_cap_kw)) {
+      uint32_t avail_b = (mg->bess_soc_kwh < mg->bess_max_rate_kw)
+                             ? mg->bess_soc_kwh
+                             : mg->bess_max_rate_kw;
+      uint32_t dis_b = (def_kw < avail_b) ? def_kw : avail_b;
+      def_kw -= dis_b;
+      mg->bess_soc_kwh -= dis_b;
+    } else if (pv_avail_kw == 0U && price_milli_per_kwh > 0 &&
+               mg->bess_soc_kwh > (mg->bess_cap_kwh / 5U)) {
+      /* Post-peak dark hours: drain surplus solar SoC down to 20% reserve so
+       * full tank headroom is ready before sunrise */
+      uint32_t surp_soc = mg->bess_soc_kwh - (mg->bess_cap_kwh / 5U);
+      uint32_t avail_b =
+          (surp_soc < mg->bess_max_rate_kw) ? surp_soc : mg->bess_max_rate_kw;
+      uint32_t dis_b = (def_kw < avail_b) ? def_kw : avail_b;
+      def_kw -= dis_b;
+      mg->bess_soc_kwh -= dis_b;
+    } else if (!is_evening_peak && price_milli_per_kwh < 0 &&
+               mg->bess_soc_kwh < (mg->bess_cap_kwh >> 2U)) {
+      /* Negative night wind LMP: charge lower 25% of BESS while getting paid,
+       * preserving upper 75% solar sponge headroom before sunrise */
+      uint32_t low_bess = mg->bess_cap_kwh >> 2U;
+      uint32_t rem_b = low_bess - mg->bess_soc_kwh;
+      if (rem_b > mg->bess_max_rate_kw) {
+        rem_b = mg->bess_max_rate_kw;
+      }
+      if (mg->grid_feeder_cap_kw > 0U &&
+          def_kw + rem_b > mg->grid_feeder_cap_kw) {
+        rem_b = (mg->grid_feeder_cap_kw > def_kw)
+                    ? (mg->grid_feeder_cap_kw - def_kw)
+                    : 0U;
+      }
+      mg->bess_soc_kwh += rem_b;
+      def_kw += rem_b;
+    }
+    symp_import_kw = def_kw;
+  }
+
+  if (is_evening_peak && symp_import_kw > mg->peak_evening_symp_kw) {
+    mg->peak_evening_symp_kw = symp_import_kw;
+  }
+  mg->cost_symplectic_milli +=
+      (int64_t)symp_import_kw * (int64_t)price_milli_per_kwh;
+  return symp_import_kw;
 }

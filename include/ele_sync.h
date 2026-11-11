@@ -46,10 +46,10 @@ typedef struct __attribute__((aligned(64))) {
       ambient_rh_pct_q16; /* [60..63] HTU21D 0-ULP humidity (%RH, Q16.16) */
 } EleSyncNode64;
 
-_Static_assert(sizeof(EleSyncNode64) == 64,
-               "EleSyncNode64 must be exactly 64 bytes (1 cache line)");
-_Static_assert(_Alignof(EleSyncNode64) == 64,
-               "EleSyncNode64 must be 64-byte aligned");
+ELE_STATIC_ASSERT(sizeof(EleSyncNode64) == 64U,
+                  "EleSyncNode64 must be exactly 64 bytes (1 cache line)");
+ELE_STATIC_ASSERT(ELE_ALIGNOF(EleSyncNode64) == 64U,
+                  "EleSyncNode64 must be 64-byte aligned");
 
 /* Initialize 2-Jet predictive node */
 void ele_sync_node64_init(EleSyncNode64 *node, int64_t initial_x_q16,

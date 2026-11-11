@@ -61,10 +61,10 @@ typedef struct __attribute__((aligned(64))) {
                                    (uJ, Q48.16) */
 } EleMotorDrive64;
 
-_Static_assert(sizeof(EleMotorDrive64) == 64,
-               "EleMotorDrive64 must be exactly 64 bytes (1 cache line)");
-_Static_assert(_Alignof(EleMotorDrive64) == 64,
-               "EleMotorDrive64 must be 64-byte aligned");
+ELE_STATIC_ASSERT(sizeof(EleMotorDrive64) == 64U,
+                  "EleMotorDrive64 must be exactly 64 bytes (1 cache line)");
+ELE_STATIC_ASSERT(ELE_ALIGNOF(EleMotorDrive64) == 64U,
+                  "EleMotorDrive64 must be 64-byte aligned");
 
 /* Initialize OT-RK-380PH + L298N symplectic drive controller */
 void ele_drive_motor64_init(EleMotorDrive64 *drv, uint32_t v_supply_mv,

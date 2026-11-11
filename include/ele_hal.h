@@ -1,13 +1,17 @@
 #ifndef ELE_HAL_H
 #define ELE_HAL_H
 
-#include <stdalign.h>
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
 
 #ifdef __cplusplus
+#define ELE_STATIC_ASSERT(cond, msg) static_assert(cond, msg)
+#define ELE_ALIGNOF(T) alignof(T)
 extern "C" {
+#else
+#define ELE_STATIC_ASSERT(cond, msg) _Static_assert(cond, msg)
+#define ELE_ALIGNOF(T) _Alignof(T)
 #endif
 
 /* ============================================================================
@@ -70,10 +74,10 @@ typedef struct __attribute__((aligned(64))) {
       energy_saved_uj_q16; /* [56..63] Sleep energy saved vs active poll (uJ) */
 } EleHalPort64;
 
-_Static_assert(sizeof(EleHalPort64) == 64U,
-               "EleHalPort64 must be exactly 64 bytes (1 cache line)");
-_Static_assert(_Alignof(EleHalPort64) == 64U,
-               "EleHalPort64 must be 64-byte aligned");
+ELE_STATIC_ASSERT(sizeof(EleHalPort64) == 64U,
+                  "EleHalPort64 must be exactly 64 bytes (1 cache line)");
+ELE_STATIC_ASSERT(ELE_ALIGNOF(EleHalPort64) == 64U,
+                  "EleHalPort64 must be 64-byte aligned");
 
 /* Initialize canonical bare-metal MMIO & power profile for target MCU */
 void ele_hal_port64_init(EleHalPort64 *port, EleMcuArch arch);

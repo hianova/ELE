@@ -50,10 +50,10 @@ typedef struct __attribute__((aligned(64))) {
                                    (Q48.16) */
 } EleWireLink64;
 
-_Static_assert(sizeof(EleWireLink64) == 64,
-               "EleWireLink64 must be exactly 64 bytes (1 cache line)");
-_Static_assert(_Alignof(EleWireLink64) == 64,
-               "EleWireLink64 must be 64-byte aligned");
+ELE_STATIC_ASSERT(sizeof(EleWireLink64) == 64U,
+                  "EleWireLink64 must be exactly 64 bytes (1 cache line)");
+ELE_STATIC_ASSERT(ELE_ALIGNOF(EleWireLink64) == 64U,
+                  "EleWireLink64 must be 64-byte aligned");
 
 /* Initialize link descriptor and automatically match ESP32-C6 FUN_DRV */
 void ele_wire_link64_init(EleWireLink64 *link, uint32_t length_mm,

@@ -43,10 +43,10 @@ typedef struct __attribute__((aligned(64))) {
   uint8_t prev_inv_mask4;       /* [63]     Stateful 4-lane polarity wires */
 } EleCacheBus64;
 
-_Static_assert(sizeof(EleCacheBus64) == 64U,
-               "EleCacheBus64 must be exactly 64 bytes (1 cache line)");
-_Static_assert(_Alignof(EleCacheBus64) == 64U,
-               "EleCacheBus64 must be 64-byte aligned");
+ELE_STATIC_ASSERT(sizeof(EleCacheBus64) == 64U,
+                  "EleCacheBus64 must be exactly 64 bytes (1 cache line)");
+ELE_STATIC_ASSERT(ELE_ALIGNOF(EleCacheBus64) == 64U,
+                  "EleCacheBus64 must be 64-byte aligned");
 
 /* 64-Byte Cache-Line Univalent PDN dI/dt, Toggle-Entropy & Thermal Governor */
 typedef struct __attribute__((aligned(64))) {
@@ -66,10 +66,10 @@ typedef struct __attribute__((aligned(64))) {
   uint64_t gate_toggle_saved_bits; /* [56..63] Saved CMOS gate bit toggles */
 } ElePdnGrid64;
 
-_Static_assert(sizeof(ElePdnGrid64) == 64U,
-               "ElePdnGrid64 must be exactly 64 bytes (1 cache line)");
-_Static_assert(_Alignof(ElePdnGrid64) == 64U,
-               "ElePdnGrid64 must be 64-byte aligned");
+ELE_STATIC_ASSERT(sizeof(ElePdnGrid64) == 64U,
+                  "ElePdnGrid64 must be exactly 64 bytes (1 cache line)");
+ELE_STATIC_ASSERT(ELE_ALIGNOF(ElePdnGrid64) == 64U,
+                  "ElePdnGrid64 must be 64-byte aligned");
 
 /* Initialize 64B HBM / UCIe charge-minimal bus channel */
 void ele_silicon_bus64_init(EleCacheBus64 *bus, uint16_t line_cap_ff,

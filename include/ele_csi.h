@@ -58,10 +58,10 @@ typedef struct __attribute__((aligned(64))) {
       coherence_signature; /* [56..63] 64-bit spatial multipath fingerprint */
 } EleCsiState64;
 
-_Static_assert(sizeof(EleCsiState64) == 64,
-               "EleCsiState64 must be exactly 64 bytes (1 cache line)");
-_Static_assert(_Alignof(EleCsiState64) == 64,
-               "EleCsiState64 must be 64-byte aligned");
+ELE_STATIC_ASSERT(sizeof(EleCsiState64) == 64U,
+                  "EleCsiState64 must be exactly 64 bytes (1 cache line)");
+ELE_STATIC_ASSERT(ELE_ALIGNOF(EleCsiState64) == 64U,
+                  "EleCsiState64 must be 64-byte aligned");
 
 /* Initialize ESP-NOW CSI wave interferometer */
 void ele_csi_state64_init(EleCsiState64 *csi, uint16_t num_subcarriers);
