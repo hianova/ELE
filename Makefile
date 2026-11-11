@@ -33,7 +33,7 @@ RV32_OBJ := $(BUILD_DIR)/riscv32/ele_core_rv32.o
 RV32_O0_OBJ := $(BUILD_DIR)/riscv32/ele_core_rv32_O0.o
 CORE_LL := $(BUILD_DIR)/ele_core.ll
 TEST_BIN := $(BUILD_DIR)/test-ele-energy
-RTL_SV := rtl/ele_cache_bus65.sv rtl/ele_ternary_mac_dualrail.sv rtl/ele_vrm_zvs_ctrl.sv rtl/ele_grid_gfm_ctrl.sv rtl/ele_silicon_top.sv
+RTL_SV := rtl/ele_cache_bus65.sv rtl/ele_ternary_mac_dualrail.sv rtl/ele_vrm_zvs_ctrl.sv rtl/ele_grid_gfm_ctrl.sv rtl/ele_fll_droop.sv rtl/ele_sscb_trip.sv rtl/ele_slm_canary_trace.sv rtl/ele_cpo_mrr_lock.sv rtl/ele_hbm_rowhammer_guard.sv rtl/ele_resonant_clk_zvs.sv rtl/ele_level_crossing_adc.sv rtl/ele_pdn_emi_damping.sv rtl/ele_silicon_top.sv
 
 FMT_FILES := $(wildcard include/*.h src/*.c tests/*.c tests/*.cpp)
 
@@ -86,14 +86,15 @@ test: $(TEST_BIN) $(RV32_OBJ) $(RV32_O0_OBJ) $(CORE_LL)
 	@! grep -v '^[[:space:]]*;' $(CORE_LL) | grep -v '^[[:space:]]*!' | grep -Eq '@(malloc|calloc|realloc|free|aligned_alloc|posix_memalign)\b'
 	@echo "  ✓ LLVM IR verified: 0 floating-point ops/types, 0 heap allocation calls"
 	@echo "=== [Gate 3] Lean 4 Formal Specification, Verilator Co-Sim & Yosys CMOS Synthesis ==="
-	@! grep -v '^[[:space:]]*--' research/EnergyOptimality.lean | grep -Eq '\b(sorry|admit|axiom)\b'
+	@python3 -c 'import re,sys; s=open("research/EnergyOptimality.lean").read(); s=re.sub(r"/-.*?-/", "", s, flags=re.S); s=re.sub(r"--[^\n]*", "", s); sys.exit(1 if re.search(r"\b(sorry|admit|axiom|unsafe|implemented_by|extern)\b", s) else 0)'
 	@if [ -n "$(LEAN)" ]; then \
-		"$(LEAN)" research/EnergyOptimality.lean; \
-		echo "  ✓ Lean 4 formal proofs verified (24 theorems, 0 sorry)"; \
+		"$(LEAN)" research/EnergyOptimality.lean && \
+		echo "  ✓ Lean 4 formal proofs verified (43 theorems, 0 sorry)"; \
 	else \
 		echo "  ✓ Lean 4 static axiom-free check passed (install lean to run kernel checker)"; \
 	fi
 	@if [ -n "$(VERILATOR)" ]; then \
+		set -e; \
 		"$(VERILATOR)" --lint-only -Wall -Wno-DECLFILENAME --top-module ele_silicon_top $(RTL_SV); \
 		"$(VERILATOR)" --cc -Wall -Wno-DECLFILENAME --top-module ele_silicon_top $(RTL_SV) \
 			-CFLAGS "-std=c++17 -I$(abspath include)" \
@@ -107,6 +108,7 @@ test: $(TEST_BIN) $(RV32_OBJ) $(RV32_O0_OBJ) $(CORE_LL)
 		echo "  ✓ SystemVerilog RTL linted & cycle-accurate 0-ULP C17 co-simulation passed"; \
 	fi
 	@if [ -n "$(YOSYS)" ]; then \
+		set -e; \
 		"$(YOSYS)" -q -p "read_verilog -nolatches -sv $(RTL_SV); synth -top ele_silicon_top; check -assert; select -assert-none t:\$$_DLATCH* t:\$$dlatch*"; \
 		echo "  ✓ Yosys CMOS gate-level synthesis verified (0 latches, 0 DRC errors)"; \
 	fi

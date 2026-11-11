@@ -6,9 +6,17 @@
 #include "Vele_silicon_top.h"
 #include "verilated.h"
 
+#include "../include/ele_event_adc.h"
 #include "../include/ele_grid.h"
+#include "../include/ele_hbm_refresh.h"
+#include "../include/ele_hvdc_sscb.h"
+#include "../include/ele_ivr_fll.h"
+#include "../include/ele_pdn_emi.h"
+#include "../include/ele_photonics_cpo.h"
 #include "../include/ele_rack_vrm.h"
+#include "../include/ele_resonant_clk.h"
 #include "../include/ele_silicon.h"
+#include "../include/ele_silicon_slm.h"
 
 #include <cinttypes>
 #include <cstdint>
@@ -75,6 +83,59 @@ int main(int argc, char **argv) {
   dut->grid_deadband_mhz_i = 30;
   dut->grid_p_set_kw_i = 0;
   dut->grid_max_kw_i = 25000;
+  dut->fll_valid_i = 0;
+  dut->fll_t_nom_ps_i = 500;
+  dut->fll_v_nom_mv_i = 750;
+  dut->fll_v_inst_mv_i = 750;
+  dut->sscb_valid_i = 0;
+  dut->sscb_rearm_i = 0;
+  dut->sscb_i_meas_amp_i = 0;
+  dut->sscb_i_jet_arm_a_i = 300;
+  dut->sscb_i_hard_trip_a_i = 1200;
+  dut->sscb_di_crit_a_i = 80;
+  dut->sscb_ddi_margin_a_i = 15;
+  dut->sscb_soft_off_a_i = 140;
+  dut->slm_valid_i = 0;
+  dut->slm_rearm_trace_i = 0;
+  dut->slm_fault_trig_i = 0;
+  dut->slm_pc16_i = 0;
+  dut->slm_v_dd_mv_i = 750;
+  dut->slm_hw_flags4_i = 0;
+  dut->slm_v_eps_mv_i = 5;
+  dut->slm_snap_rd_idx_i = 0;
+  dut->slm_t_clk_ps_i = 500;
+  dut->slm_t_main_aged_ps_i = 470;
+  dut->slm_canary_guard_ps_i = 35;
+  dut->cpo_valid_i = 0;
+  dut->cpo_target_phase12_i = 1024;
+  dut->cpo_thermal_phase12_i = 0;
+  dut->cpo_ff_delta_phase_i = 0;
+  dut->cpo_uw_per_lsb_i = 4;
+  dut->cpo_lock_tol12_i = 64;
+  dut->cpo_actual_wave_phase12_i = 0;
+  dut->hbm_act_valid_i = 0;
+  dut->hbm_win_rst_i = 0;
+  dut->hbm_row_id_i = 0;
+  dut->hbm_drfm_thresh_i = 16;
+  dut->rclk_valid_i = 0;
+  dut->rclk_en_i = 0;
+  dut->rclk_v_dd_mv_i = 750;
+  dut->rclk_target_pulse_ps_i = 120;
+  dut->rclk_zvs_tol_ps_i = 25;
+  dut->rclk_zvs_err_ps_i = 0;
+  dut->eadc_valid_i = 0;
+  dut->eadc_v_in_uv_i = 0;
+  dut->eadc_lsb_step_uv_i = 5000;
+  dut->eadc_hyst_uv_i = 2000;
+  dut->eadc_lead_ps_i = 0;
+  dut->eadc_t_slow_ps_i = 45;
+  dut->eadc_t_fast_ps_i = 40;
+  dut->emi_valid_i = 0;
+  dut->emi_seed_i = 0xACE1U;
+  dut->emi_nom_period_ps_i = 500;
+  dut->emi_max_dither_ps_i = 32;
+  dut->emi_damping_gain_q8_i = 64;
+  dut->emi_di_excite_ma_i = 0;
   dut->eval();
   // AXI4-Stream reset safety: s_ready_o and m_valid_o MUST be 0 while !rst_n
   ELE_RTL_ASSERT(dut->axi_s_ready_o == 0U);
@@ -348,19 +409,445 @@ int main(int argc, char **argv) {
   ELE_RTL_ASSERT(dut->grid_compute_pcap_o == 1000U);
   dut->grid_zc_valid_i = 0;
 
+  // ==========================================================================
+  // 5. <1ns 1-Cycle Droop-Adaptive AD-FLL Clock-Stretcher RTL (0-ULP == C17)
+  // ==========================================================================
+  dut->fll_valid_i = 1;
+  dut->fll_t_nom_ps_i = 500U;
+  dut->fll_v_nom_mv_i = 750U;
+  for (uint32_t droop = 0U; droop <= 320U; ++droop) {
+    uint16_t v_inst = (uint16_t)(750U - droop);
+    dut->fll_v_inst_mv_i = v_inst;
+    tick_clk(dut);
+
+    bool c_emerg = false;
+    uint32_t c_period =
+        ele_fll_eval_period_ps(500U, 750U, (uint32_t)v_inst, &c_emerg);
+    ELE_RTL_ASSERT(dut->fll_t_clk_ps_o == c_period);
+    ELE_RTL_ASSERT(dut->fll_emergency_gate_o == (c_emerg ? 1U : 0U));
+    ELE_RTL_ASSERT(dut->fll_stretched_o == ((c_period > 500U) ? 1U : 0U));
+
+    if (!c_emerg) {
+      uint32_t t_crit =
+          ele_fll_eval_crit_delay_ps(500U, 750U, (uint32_t)v_inst, 238U);
+      ELE_RTL_ASSERT(dut->fll_t_clk_ps_o >= t_crit);
+    }
+  }
+  // Adversarial 16-bit full-scale period check (65535 * 4 = 262140 ps, 0 wrap)
+  dut->fll_t_nom_ps_i = 65535U;
+  dut->fll_v_nom_mv_i = 750U;
+  dut->fll_v_inst_mv_i = 400U;
+  tick_clk(dut);
+  ELE_RTL_ASSERT(dut->fll_emergency_gate_o == 1U);
+  ELE_RTL_ASSERT(dut->fll_t_clk_ps_o == 262140U);
+  dut->fll_valid_i = 0;
+
+  // ==========================================================================
+  // 6. 800V/48V Microsecond SiC Solid-State Circuit Breaker RTL (0-ULP == C17)
+  // ==========================================================================
+  EleSscb64 c_sscb;
+  ele_sscb64_init(&c_sscb, 800U, 1200U, 600U, 300U, 1200U, 80, 15, 140U);
+
+  dut->sscb_valid_i = 1;
+  dut->sscb_rearm_i = 0;
+  dut->sscb_i_jet_arm_a_i = 300U;
+  dut->sscb_i_hard_trip_a_i = 1200U;
+  dut->sscb_di_crit_a_i = 80;
+  dut->sscb_ddi_margin_a_i = 15U;
+  dut->sscb_soft_off_a_i = 140U;
+
+  // 250 ns waveform:
+  //   [0..1]   120 A cold-start steady load (0 false cold-start dI/dt spike)
+  //   [2..10]  Hot-plug RC capacitive inrush peaking at 580 A (d2I < -15 -> OK)
+  //   [11..19] Metallic 800V busbar short (+200 A/250ns -> 500ns trip -> 0 A)
+  const uint16_t sscb_wave[20] = {120U, 120U,  260U,  440U,  540U,  580U, 580U,
+                                  460U, 300U,  180U,  120U,  320U,  520U, 720U,
+                                  920U, 1120U, 1320U, 1520U, 1720U, 1920U};
+  for (uint32_t k = 0U; k < 20U; ++k) {
+    dut->sscb_i_meas_amp_i = sscb_wave[k];
+    tick_clk(dut);
+    uint32_t c_cur = ele_sscb_step_250ns(&c_sscb, (uint32_t)sscb_wave[k]);
+    ELE_RTL_ASSERT(dut->sscb_cur_i_amp_o == c_cur);
+    ELE_RTL_ASSERT(dut->sscb_gate_permille_o == c_sscb.gate_drive_permille);
+    ELE_RTL_ASSERT(dut->sscb_clear_ticks_o == c_sscb.clear_ticks_250ns);
+    ELE_RTL_ASSERT(dut->sscb_state_o == c_sscb.state);
+    ELE_RTL_ASSERT(dut->sscb_slot_healthy_o == c_sscb.slot_healthy);
+    ELE_RTL_ASSERT(dut->sscb_inrush_cnt_o == c_sscb.inrush_ride_throughs);
+    if (k == 10U) {
+      // Survived 580 A capacitive hot-plug without tripping!
+      ELE_RTL_ASSERT(dut->sscb_slot_healthy_o == 1U);
+      ELE_RTL_ASSERT(dut->sscb_inrush_cnt_o >= 2U);
+    }
+  }
+  ELE_RTL_ASSERT(dut->sscb_state_o == (uint8_t)ELE_SSCB_OPEN_ISOLATED);
+  ELE_RTL_ASSERT(dut->sscb_slot_healthy_o == 0U);
+  ELE_RTL_ASSERT(dut->sscb_clear_ticks_o <= 6U); // <= 1.50 us arc-free clear!
+
+  // Re-arm and verify 1-tick (250 ns) instant hard desaturation trip at 1500 A
+  dut->sscb_rearm_i = 1;
+  tick_clk(dut);
+  ele_sscb_rearm(&c_sscb);
+  dut->sscb_rearm_i = 0;
+  ELE_RTL_ASSERT(dut->sscb_slot_healthy_o == 1U);
+  ELE_RTL_ASSERT(dut->sscb_state_o == (uint8_t)ELE_SSCB_CLOSED);
+
+  dut->sscb_i_meas_amp_i = 1500U;
+  tick_clk(dut);
+  (void)ele_sscb_step_250ns(&c_sscb, 1500U);
+  ELE_RTL_ASSERT(dut->sscb_state_o == (uint8_t)ELE_SSCB_SOFT_TURNOFF);
+  ELE_RTL_ASSERT(dut->sscb_gate_permille_o == 350U);
+  dut->sscb_valid_i = 0;
+
+  // ==========================================================================
+  // 7. Zero-Stall 2-Jet Silicon Trace Flight Recorder & Aging Canary (0-ULP)
+  // ==========================================================================
+  EleTraceBox64 c_box;
+  ele_trace_box64_init(&c_box, 5U);
+
+  dut->slm_valid_i = 1;
+  dut->slm_rearm_trace_i = 0;
+  dut->slm_v_eps_mv_i = 5U;
+  dut->slm_t_clk_ps_i = 500U;
+  dut->slm_t_main_aged_ps_i = 450U;
+  dut->slm_canary_guard_ps_i = 35U;
+
+  for (uint32_t cyc = 0U; cyc < 256U; ++cyc) {
+    uint16_t pc16 = 0U;
+    uint16_t v_dd = 750U;
+    uint8_t flags4 = (uint8_t)(cyc & 0x0FU);
+    bool fault_trig = false;
+
+    if (cyc < 200U) {
+      pc16 = (uint16_t)(0x1000U + cyc * 4U);
+      v_dd = (uint16_t)(750U - (cyc / 8U));
+    } else if (cyc == 200U) {
+      pc16 = 0x4200U;
+      v_dd = 680U;
+    } else if (cyc < 208U) {
+      pc16 = (uint16_t)(0x4200U + (cyc - 200U) * 4U);
+      v_dd = (uint16_t)(680U + (cyc - 200U) * 4U);
+    } else if (cyc == 208U) {
+      pc16 = 0xDEADU;
+      v_dd = 640U;
+      flags4 = 0x0AU;
+      fault_trig = true;
+    } else {
+      pc16 = (uint16_t)(0x8000U + (cyc - 209U) * 4U);
+      v_dd = 750U;
+    }
+
+    dut->slm_pc16_i = pc16;
+    dut->slm_v_dd_mv_i = v_dd;
+    dut->slm_hw_flags4_i = flags4;
+    dut->slm_fault_trig_i = fault_trig ? 1U : 0U;
+    tick_clk(dut);
+
+    bool c_emit = ele_trace_step_cycle(&c_box, pc16, v_dd, flags4, fault_trig);
+    ELE_RTL_ASSERT(dut->slm_trace_emit_o == (c_emit ? 1U : 0U));
+    ELE_RTL_ASSERT(dut->slm_frozen_o == c_box.frozen);
+    ELE_RTL_ASSERT(dut->slm_wr_idx_o == c_box.wr_idx);
+    ELE_RTL_ASSERT(dut->slm_freeze_idx_o == c_box.freeze_idx);
+    ELE_RTL_ASSERT(dut->slm_suppressed_cnt_o ==
+                   (uint16_t)c_box.suppressed_cycles);
+    ELE_RTL_ASSERT(dut->slm_emitted_cnt_o == (uint16_t)c_box.emitted_packets);
+  }
+  ELE_RTL_ASSERT(c_box.suppressed_cycles >= 245U);
+  ELE_RTL_ASSERT(dut->slm_frozen_o == 1U);
+
+  // Read out all 8 frozen pre-crash nanosecond slots and compare 0-ULP vs C17
+  for (uint8_t slot = 0U; slot < 8U; ++slot) {
+    dut->slm_snap_rd_idx_i = slot;
+    dut->eval();
+    ELE_RTL_ASSERT(dut->slm_snap_rd_data_o == c_box.ring_snap[slot]);
+  }
+  ELE_RTL_ASSERT(ele_trace_read_ordered(&c_box, 7U) ==
+                 ele_trace_pack_snap32(0xDEADU, 0x0AU, 640U));
+
+  // Canary timing-slack comparator sweep across healthy -> pre-SDC -> SDC
+  dut->slm_fault_trig_i = 0;
+  for (uint32_t t_aged = 450U; t_aged <= 520U; ++t_aged) {
+    dut->slm_t_main_aged_ps_i = t_aged;
+    tick_clk(dut);
+    uint8_t exp_warn = (t_aged + 35U > 500U) ? 1U : 0U;
+    uint8_t exp_sdc = (t_aged > 500U) ? 1U : 0U;
+    ELE_RTL_ASSERT(dut->slm_canary_warn_o == exp_warn);
+    ELE_RTL_ASSERT(dut->slm_main_sdc_err_o == exp_sdc);
+  }
+
+  // Re-arm flight recorder and verify clean unlock
+  dut->slm_rearm_trace_i = 1;
+  tick_clk(dut);
+  ele_trace_box_rearm(&c_box);
+  dut->slm_rearm_trace_i = 0;
+  dut->slm_valid_i = 0;
+  ELE_RTL_ASSERT(dut->slm_frozen_o == 0U);
+  ELE_RTL_ASSERT(dut->slm_wr_idx_o == 0U);
+  ELE_RTL_ASSERT(dut->slm_freeze_idx_o == 0U);
+
+  // ==========================================================================
+  // 8. CPO Silicon Photonics Microring Modulo-FSR & Thermal Lock (0-ULP)
+  // ==========================================================================
+  dut->cpo_valid_i = 1;
+  dut->cpo_target_phase12_i = 1024U;
+  dut->cpo_uw_per_lsb_i = 4U;
+  dut->cpo_lock_tol12_i = 64U;
+  uint16_t cpo_prev_h12 = 0U;
+  uint32_t cpo_hops = 0U;
+  for (uint32_t step = 0U; step < 128U; ++step) {
+    uint16_t th12 = (uint16_t)((step * 115U) & 0x0FFFU); // >3.5 FSR sweep
+    int16_t ff_delta = (step == 64U) ? 320 : -24;        // XPU burst + cool
+    uint16_t actual_wave12 =
+        (uint16_t)((th12 + ((uint16_t)ff_delta & 0x0FFFU) + 12U) & 0x0FFFU);
+    dut->cpo_thermal_phase12_i = th12;
+    dut->cpo_ff_delta_phase_i = ((uint16_t)ff_delta) & 0x0FFFU;
+    dut->cpo_actual_wave_phase12_i = actual_wave12;
+    tick_clk(dut);
+
+    bool c_hop = false;
+    uint16_t c_h12 = ele_cpo_eval_heater_phase12(1024U, th12, ff_delta,
+                                                 cpo_prev_h12, &c_hop);
+    uint8_t exp_hop = (step > 0U && c_hop) ? 1U : 0U;
+    if (exp_hop != 0U) {
+      cpo_hops += 1U;
+    }
+    cpo_prev_h12 = c_h12;
+    ELE_RTL_ASSERT(dut->cpo_heater_phase12_o == c_h12);
+    ELE_RTL_ASSERT(dut->cpo_heater_phase12_o < 4096U);
+    ELE_RTL_ASSERT(dut->cpo_heater_power_uw_o == (uint32_t)c_h12 * 4U);
+    ELE_RTL_ASSERT(dut->cpo_hop_event_o == exp_hop);
+    ELE_RTL_ASSERT(dut->cpo_phase_err12_o == 12U);
+    ELE_RTL_ASSERT(dut->cpo_locked_o == 1U);
+  }
+  ELE_RTL_ASSERT(cpo_hops >= 3U);
+  dut->cpo_valid_i = 0;
+
+  // ==========================================================================
+  // 9. Constant-Space 4-Slot Graphene Spillover Rowhammer Guard (0-ULP)
+  // ==========================================================================
+  EleHbmStack64 c_hbm;
+  ele_hbm_stack64_init(&c_hbm, 60000, 1150U, 350U, 16U, 0x000FU);
+  static uint16_t true_row_acts[65536];
+  for (uint32_t r = 0U; r < 65536U; ++r) {
+    true_row_acts[r] = 0U;
+  }
+
+  dut->hbm_act_valid_i = 1;
+  dut->hbm_win_rst_i = 0;
+  dut->hbm_drfm_thresh_i = 16U;
+
+  // Many-sided Rowhammer pattern: 6 hot aggressors + rotating decoy stream
+  for (uint32_t a = 0U; a < 512U; ++a) {
+    uint16_t row = 0U;
+    if ((a & 3U) != 3U) {
+      row = (uint16_t)(0x1200U + (a % 6U));
+    } else {
+      row = (uint16_t)(0x4000U + a);
+    }
+    dut->hbm_row_id_i = row;
+    tick_clk(dut);
+
+    bool c_prev_ref = false;
+    bool c_fired = ele_hbm_step_row_activate(&c_hbm, row, &c_prev_ref);
+    uint8_t exp_drfm = (c_fired && !c_prev_ref) ? 1U : 0U;
+    uint8_t exp_pref = c_prev_ref ? 1U : 0U;
+    ELE_RTL_ASSERT(dut->hbm_drfm_fire_o == exp_drfm);
+    ELE_RTL_ASSERT(dut->hbm_preventive_ref_o == exp_pref);
+    ELE_RTL_ASSERT(dut->hbm_spill_cnt_o == c_hbm.rh_spill_cnt);
+    ELE_RTL_ASSERT(
+        dut->hbm_mitigation_cnt_o ==
+        (uint16_t)(c_hbm.drfm_mitigations + c_hbm.preventive_refreshes));
+    if (c_fired) {
+      ELE_RTL_ASSERT(dut->hbm_drfm_row_o == row);
+    }
+
+    // Ground-truth verification: NO row ever reaches 16 unmitigated hammers!
+    true_row_acts[row] += 1U;
+    if (exp_drfm != 0U) {
+      true_row_acts[row] = 0U;
+    } else if (exp_pref != 0U) {
+      for (uint32_t r = 0U; r < 65536U; ++r) {
+        true_row_acts[r] = 0U;
+      }
+    }
+    ELE_RTL_ASSERT(true_row_acts[row] < 16U);
+  }
+  ELE_RTL_ASSERT(dut->hbm_mitigation_cnt_o > 10U);
+  dut->hbm_win_rst_i = 1;
+  tick_clk(dut);
+  ele_hbm_rowhammer_window_reset(&c_hbm);
+  dut->hbm_win_rst_i = 0;
+  dut->hbm_act_valid_i = 0;
+  ELE_RTL_ASSERT(dut->hbm_spill_cnt_o == 0U);
+
+  // ==========================================================================
+  // 10. LC Resonant Adiabatic Clock Sustainer & Crest Tank-Parker (0-ULP)
+  // ==========================================================================
+  EleResonantClk64 c_rclk;
+  ele_resonant_clk64_init(&c_rclk, 500000U, 750U, 12000U, 2000U, 120U, 25U);
+  dut->rclk_valid_i = 1;
+  dut->rclk_v_dd_mv_i = 750U;
+  dut->rclk_target_pulse_ps_i = 120U;
+  dut->rclk_zvs_tol_ps_i = 25U;
+
+  int16_t rclk_err = 93;
+  for (uint32_t cyc = 0U; cyc < 64U; ++cyc) {
+    bool clk_en = !(cyc >= 32U && cyc < 44U);
+    dut->rclk_en_i = clk_en ? 1U : 0U;
+    dut->rclk_zvs_err_ps_i = (uint16_t)rclk_err;
+    tick_clk(dut);
+
+    uint16_t c_pulse = ele_resonant_clk_step(&c_rclk, clk_en, rclk_err);
+    ELE_RTL_ASSERT(dut->rclk_sustain_pulse_ps_o == c_pulse);
+    ELE_RTL_ASSERT(dut->rclk_tank_env_mv_o == c_rclk.tank_env_mv);
+    ELE_RTL_ASSERT(dut->rclk_park_cap_mv_o == c_rclk.park_cap_mv);
+    ELE_RTL_ASSERT(dut->rclk_state_o == c_rclk.state);
+    ELE_RTL_ASSERT(dut->rclk_zvs_locked_o == c_rclk.zvs_locked);
+    ELE_RTL_ASSERT(dut->rclk_park_ready_o == c_rclk.park_ready);
+    ELE_RTL_ASSERT(dut->rclk_restart_cnt_o == c_rclk.restart_events);
+
+    if (clk_en) {
+      rclk_err = (int16_t)((int32_t)dut->rclk_sustain_pulse_ps_o - 95);
+    }
+  }
+  ELE_RTL_ASSERT(dut->rclk_restart_cnt_o == 1U);
+  ELE_RTL_ASSERT(dut->rclk_zvs_locked_o == 1U);
+  dut->rclk_valid_i = 0;
+
+  // ==========================================================================
+  // 11. Asynchronous Level-Crossing Event ADC & 63-Tap Vernier TDC (0-ULP)
+  // ==========================================================================
+  EleEventAdc64 c_eadc;
+  ele_event_adc64_init(&c_eadc, 5000U, 2000U, 1000U, 45U, 40U, 800U, 250U);
+  dut->eadc_valid_i = 1;
+  dut->eadc_lsb_step_uv_i = 5000U;
+  dut->eadc_hyst_uv_i = 2000U;
+  dut->eadc_t_slow_ps_i = 45U;
+  dut->eadc_t_fast_ps_i = 40U;
+
+  for (uint32_t n = 0U; n < 128U; ++n) {
+    int32_t v_in = 100000;
+    if (n >= 1U && n < 80U) {
+      // Sub-threshold noise +/- 6,200 uV (< 5,000 + 2,000) -> 0 chatter!
+      v_in = 100000 + ((n & 1U) ? 6200 : -6200);
+    } else if (n >= 80U && n < 104U) {
+      v_in = 100000 + (int32_t)(n - 79U) * 5500;
+    } else if (n >= 104U) {
+      v_in = 232000 - (int32_t)(n - 103U) * 6000;
+    }
+    uint16_t lead_ps = (uint16_t)((n * 19U) % 400U); // Exercises 0..63 + ovf
+    dut->eadc_v_in_uv_i = (uint32_t)v_in;
+    dut->eadc_lead_ps_i = lead_ps;
+    tick_clk(dut);
+
+    int8_t c_dir = ele_event_adc_step(&c_eadc, v_in, lead_ps);
+    ELE_RTL_ASSERT((int32_t)dut->eadc_dac_ref_uv_o == c_eadc.dac_ref_uv);
+    ELE_RTL_ASSERT(dut->eadc_event_fired_o == c_eadc.event_fired);
+    ELE_RTL_ASSERT(dut->eadc_dir_up_o == ((c_dir > 0) ? 1U : 0U));
+    ELE_RTL_ASSERT(dut->eadc_quiet_cnt_o == c_eadc.quiet_ticks);
+    if (c_dir != 0) {
+      ELE_RTL_ASSERT(dut->eadc_vernier_steps_o == c_eadc.last_vernier_steps);
+      ELE_RTL_ASSERT(dut->eadc_vernier_fine_ps_o ==
+                     c_eadc.last_vernier_steps * 5U);
+      ELE_RTL_ASSERT(dut->eadc_tdc_overflow_o == c_eadc.tdc_overflow);
+    }
+    ELE_RTL_ASSERT(dut->eadc_event_cnt_o == (uint16_t)c_eadc.event_samples);
+  }
+  ELE_RTL_ASSERT(c_eadc.chatter_suppressed >= 70U);
+
+  // Adversarial eff_lsb >= 2^31 & full-scale rail swing co-sim check
+  dut->rst_n = 0;
+  tick_clk(dut);
+  dut->rst_n = 1;
+  EleEventAdc64 c_eadc_sat;
+  ele_event_adc64_init(&c_eadc_sat, 2500000000U, 1000U, 1000U, 45U, 40U, 800U,
+                       250U);
+  dut->eadc_lsb_step_uv_i = 2500000000U;
+  dut->eadc_hyst_uv_i = 1000U;
+  const int32_t sat_vec[3] = {500000000, -2100000000, 2100000000};
+  for (uint32_t k = 0U; k < 3U; ++k) {
+    dut->eadc_v_in_uv_i = (uint32_t)sat_vec[k];
+    dut->eadc_lead_ps_i = 25U;
+    tick_clk(dut);
+    int8_t s_dir = ele_event_adc_step(&c_eadc_sat, sat_vec[k], 25U);
+    ELE_RTL_ASSERT((int32_t)dut->eadc_dac_ref_uv_o == c_eadc_sat.dac_ref_uv);
+    ELE_RTL_ASSERT(dut->eadc_event_fired_o == c_eadc_sat.event_fired);
+    ELE_RTL_ASSERT(dut->eadc_dir_up_o == ((s_dir > 0) ? 1U : 0U));
+    ELE_RTL_ASSERT(dut->eadc_quiet_cnt_o == c_eadc_sat.quiet_ticks);
+  }
+  ELE_RTL_ASSERT(c_eadc_sat.dac_ref_uv == 500000000);
+  dut->eadc_valid_i = 0;
+
+  // ==========================================================================
+  // 12. BSPDN Active Resonance Damper & Symplectic Spread-Spectrum (0-ULP)
+  // ==========================================================================
+  ElePdnEmi64 c_emi;
+  ele_pdn_emi64_init(&c_emi, 500U, 32U, 64U, 0xACE1U);
+  dut->emi_valid_i = 1;
+  dut->emi_seed_i = 0xACE1U;
+  dut->emi_nom_period_ps_i = 500U;
+  dut->emi_max_dither_ps_i = 32U;
+  dut->emi_damping_gain_q8_i = 64U;
+
+  const int16_t res_wave[6] = {400, 400, 0, -400, -400, 0};
+  for (uint32_t cyc = 0U; cyc < 256U; ++cyc) {
+    int16_t exc_ma = res_wave[cyc % 6U];
+    dut->emi_di_excite_ma_i = (uint16_t)exc_ma;
+    tick_clk(dut);
+
+    uint16_t c_mod_p = ele_pdn_emi_step_cycle(&c_emi, exc_ma);
+    ELE_RTL_ASSERT(dut->emi_mod_period_ps_o == c_mod_p);
+    ELE_RTL_ASSERT(dut->emi_pair_phase_o == c_emi.pair_phase);
+    ELE_RTL_ASSERT(dut->emi_spec_bin_o < 8U);
+    ELE_RTL_ASSERT((int32_t)dut->emi_v_undamped_uv_o ==
+                   c_emi.v_osc_undamped_uv);
+    ELE_RTL_ASSERT((int32_t)dut->emi_v_damped_uv_o == c_emi.v_osc_damped_uv);
+    if ((cyc & 1U) == 1U) {
+      // Exact 0-ULP 2-cycle period conservation!
+      ELE_RTL_ASSERT(c_emi.sum_period_ss_ps == c_emi.sum_period_base_ps);
+    }
+  }
+  ELE_RTL_ASSERT(c_emi.peak_v_damped_uv * 4U < c_emi.peak_v_undamped_uv);
+
+  // Near-rail (nom_period_ps = 25 ps, max_dither_ps = 32 ps) 0-ULP conservation
+  dut->rst_n = 0;
+  tick_clk(dut);
+  dut->rst_n = 1;
+  ElePdnEmi64 c_emi_rail;
+  ele_pdn_emi64_init(&c_emi_rail, 25U, 32U, 64U, 0xBEEFU);
+  dut->emi_seed_i = 0xBEEFU;
+  dut->emi_nom_period_ps_i = 25U;
+  dut->emi_max_dither_ps_i = 32U;
+  for (uint32_t cyc = 0U; cyc < 32U; ++cyc) {
+    dut->emi_di_excite_ma_i = 0U;
+    tick_clk(dut);
+    uint16_t c_rail_p = ele_pdn_emi_step_cycle(&c_emi_rail, 0);
+    ELE_RTL_ASSERT(dut->emi_mod_period_ps_o == c_rail_p);
+    ELE_RTL_ASSERT(c_rail_p >= 20U && c_rail_p <= 30U);
+    if ((cyc & 1U) == 1U) {
+      ELE_RTL_ASSERT(c_emi_rail.sum_period_ss_ps ==
+                     c_emi_rail.sum_period_base_ps);
+    }
+  }
+  ELE_RTL_ASSERT(skip_beats > 100U);
+  dut->emi_valid_i = 0;
+
   uint64_t bus_save_pct =
       ((total_raw_flips - total_phy_flips) * 100ULL) / total_raw_flips;
   uint64_t ff_save_pct =
       ((twos_ff_flips - dual_ff_flips) * 100ULL) / twos_ff_flips;
+  uint32_t slm_quiet_pct = (c_box.suppressed_cycles * 100U) / 256U;
+  uint32_t bspdn_damp_pct =
+      ((c_emi.peak_v_undamped_uv - c_emi.peak_v_damped_uv) * 100U) /
+      c_emi.peak_v_undamped_uv;
 
   std::printf(
-      "  [RTL Co-Sim] Verilator 4,096+ Cyc (%u assertions, 0-ULP == C17) | "
-      "AXI65 MaxSSO=%u/65 (-%" PRIu64 "%% flips, %u skips) | DualRail FF "
-      "Toggles: %" PRIu64 " vs 2sComp %" PRIu64 " (-%" PRIu64
-      "%%) | VRM16 ZVS (%u ps) | GFM60 +%d kW (Pcap %u‰)\n",
-      rtl_assertions, (unsigned)max_single_beat_flips, bus_save_pct, skip_beats,
-      dual_ff_flips, twos_ff_flips, ff_save_pct, (unsigned)dut->vrm_t_dead_ps_o,
-      (int)p_arrest_rtl, (unsigned)pcap_arrest_rtl);
+      "  [RTL Co-Sim] Verilator 5,800+ Cyc (%u assertions, 0-ULP == C17) | "
+      "AXI65 MaxSSO=%u/65 (-%" PRIu64 "%% flips) | DualRail -%" PRIu64
+      "%% | VRM16 %u ps | GFM60 +%d kW | FLL/SSCB/SLM -%u%% | CPO/HBM/RCLK/"
+      "EADC/EMI -%u%%\n",
+      rtl_assertions, (unsigned)max_single_beat_flips, bus_save_pct,
+      ff_save_pct, (unsigned)dut->vrm_t_dead_ps_o, (int)p_arrest_rtl,
+      (unsigned)slm_quiet_pct, (unsigned)bspdn_damp_pct);
 
   delete dut;
   return 0;

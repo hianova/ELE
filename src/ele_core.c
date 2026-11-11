@@ -1,11 +1,20 @@
 #include "../include/ele_csi.h"
 #include "../include/ele_drive.h"
 #include "../include/ele_driver.h"
+#include "../include/ele_event_adc.h"
 #include "../include/ele_grid.h"
 #include "../include/ele_hal.h"
+#include "../include/ele_hbm_refresh.h"
+#include "../include/ele_hvdc_sscb.h"
+#include "../include/ele_ivr_fll.h"
+#include "../include/ele_pdn_emi.h"
+#include "../include/ele_photonics_cpo.h"
 #include "../include/ele_rack_vrm.h"
+#include "../include/ele_resonant_clk.h"
 #include "../include/ele_silicon.h"
+#include "../include/ele_silicon_slm.h"
 #include "../include/ele_sync.h"
+#include "../include/ele_thermo_fluid.h"
 #include "../include/ele_wire.h"
 
 #if defined(__GNUC__) || defined(__clang__)
@@ -15,7 +24,7 @@ typedef uint64_t ele_u64_alias_t;
 #endif
 
 static inline void ele_zero64(void *ptr) {
-  ele_u64_alias_t *p = (ele_u64_alias_t *)ptr;
+  volatile ele_u64_alias_t *p = (volatile ele_u64_alias_t *)ptr;
   p[0] = 0ULL;
   p[1] = 0ULL;
   p[2] = 0ULL;
@@ -536,8 +545,15 @@ void ele_driver_decode_burst_axes(EleDriverCodec64 *axes, uint8_t num_axes,
     uint8_t frame[4] = {0U, 0U, 0U, 0U};
     if (bus_transfer_ok && burst_buf) {
       const uint8_t *src = burst_buf + ((uint32_t)k * (uint32_t)stride_bytes);
-      for (uint8_t b = 0U; b < stride_bytes && b < 4U; ++b) {
-        frame[b] = src[b];
+      frame[0] = src[0];
+      if (stride_bytes > 1U) {
+        frame[1] = src[1];
+      }
+      if (stride_bytes > 2U) {
+        frame[2] = src[2];
+      }
+      if (stride_bytes > 3U) {
+        frame[3] = src[3];
       }
     }
     int32_t val =
@@ -2425,4 +2441,1482 @@ uint32_t ele_grid_step_duck_hour(EleDuckMicrogrid64 *mg, uint32_t pv_avail_kw,
   mg->cost_symplectic_milli +=
       (int64_t)symp_import_kw * (int64_t)price_milli_per_kwh;
   return symp_import_kw;
+}
+
+/* ============================================================================
+ * 10. Package Coupled-Inductor IVR & <1ns Droop-Adaptive AD-FLL (`ele_ivr_fll`)
+ * ============================================================================
+ */
+
+void ele_ivr_fll64_init(EleIvrFll64 *fll, uint32_t v_nom_mv,
+                        uint32_t v_guard_static_mv, uint32_t v_th_mv,
+                        uint32_t t_nom_ps, uint32_t l_pkg_uv_per_a,
+                        uint32_t ivr_slew_mv_cyc) {
+  if (!fll) {
+    return;
+  }
+  ele_zero64(fll);
+  fll->v_nom_mv = (v_nom_mv >= 300U) ? v_nom_mv : 750U;
+  fll->v_guard_static_mv = (v_guard_static_mv > 0U) ? v_guard_static_mv : 80U;
+  fll->v_th_mv = (v_th_mv < fll->v_nom_mv) ? v_th_mv : 238U;
+  fll->t_nom_ps = (t_nom_ps >= 50U) ? t_nom_ps : 500U;
+  fll->v_inst_mv = fll->v_nom_mv;
+  fll->t_clk_ps = fll->t_nom_ps;
+  fll->l_pkg_uv_per_a = (l_pkg_uv_per_a > 0U) ? l_pkg_uv_per_a : 250U;
+  fll->ivr_slew_mv_cyc = (ivr_slew_mv_cyc > 0U) ? ivr_slew_mv_cyc : 20U;
+}
+
+uint32_t ele_fll_eval_period_ps(uint32_t t_nom_ps, uint32_t v_nom_mv,
+                                uint32_t v_inst_mv, bool *out_emergency_gate) {
+  if (v_inst_mv >= v_nom_mv) {
+    if (out_emergency_gate) {
+      *out_emergency_gate = false;
+    }
+    return t_nom_ps;
+  }
+  uint32_t droop_mv = v_nom_mv - v_inst_mv;
+  if (droop_mv > 256U) {
+    if (out_emergency_gate) {
+      *out_emergency_gate = true;
+    }
+    uint64_t p4 = (uint64_t)t_nom_ps * 4ULL;
+    return (p4 > 0xFFFFFFFFULL) ? 0xFFFFFFFFU : (uint32_t)p4;
+  }
+  if (out_emergency_gate) {
+    *out_emergency_gate = false;
+  }
+  uint64_t lin_num = (uint64_t)t_nom_ps * (uint64_t)droop_mv + 511ULL;
+  uint32_t dt1_ps = (uint32_t)ele_shr64(lin_num, 9U);
+  uint32_t droop_sq = droop_mv * droop_mv;
+  uint64_t quad_num = (uint64_t)t_nom_ps * (uint64_t)droop_sq + 131071ULL;
+  uint32_t dt2_ps = (uint32_t)ele_shr64(quad_num, 17U);
+  uint64_t total_ps = (uint64_t)t_nom_ps + (uint64_t)dt1_ps + (uint64_t)dt2_ps;
+  return (total_ps > 0xFFFFFFFFULL) ? 0xFFFFFFFFU : (uint32_t)total_ps;
+}
+
+uint32_t ele_fll_eval_crit_delay_ps(uint32_t t_nom_ps, uint32_t v_nom_mv,
+                                    uint32_t v_inst_mv, uint32_t v_th_mv) {
+  if (v_nom_mv <= v_th_mv) {
+    return t_nom_ps;
+  }
+  if (v_inst_mv <= v_th_mv) {
+    return 0xFFFFFFFFU;
+  }
+  uint32_t vod_nom = v_nom_mv - v_th_mv;
+  uint32_t vod_inst = v_inst_mv - v_th_mv;
+  uint64_t num =
+      (uint64_t)t_nom_ps * (uint64_t)vod_nom + (uint64_t)(vod_inst - 1U);
+  uint64_t res = ele_div_u64_u32(num, vod_inst);
+  return (res > 0xFFFFFFFFULL) ? 0xFFFFFFFFU : (uint32_t)res;
+}
+
+uint32_t ele_ivr_fll_step_cycle(EleIvrFll64 *fll, uint32_t load_amp) {
+  if (!fll) {
+    return 0U;
+  }
+  uint32_t v_nom = (fll->v_nom_mv >= 300U)
+                       ? ((fll->v_nom_mv > 65535U) ? 65535U : fll->v_nom_mv)
+                       : 750U;
+  uint32_t v_guard =
+      (fll->v_guard_static_mv > 65535U) ? 65535U : fll->v_guard_static_mv;
+  uint32_t v_th = (fll->v_th_mv < v_nom) ? fll->v_th_mv : 238U;
+  uint32_t t_nom = (fll->t_nom_ps >= 50U)
+                       ? ((fll->t_nom_ps > 65535U) ? 65535U : fll->t_nom_ps)
+                       : 500U;
+  uint32_t slew_mv =
+      (fll->ivr_slew_mv_cyc > 0U)
+          ? ((fll->ivr_slew_mv_cyc > 65535U) ? 65535U : fll->ivr_slew_mv_cyc)
+          : 20U;
+  uint32_t v_cur = (fll->v_inst_mv > 0U && fll->v_inst_mv <= 65535U)
+                       ? fll->v_inst_mv
+                       : v_nom;
+
+  /* 1. Coupled-inductor IVR charge restoration toward v_nom */
+  if (v_cur < v_nom) {
+    uint32_t gap = v_nom - v_cur;
+    v_cur += (gap < slew_mv) ? gap : slew_mv;
+  } else if (v_cur > v_nom) {
+    uint32_t over = v_cur - v_nom;
+    v_cur -= (over < slew_mv) ? over : slew_mv;
+  }
+
+  /* 2. Sub-nanosecond package L_pkg * max(0, dI/dt) voltage droop */
+  uint32_t di_rise =
+      (load_amp > fll->prev_load_amp) ? (load_amp - fll->prev_load_amp) : 0U;
+  uint64_t droop_mv64 =
+      ele_div_u64_u32((uint64_t)di_rise * (uint64_t)fll->l_pkg_uv_per_a, 1000U);
+  uint32_t droop_step_mv =
+      (droop_mv64 > 0xFFFFULL) ? 0xFFFFU : (uint32_t)droop_mv64;
+
+  uint32_t v_floor = v_th + 64U;
+  if (v_floor > v_nom) {
+    v_floor = v_nom;
+  }
+  if (v_cur > v_floor + droop_step_mv) {
+    v_cur -= droop_step_mv;
+  } else {
+    v_cur = v_floor;
+  }
+  fll->v_inst_mv = v_cur;
+  fll->prev_load_amp = load_amp;
+
+  /* 3. Normalize overdrive to 512 mV reference if near-threshold vod < 512 */
+  uint32_t vod_nom = v_nom - v_th;
+  uint32_t v_eff_inst = v_cur;
+  if (v_cur < v_nom && vod_nom > 0U && vod_nom < 512U) {
+    uint32_t raw_droop = v_nom - v_cur;
+    uint64_t scaled_droop = ele_div_u64_u32(
+        (uint64_t)raw_droop * 512ULL + (uint64_t)(vod_nom - 1U), vod_nom);
+    v_eff_inst = (scaled_droop >= (uint64_t)v_nom)
+                     ? 0U
+                     : (v_nom - (uint32_t)scaled_droop);
+  }
+
+  bool emerg = false;
+  uint32_t t_clk = ele_fll_eval_period_ps(t_nom, v_nom, v_eff_inst, &emerg);
+  fll->t_clk_ps = t_clk;
+  if (t_clk > t_nom) {
+    fll->stretch_cycles += 1U;
+  }
+
+  /* 4. Audit setup-time violations (SDC) vs fixed-clock static guardband */
+  uint32_t t_crit_fll = ele_fll_eval_crit_delay_ps(t_nom, v_nom, v_cur, v_th);
+  if (!emerg && t_crit_fll > t_clk) {
+    fll->fll_sdc_faults += 1U;
+  }
+
+  uint64_t v_static_inst64 = (uint64_t)v_cur + (uint64_t)v_guard;
+  uint32_t v_static_inst =
+      (v_static_inst64 > 0xFFFFULL) ? 0xFFFFU : (uint32_t)v_static_inst64;
+  uint32_t t_crit_static =
+      ele_fll_eval_crit_delay_ps(t_nom, v_nom, v_static_inst, v_th);
+  if (t_crit_static > t_nom) {
+    fll->baseline_sdc_faults += 1U;
+  }
+
+  /* 5. Dynamic energy per 1,000-cycle burst: E_dyn = C_eff * V_dd^2 (in uJ) */
+  uint32_t clamped_load = (load_amp > 100000U) ? 100000U : load_amp;
+  uint64_t v_static_nom = (uint64_t)v_nom + (uint64_t)v_guard;
+  uint64_t e_guard = ele_div_u64_u32(
+      (uint64_t)clamped_load * v_static_nom * v_static_nom, v_nom * 1000U);
+  uint64_t e_fll = ele_div_u64_u32((uint64_t)clamped_load * (uint64_t)v_cur *
+                                       (uint64_t)v_cur,
+                                   v_nom * 1000U);
+  fll->energy_guardband_uj += e_guard;
+  fll->energy_fll_uj += e_fll;
+
+  return t_clk;
+}
+
+/* ============================================================================
+ * 11. 800V/48V Microsecond SiC Solid-State Circuit Breaker (`ele_hvdc_sscb`)
+ * ============================================================================
+ */
+
+void ele_sscb64_init(EleSscb64 *cb, uint32_t v_bus_nom_v,
+                     uint32_t v_sw_breakdown_v, uint32_t l_bus_nh,
+                     uint32_t i_jet_arm_a, uint32_t i_hard_trip_a,
+                     int32_t di_crit_a_tick, int32_t ddi_inrush_margin,
+                     uint32_t soft_off_a_tick) {
+  if (!cb) {
+    return;
+  }
+  ele_zero64(cb);
+  cb->v_bus_nom_v = (v_bus_nom_v > 0U) ? v_bus_nom_v : 800U;
+  cb->v_sw_breakdown_v =
+      (v_sw_breakdown_v > cb->v_bus_nom_v) ? v_sw_breakdown_v : 1200U;
+  cb->l_bus_nh = (l_bus_nh > 0U) ? l_bus_nh : 600U;
+  cb->i_jet_arm_a = (i_jet_arm_a > 0U) ? i_jet_arm_a : 300U;
+  cb->i_hard_trip_a =
+      (i_hard_trip_a > cb->i_jet_arm_a)
+          ? i_hard_trip_a
+          : ((cb->i_jet_arm_a <= 0x3FFFFFFFU) ? (cb->i_jet_arm_a * 4U)
+                                              : 0xFFFFFFFFU);
+  cb->di_crit_a_tick = (di_crit_a_tick > 0) ? di_crit_a_tick : 80;
+  cb->ddi_inrush_margin = (ddi_inrush_margin >= 0) ? ddi_inrush_margin : 15;
+  cb->soft_off_a_tick = (soft_off_a_tick > 0U) ? soft_off_a_tick : 140U;
+  cb->gate_drive_permille = 1000U;
+  cb->state = (uint8_t)ELE_SSCB_CLOSED;
+  cb->slot_healthy = 1U;
+}
+
+void ele_sscb_rearm(EleSscb64 *cb) {
+  if (!cb) {
+    return;
+  }
+  cb->cur_i_amp = 0U;
+  cb->di_a_tick = 0;
+  cb->ddi_a_tick2 = 0;
+  cb->gate_drive_permille = 1000U;
+  cb->clear_ticks_250ns = 0U;
+  cb->primed = 0U;
+  cb->state = (uint8_t)ELE_SSCB_CLOSED;
+  cb->fault_streak = 0U;
+  cb->slot_healthy = 1U;
+}
+
+uint32_t ele_sscb_step_250ns(EleSscb64 *cb, uint32_t measured_i_amp) {
+  if (!cb) {
+    return 0U;
+  }
+  if (cb->state == (uint8_t)ELE_SSCB_OPEN_ISOLATED) {
+    cb->cur_i_amp = 0U;
+    cb->di_a_tick = 0;
+    cb->ddi_a_tick2 = 0;
+    cb->gate_drive_permille = 0U;
+    cb->slot_healthy = 0U;
+    return 0U;
+  }
+
+  uint32_t soft_step = (cb->soft_off_a_tick > 0U) ? cb->soft_off_a_tick : 140U;
+
+  if (cb->state == (uint8_t)ELE_SSCB_SOFT_TURNOFF) {
+    uint32_t ramped_i =
+        (cb->cur_i_amp > soft_step) ? (cb->cur_i_amp - soft_step) : 0U;
+    uint32_t next_i = (measured_i_amp < ramped_i) ? measured_i_amp : ramped_i;
+    int32_t new_di = ele_sat_i64_i32((int64_t)next_i - (int64_t)cb->cur_i_amp);
+    int32_t new_ddi = ele_sat_i64_i32((int64_t)new_di - (int64_t)cb->di_a_tick);
+    cb->cur_i_amp = next_i;
+    cb->di_a_tick = new_di;
+    cb->ddi_a_tick2 = new_ddi;
+    if (cb->clear_ticks_250ns < 255U) {
+      cb->clear_ticks_250ns += 1U;
+    }
+    if (next_i == 0U) {
+      cb->state = (uint8_t)ELE_SSCB_OPEN_ISOLATED;
+      cb->gate_drive_permille = 0U;
+      cb->slot_healthy = 0U;
+    }
+    return next_i;
+  }
+
+  /* State == ELE_SSCB_CLOSED: 2-Jet Inrush vs Short-Circuit Discriminator */
+  int32_t new_di = 0;
+  int32_t new_ddi = 0;
+  if (cb->primed == 0U) {
+    cb->primed = 1U;
+  } else {
+    new_di = ele_sat_i64_i32((int64_t)measured_i_amp - (int64_t)cb->cur_i_amp);
+    new_ddi = ele_sat_i64_i32((int64_t)new_di - (int64_t)cb->di_a_tick);
+  }
+
+  uint32_t i_arm = (cb->i_jet_arm_a > 0U) ? cb->i_jet_arm_a : 300U;
+  uint32_t i_hard = (cb->i_hard_trip_a > i_arm)
+                        ? cb->i_hard_trip_a
+                        : ((i_arm <= 0x3FFFFFFFU) ? (i_arm * 4U) : 0xFFFFFFFFU);
+  int64_t margin =
+      (cb->ddi_inrush_margin >= 0) ? (int64_t)cb->ddi_inrush_margin : 0LL;
+  int64_t neg_margin = -margin;
+
+  bool hard_fault = (measured_i_amp >= i_hard);
+  bool jet_fault = (measured_i_amp >= i_arm) &&
+                   (new_di >= cb->di_crit_a_tick) &&
+                   ((int64_t)new_ddi >= neg_margin);
+  bool rc_inrush = (measured_i_amp >= i_arm) && (new_di > 0) &&
+                   ((int64_t)new_ddi < neg_margin);
+
+  cb->cur_i_amp = measured_i_amp;
+  cb->di_a_tick = new_di;
+  cb->ddi_a_tick2 = new_ddi;
+
+  if (rc_inrush && cb->inrush_ride_throughs < 255U) {
+    cb->inrush_ride_throughs += 1U;
+  }
+
+  uint8_t next_streak = 0U;
+  if (jet_fault) {
+    next_streak =
+        (cb->fault_streak < 255U) ? (uint8_t)(cb->fault_streak + 1U) : 255U;
+  }
+  cb->fault_streak = next_streak;
+
+  if (hard_fault || next_streak >= 2U) {
+    cb->state = (uint8_t)ELE_SSCB_SOFT_TURNOFF;
+    cb->gate_drive_permille = 350U;
+    cb->clear_ticks_250ns = 1U;
+    if (measured_i_amp > cb->peak_fault_i_amp) {
+      cb->peak_fault_i_amp = measured_i_amp;
+    }
+    uint64_t v_soft =
+        (uint64_t)cb->v_bus_nom_v +
+        ele_div_u64_u32((uint64_t)cb->l_bus_nh * (uint64_t)soft_step, 250U);
+    uint64_t v_hard =
+        (uint64_t)cb->v_bus_nom_v +
+        ele_div_u64_u32((uint64_t)cb->l_bus_nh * (uint64_t)measured_i_amp, 25U);
+    uint32_t vs32 = (v_soft > 0xFFFFFFFFULL) ? 0xFFFFFFFFU : (uint32_t)v_soft;
+    uint32_t vh32 = (v_hard > 0xFFFFFFFFULL) ? 0xFFFFFFFFU : (uint32_t)v_hard;
+    if (vs32 > cb->peak_v_sw_soft_v) {
+      cb->peak_v_sw_soft_v = vs32;
+    }
+    if (vh32 > cb->peak_v_sw_hard_v) {
+      cb->peak_v_sw_hard_v = vh32;
+    }
+  }
+
+  return measured_i_amp;
+}
+
+/* ============================================================================
+ * 12. Two-Phase Microchannel Boiling & Cube-Law Pump (`ele_thermo_fluid`)
+ * ============================================================================
+ */
+
+void ele_coldplate64_init(EleColdPlate64 *cp, uint32_t flow_max_ml_s,
+                          uint32_t flow_min_ml_s, uint32_t pump_rated_mw,
+                          uint32_t h_fg_j_per_ml, int32_t t_coolant_in_mc,
+                          uint32_t pump_slew_ml_tick,
+                          uint16_t chf_crit_permille) {
+  if (!cp) {
+    return;
+  }
+  ele_zero64(cp);
+  cp->flow_max_ml_s = (flow_max_ml_s >= 5U) ? flow_max_ml_s : 50U;
+  cp->flow_min_ml_s = (flow_min_ml_s > 0U && flow_min_ml_s <= cp->flow_max_ml_s)
+                          ? flow_min_ml_s
+                          : 10U;
+  cp->pump_rated_mw = (pump_rated_mw > 0U) ? pump_rated_mw : 60000U;
+  cp->h_fg_j_per_ml = (h_fg_j_per_ml > 0U) ? h_fg_j_per_ml : 40U;
+  cp->t_coolant_in_mc = t_coolant_in_mc;
+  cp->t_junc_mc = ele_sat_i64_i32((int64_t)t_coolant_in_mc + 2000LL);
+  cp->cur_flow_ml_s = cp->flow_min_ml_s;
+  cp->pump_slew_ml_tick = (pump_slew_ml_tick > 0U) ? pump_slew_ml_tick : 6U;
+  cp->chf_crit_permille =
+      (chf_crit_permille >= 100U && chf_crit_permille <= 950U)
+          ? chf_crit_permille
+          : 700U;
+}
+
+uint32_t ele_thermo_eval_pump_mw(const EleColdPlate64 *cp, uint32_t flow_ml_s) {
+  if (!cp) {
+    return 0U;
+  }
+  uint32_t f_max = (cp->flow_max_ml_s > 0U) ? cp->flow_max_ml_s : 50U;
+  uint32_t p_rated = (cp->pump_rated_mw > 0U) ? cp->pump_rated_mw : 60000U;
+  uint32_t f = (flow_ml_s > f_max) ? f_max : flow_ml_s;
+
+  /* 4% static bearing/controller tare + 96% hydraulic shaft cube law */
+  uint32_t p_idle = p_rated / 25U;
+  uint32_t p_shaft = p_rated - p_idle;
+  uint32_t u_permille = (uint32_t)ele_div_u64_u32((uint64_t)f * 1000ULL, f_max);
+  uint32_t u_cubed = u_permille * u_permille * u_permille;
+  uint32_t dyn_mw = (uint32_t)ele_div_u64_u32(
+      (uint64_t)p_shaft * (uint64_t)u_cubed, 1000000000U);
+  return p_idle + dyn_mw;
+}
+
+uint32_t ele_coldplate_step_10ms(EleColdPlate64 *cp, uint32_t q_chip_watt,
+                                 uint32_t upcoming_q_watt) {
+  if (!cp) {
+    return 0U;
+  }
+  uint32_t f_max =
+      (cp->flow_max_ml_s >= 5U)
+          ? ((cp->flow_max_ml_s > 65535U) ? 65535U : cp->flow_max_ml_s)
+          : 50U;
+  uint32_t f_min = (cp->flow_min_ml_s > 0U && cp->flow_min_ml_s <= f_max)
+                       ? cp->flow_min_ml_s
+                       : 10U;
+  uint32_t h_fg =
+      (cp->h_fg_j_per_ml > 0U)
+          ? ((cp->h_fg_j_per_ml > 65535U) ? 65535U : cp->h_fg_j_per_ml)
+          : 40U;
+  uint32_t slew =
+      (cp->pump_slew_ml_tick > 0U)
+          ? ((cp->pump_slew_ml_tick > f_max) ? f_max : cp->pump_slew_ml_tick)
+          : 6U;
+  uint16_t x_crit =
+      (cp->chf_crit_permille >= 100U && cp->chf_crit_permille <= 950U)
+          ? cp->chf_crit_permille
+          : 700U;
+
+  uint32_t q_now = (q_chip_watt > 50000U) ? 50000U : q_chip_watt;
+  uint32_t q_up = (upcoming_q_watt > 50000U) ? 50000U : upcoming_q_watt;
+  uint32_t q_prev = (cp->prev_q_watt > 50000U) ? 50000U : cp->prev_q_watt;
+
+  /* 1. 2-Jet thermal heat-flux lookahead across 5-tick (50 ms) rotor inertia */
+  int32_t new_dq = (int32_t)q_now - (int32_t)q_prev;
+  int32_t ddq = ele_sat_i64_i32((int64_t)new_dq - (int64_t)cp->dq_watt_tick);
+  cp->prev_q_watt = q_now;
+  cp->dq_watt_tick = new_dq;
+
+  int64_t pos_dq = (new_dq > 0) ? (int64_t)new_dq : 0LL;
+  int64_t pos_ddq = (ddq > 0) ? (int64_t)ddq : 0LL;
+  uint64_t q_pred = (uint64_t)q_now + (uint64_t)(pos_dq * 5LL) +
+                    (uint64_t)((pos_ddq * 25LL) >> 1U);
+  if ((uint64_t)q_up > q_pred) {
+    q_pred = (uint64_t)q_up;
+  }
+
+  /* 2. Target 75% of critical vapor quality for safe nucleate boiling */
+  uint32_t x_target = ((uint32_t)x_crit * 3U) >> 2U;
+  if (x_target == 0U) {
+    x_target = 500U;
+  }
+  uint32_t denom = h_fg * x_target;
+  uint64_t req_flow64 =
+      ele_div_u64_u32(q_pred * 1000ULL + (uint64_t)(denom - 1U), denom);
+  uint32_t target_flow =
+      (req_flow64 > (uint64_t)f_max)
+          ? f_max
+          : ((req_flow64 < (uint64_t)f_min) ? f_min : (uint32_t)req_flow64);
+
+  /* Counterfactual reactive thermostat flow (lags behind burst onset) */
+  uint64_t prev_req64 = ele_div_u64_u32(
+      (uint64_t)q_prev * 1000ULL + (uint64_t)(denom - 1U), denom);
+  uint32_t react_base =
+      (prev_req64 > (uint64_t)f_max)
+          ? f_max
+          : ((prev_req64 < (uint64_t)f_min) ? f_min : (uint32_t)prev_req64);
+  uint32_t react_flow =
+      (react_base + slew > f_max) ? f_max : (react_base + slew);
+
+  /* 3. Mechanical rotor slew-rate evolution */
+  uint32_t f_cur =
+      (cp->cur_flow_ml_s >= f_min)
+          ? ((cp->cur_flow_ml_s > f_max) ? f_max : cp->cur_flow_ml_s)
+          : f_min;
+  if (f_cur < target_flow) {
+    uint32_t up = target_flow - f_cur;
+    f_cur += (up < slew) ? up : slew;
+  } else if (f_cur > target_flow) {
+    uint32_t down_slew = (slew + 1U) >> 1U;
+    uint32_t down = f_cur - target_flow;
+    f_cur -= (down < down_slew) ? down : down_slew;
+  }
+  cp->cur_flow_ml_s = f_cur;
+
+  /* 4. Evaluate microchannel exit vapor quality & CHF dryout crisis */
+  uint64_t x_symp64 = ele_div_u64_u32((uint64_t)q_now * 1000ULL, f_cur * h_fg);
+  uint64_t x_react64 =
+      ele_div_u64_u32((uint64_t)q_now * 1000ULL, react_flow * h_fg);
+  uint16_t x_symp = (x_symp64 > 1000ULL) ? 1000U : (uint16_t)x_symp64;
+  cp->vapor_qual_permille = x_symp;
+
+  if (x_react64 >= (uint64_t)x_crit && cp->dryout_events_react < 65535U) {
+    cp->dryout_events_react += 1U;
+  }
+
+  int64_t t_sat_mc = (int64_t)cp->t_coolant_in_mc + 8000LL;
+  int64_t t_eq_mc = t_sat_mc;
+  if (x_symp >= x_crit) {
+    /* Film-boiling vapor blanketing: conductance collapses 8x (200 mC/W) */
+    if (cp->dryout_events_symp < 65535U) {
+      cp->dryout_events_symp += 1U;
+    }
+    t_eq_mc = t_sat_mc + (int64_t)q_now * 200LL;
+  } else {
+    /* Nucleate boiling: high two-phase conductance (22 mC/W) */
+    t_eq_mc = t_sat_mc + (int64_t)q_now * 22LL;
+  }
+  int64_t step_mc = ele_asr64(t_eq_mc - (int64_t)cp->t_junc_mc, 2U);
+  cp->t_junc_mc = ele_sat_i64_i32((int64_t)cp->t_junc_mc + step_mc);
+
+  /* 5. Accumulate 10 ms (0.01 s) pump energy in mJ: E_mJ = P_mW / 100 */
+  uint32_t p_fixed_mw = ele_thermo_eval_pump_mw(cp, f_max);
+  uint32_t p_symp_mw = ele_thermo_eval_pump_mw(cp, f_cur);
+  cp->pump_energy_fixed_mj += (uint64_t)((p_fixed_mw + 50U) / 100U);
+  cp->pump_energy_symp_mj += (uint64_t)((p_symp_mw + 50U) / 100U);
+
+  return f_cur;
+}
+
+/* ============================================================================
+ * 13. Silicon Lifecycle Management, Zero-Stall Trace & Canary DFT (`ele_slm`)
+ * ============================================================================
+ */
+
+void ele_trace_box64_init(EleTraceBox64 *box, uint16_t v_eps_mv) {
+  if (!box) {
+    return;
+  }
+  ele_zero64(box);
+  box->v_eps_mv = (v_eps_mv > 4095U) ? 4095U : v_eps_mv;
+  box->pc_stride16 = 4U;
+}
+
+void ele_trace_box_rearm(EleTraceBox64 *box) {
+  if (!box) {
+    return;
+  }
+  box->wr_idx = 0U;
+  box->freeze_idx = 0U;
+  box->frozen = 0U;
+}
+
+bool ele_trace_step_cycle(EleTraceBox64 *box, uint16_t pc16, uint16_t v_dd_mv,
+                          uint8_t hw_flags4, bool fault_trigger) {
+  if (!box) {
+    return false;
+  }
+  uint16_t v12 = (v_dd_mv > 4095U) ? 4095U : v_dd_mv;
+  uint16_t eps12 = (box->v_eps_mv > 4095U) ? 4095U : box->v_eps_mv;
+  uint32_t snap = ele_trace_pack_snap32(pc16, hw_flags4, v12);
+
+  /* 1. Pre-trigger 8-slot circular flight recorder (0-stall SRAM/FF ring) */
+  if (box->frozen == 0U) {
+    uint8_t cur_wr = (uint8_t)(box->wr_idx & 7U);
+    box->ring_snap[cur_wr] = snap;
+    if (fault_trigger) {
+      box->frozen = 1U;
+      box->freeze_idx = cur_wr;
+      if (box->trigger_count < 65535U) {
+        box->trigger_count += 1U;
+      }
+    } else {
+      box->wr_idx = (uint8_t)((cur_wr + 1U) & 7U);
+    }
+  }
+
+  /* 2. Zero-stall 2-Jet PVT + modular PC-stride trace compressor */
+  bool quiet = false;
+  if (box->primed == 0U) {
+    box->primed = 1U;
+    box->prev_pc16 = pc16;
+    box->pc_stride16 = 4U;
+    box->prev_v_mv = v12;
+    box->dv_mv_cyc = 0;
+  } else {
+    uint16_t expected_pc =
+        (uint16_t)((uint32_t)box->prev_pc16 + (uint32_t)box->pc_stride16);
+    int32_t pred_v = (int32_t)box->prev_v_mv + (int32_t)box->dv_mv_cyc;
+    int32_t v_err = (int32_t)v12 - pred_v;
+    uint32_t abs_v_err = ele_abs_i32_u32(v_err);
+
+    quiet = (!fault_trigger) && (pc16 == expected_pc) &&
+            (abs_v_err <= (uint32_t)eps12);
+
+    uint16_t new_stride = (uint16_t)((uint32_t)pc16 - (uint32_t)box->prev_pc16);
+    int16_t new_dv = (int16_t)((int32_t)v12 - (int32_t)box->prev_v_mv);
+    box->prev_pc16 = pc16;
+    box->pc_stride16 = new_stride;
+    box->prev_v_mv = v12;
+    box->dv_mv_cyc = new_dv;
+  }
+
+  if (box->full_trace_bits <= 0xFFFFFFFFU - 32U) {
+    box->full_trace_bits += 32U;
+  } else {
+    box->full_trace_bits = 0xFFFFFFFFU;
+  }
+
+  if (quiet) {
+    if (box->suppressed_cycles < 0xFFFFFFFFU) {
+      box->suppressed_cycles += 1U;
+    }
+  } else {
+    if (box->emitted_packets < 0xFFFFFFFFU) {
+      box->emitted_packets += 1U;
+    }
+    if (box->slm_trace_bits <= 0xFFFFFFFFU - 32U) {
+      box->slm_trace_bits += 32U;
+    } else {
+      box->slm_trace_bits = 0xFFFFFFFFU;
+    }
+  }
+  return !quiet;
+}
+
+uint32_t ele_trace_read_ordered(const EleTraceBox64 *box, uint8_t age_idx) {
+  if (!box) {
+    return 0U;
+  }
+  uint8_t k = (uint8_t)(age_idx & 7U);
+  uint8_t slot = (box->frozen != 0U)
+                     ? (uint8_t)((box->freeze_idx + 1U + k) & 7U)
+                     : (uint8_t)((box->wr_idx + k) & 7U);
+  return box->ring_snap[slot];
+}
+
+void ele_canary64_init(EleAgingCanary64 *can, uint32_t v_th_base_mv,
+                       uint32_t canary_guard_ps, uint16_t max_aged_vth_mv,
+                       uint32_t r_baseline_uohm, uint32_t r_warn_uohm) {
+  if (!can) {
+    return;
+  }
+  ele_zero64(can);
+  can->v_th_base_mv =
+      (v_th_base_mv > 0U && v_th_base_mv <= 2000U) ? v_th_base_mv : 238U;
+  can->canary_guard_ps = (canary_guard_ps > 0U && canary_guard_ps <= 5000U)
+                             ? canary_guard_ps
+                             : 35U;
+  can->max_aged_vth_mv = (max_aged_vth_mv > (uint16_t)can->v_th_base_mv)
+                             ? max_aged_vth_mv
+                             : (uint16_t)(can->v_th_base_mv + 120U);
+  can->r_baseline_uohm = (r_baseline_uohm > 0U) ? r_baseline_uohm : 200U;
+  can->r_warn_uohm = (r_warn_uohm > can->r_baseline_uohm) ? r_warn_uohm : 600U;
+  can->r_measured_uohm = can->r_baseline_uohm;
+}
+
+uint32_t ele_canary_step_and_heal(EleAgingCanary64 *can, EleIvrFll64 *fll,
+                                  uint32_t load_amp,
+                                  uint32_t true_nbti_shift_mv,
+                                  uint32_t delta_kilohours) {
+  if (!can || !fll) {
+    return 0U;
+  }
+  if (can->stress_kilohours <= 0xFFFFFFFFU - delta_kilohours) {
+    can->stress_kilohours += delta_kilohours;
+  } else {
+    can->stress_kilohours = 0xFFFFFFFFU;
+  }
+
+  uint32_t v_nom = (fll->v_nom_mv >= 300U)
+                       ? ((fll->v_nom_mv > 65535U) ? 65535U : fll->v_nom_mv)
+                       : 750U;
+  uint32_t t_nom = (fll->t_nom_ps >= 50U)
+                       ? ((fll->t_nom_ps > 65535U) ? 65535U : fll->t_nom_ps)
+                       : 500U;
+  uint32_t v_th0 = (can->v_th_base_mv < v_nom) ? can->v_th_base_mv : 238U;
+  uint32_t guard_ps =
+      (can->canary_guard_ps <= 5000U) ? can->canary_guard_ps : 35U;
+  uint32_t nbti_mv = (true_nbti_shift_mv > 256U) ? 256U : true_nbti_shift_mv;
+
+  /* 1. Step IVR rail voltage using fresh v_th0 baseline, then add compensated
+   *    NBTI shift `est_vth_shift_mv` as effective overdrive droop into AD-FLL!
+   */
+  fll->v_th_mv = v_th0;
+  (void)ele_ivr_fll_step_cycle(fll, load_amp);
+
+  uint32_t v_inst = fll->v_inst_mv;
+  uint32_t comp_shift =
+      (can->est_vth_shift_mv > 256U) ? 256U : can->est_vth_shift_mv;
+  uint32_t v_fll_eff = (v_inst > comp_shift) ? (v_inst - comp_shift) : 0U;
+  uint32_t vod_fresh = (v_nom > v_th0) ? (v_nom - v_th0) : 512U;
+  if (v_fll_eff < v_nom && vod_fresh > 0U && vod_fresh < 512U) {
+    uint32_t raw_droop = v_nom - v_fll_eff;
+    uint64_t scaled = ele_div_u64_u32(
+        (uint64_t)raw_droop * 512ULL + (uint64_t)(vod_fresh - 1U), vod_fresh);
+    v_fll_eff = (scaled >= (uint64_t)v_nom) ? 0U : (v_nom - (uint32_t)scaled);
+  }
+  bool emerg = false;
+  uint32_t t_clk_healed =
+      ele_fll_eval_period_ps(t_nom, v_nom, v_fll_eff, &emerg);
+  fll->t_clk_ps = t_clk_healed;
+
+  /* 2. True aged critical-path delay: T_nom * (V_nom - V_th0) / (V_inst -
+   * V_th_aged) */
+  uint32_t v_th_aged = v_th0 + nbti_mv;
+  uint32_t t_main_aged = 0xFFFFFFFFU;
+  if (v_inst > v_th_aged) {
+    uint32_t vod_aged = v_inst - v_th_aged;
+    uint64_t num =
+        (uint64_t)t_nom * (uint64_t)vod_fresh + (uint64_t)(vod_aged - 1U);
+    uint64_t d64 = ele_div_u64_u32(num, vod_aged);
+    t_main_aged = (d64 > 0xFFFFFFFFULL) ? 0xFFFFFFFFU : (uint32_t)d64;
+  }
+
+  /* Counterfactual unmonitored AD-FLL (unaware of NBTI V_th shift) */
+  bool emerg_unmon = false;
+  uint32_t t_clk_unmon =
+      ele_fll_eval_period_ps(t_nom, v_nom, v_inst, &emerg_unmon);
+  if (!emerg_unmon && t_main_aged > t_clk_unmon) {
+    can->main_sdc_unmonitored += 1U;
+  }
+
+  /* Audit healed main-path SDC (0 violations while canary guards margin) */
+  if (!emerg && t_main_aged > t_clk_healed) {
+    can->main_sdc_healed += 1U;
+  }
+
+  /* 3. Canary shadow path (`t_main_aged + guard_ps`) & closed-loop healing */
+  uint64_t t_canary64 = (uint64_t)t_main_aged + (uint64_t)guard_ps;
+  if (t_canary64 > (uint64_t)t_clk_healed) {
+    can->canary_alarm = 1U;
+    can->canary_pre_alarms += 1U;
+    if (can->est_vth_shift_mv + 8U <= 256U) {
+      can->est_vth_shift_mv += 8U;
+      can->self_heal_steps += 1U;
+    }
+  } else {
+    can->canary_alarm = 0U;
+  }
+
+  if (v_th0 + can->est_vth_shift_mv >= (uint32_t)can->max_aged_vth_mv) {
+    can->retire_recommended = 1U;
+  }
+  fll->v_th_mv = v_th0 + can->est_vth_shift_mv;
+
+  can->rem_slack_ps =
+      (t_clk_healed > t_main_aged) ? (t_clk_healed - t_main_aged) : 0U;
+  return can->rem_slack_ps;
+}
+
+uint32_t ele_canary_probe_contact_uohm(EleAgingCanary64 *can,
+                                       uint32_t sense_v_uv, uint32_t load_amp) {
+  if (!can) {
+    return 0U;
+  }
+  if (can->sample_primed == 0U || load_amp <= can->prev_sample_i_amp) {
+    can->prev_sample_v_uv = sense_v_uv;
+    can->prev_sample_i_amp = load_amp;
+    can->sample_primed = 1U;
+    return can->r_measured_uohm;
+  }
+
+  uint32_t di_a = load_amp - can->prev_sample_i_amp;
+  if (di_a >= 20U && can->prev_sample_v_uv >= sense_v_uv) {
+    uint32_t dv_uv = can->prev_sample_v_uv - sense_v_uv;
+    uint32_t r_uohm = dv_uv / di_a;
+    can->r_measured_uohm = r_uohm;
+    uint32_t r_warn = (can->r_warn_uohm > 0U) ? can->r_warn_uohm : 600U;
+    if (r_uohm >= r_warn) {
+      can->solder_fatigue_warn = 1U;
+      if (can->contact_fault_events < 65535U) {
+        can->contact_fault_events += 1U;
+      }
+    } else {
+      can->solder_fatigue_warn = 0U;
+    }
+  }
+  return can->r_measured_uohm;
+}
+
+/* ============================================================================
+ * 14. CPO Silicon Photonics Microring Modulo-FSR & Lock (`ele_photonics_cpo`)
+ * ============================================================================
+ */
+
+void ele_cpo_mrr64_init(EleCpoMrr64 *mrr, uint16_t target_phase12,
+                        uint16_t base_temp_c, uint16_t k_to_phase_per_c,
+                        uint16_t uw_per_phase_lsb, uint16_t lock_tol_phase12,
+                        uint16_t k_gpu_ff_mdeg_per_w,
+                        uint16_t bistable_limit_uw) {
+  if (!mrr) {
+    return;
+  }
+  ele_zero64(mrr);
+  mrr->target_phase12 = target_phase12 & 0x0FFFU;
+  mrr->base_temp_c =
+      (base_temp_c > 0U && base_temp_c <= 150U) ? base_temp_c : 25U;
+  mrr->k_to_phase_per_c =
+      (k_to_phase_per_c > 0U) ? k_to_phase_per_c : 512U; /* 8 C per FSR */
+  mrr->uw_per_phase_lsb = (uw_per_phase_lsb > 0U) ? uw_per_phase_lsb : 4U;
+  mrr->lock_tol_phase12 = (lock_tol_phase12 > 0U && lock_tol_phase12 <= 2048U)
+                              ? lock_tol_phase12
+                              : 64U;
+  mrr->k_gpu_ff_mdeg_per_w =
+      (k_gpu_ff_mdeg_per_w > 0U) ? k_gpu_ff_mdeg_per_w : 25U;
+  mrr->bistable_limit_uw = (bistable_limit_uw > 0U) ? bistable_limit_uw : 4000U;
+  mrr->die_temp_mc = (int32_t)mrr->base_temp_c * 1000;
+}
+
+uint16_t ele_cpo_eval_heater_phase12(uint16_t target_phase12,
+                                     uint16_t thermal_phase12,
+                                     int16_t ff_delta_phase,
+                                     uint16_t prev_heater_phase12,
+                                     bool *out_hop) {
+  uint16_t tgt12 = target_phase12 & 0x0FFFU;
+  uint16_t th12 = thermal_phase12 & 0x0FFFU;
+  uint16_t ff12 = ((uint16_t)ff_delta_phase) & 0x0FFFU;
+  uint16_t pred12 = (uint16_t)((th12 + ff12) & 0x0FFFU);
+  uint16_t next12 = (uint16_t)((tgt12 - pred12) & 0x0FFFU);
+  uint16_t prev12 = prev_heater_phase12 & 0x0FFFU;
+  uint16_t jump12 = (next12 >= prev12) ? (next12 - prev12) : (prev12 - next12);
+  if (out_hop) {
+    *out_hop = (jump12 > 2048U);
+  }
+  return next12;
+}
+
+uint32_t ele_cpo_mrr_step_ms(EleCpoMrr64 *mrr, int32_t meas_temp_mc,
+                             uint16_t gpu_watt, uint16_t laser_in_uw) {
+  if (!mrr) {
+    return 0U;
+  }
+  uint16_t k_to = (mrr->k_to_phase_per_c > 0U) ? mrr->k_to_phase_per_c : 512U;
+  uint16_t uw_lsb = (mrr->uw_per_phase_lsb > 0U) ? mrr->uw_per_phase_lsb : 4U;
+  uint16_t tol12 = (mrr->lock_tol_phase12 > 0U) ? mrr->lock_tol_phase12 : 64U;
+  uint16_t bi_cap =
+      (mrr->bistable_limit_uw > 0U) ? mrr->bistable_limit_uw : 4000U;
+
+  /* 1. Clamp input optical power strictly below two-photon bistability knee */
+  if (laser_in_uw > bi_cap) {
+    mrr->opt_power_uw = bi_cap;
+    mrr->bistable_clamped = 1U;
+  } else {
+    mrr->opt_power_uw = laser_in_uw;
+    mrr->bistable_clamped = 0U;
+  }
+  mrr->self_heat_phase12 = (uint16_t)(((uint32_t)mrr->opt_power_uw * 3U) >> 6U);
+
+  /* 2. Compute unwrapped thermo-optic phase shift relative to base_temp_c */
+  int64_t base_mc = (int64_t)mrr->base_temp_c * 1000LL;
+  int64_t dt_mc = (int64_t)meas_temp_mc - base_mc;
+  uint64_t abs_dt_mc =
+      (dt_mc < 0LL) ? (0ULL - (uint64_t)dt_mc) : (uint64_t)dt_mc;
+  uint64_t mag_phase = ele_div_u64_u32(abs_dt_mc * (uint64_t)k_to, 1000U);
+  uint16_t th_phase12 = (dt_mc < 0LL)
+                            ? (uint16_t)((0U - (uint32_t)mag_phase) & 0x0FFFU)
+                            : (uint16_t)((uint32_t)mag_phase & 0x0FFFU);
+  th_phase12 = (uint16_t)((th_phase12 + mrr->self_heat_phase12) & 0x0FFFU);
+
+  /* 3. 2-Jet thermal velocity + adjacent XPU power-step wave feedforward */
+  int32_t d_temp =
+      (mrr->primed != 0U)
+          ? ele_sat_i64_i32((int64_t)meas_temp_mc - (int64_t)mrr->die_temp_mc)
+          : 0;
+  int32_t d_gpu_w = (mrr->primed != 0U)
+                        ? ((int32_t)gpu_watt - (int32_t)mrr->prev_gpu_watt)
+                        : 0;
+  int64_t wave_mc =
+      (int64_t)d_temp + (int64_t)d_gpu_w * (int64_t)mrr->k_gpu_ff_mdeg_per_w;
+  uint64_t abs_wave_mc =
+      (wave_mc < 0LL) ? (0ULL - (uint64_t)wave_mc) : (uint64_t)wave_mc;
+  uint64_t wave_mag = ele_div_u64_u32(abs_wave_mc * (uint64_t)k_to, 1000U);
+  if (wave_mag > 2047ULL) {
+    wave_mag = 2047ULL;
+  }
+  int16_t ff_phase = (wave_mc < 0LL) ? -(int16_t)wave_mag : (int16_t)wave_mag;
+
+  bool hop = false;
+  uint16_t next_h12 = ele_cpo_eval_heater_phase12(
+      mrr->target_phase12, th_phase12, ff_phase, mrr->heater_phase12, &hop);
+  if (mrr->primed != 0U && hop) {
+    mrr->hop_event = 1U;
+    if (mrr->fsr_hops < 0xFFFFFFFFU) {
+      mrr->fsr_hops += 1U;
+    }
+  } else {
+    mrr->hop_event = 0U;
+  }
+
+  /* 4. Audit carrier phase error at end of 1 ms frame as heat wave arrives */
+  uint16_t actual_wave12 =
+      (uint16_t)((th_phase12 + ((uint16_t)ff_phase & 0x0FFFU)) & 0x0FFFU);
+  uint16_t comp_total12 = (uint16_t)((actual_wave12 + next_h12) & 0x0FFFU);
+  uint16_t diff12 =
+      (uint16_t)(((mrr->target_phase12 & 0x0FFFU) - comp_total12) & 0x0FFFU);
+  uint16_t err12 = (diff12 > 2048U) ? (uint16_t)(4096U - diff12) : diff12;
+  mrr->last_phase_err12 = err12;
+  if (err12 <= tol12) {
+    mrr->locked = 1U;
+  } else {
+    mrr->locked = 0U;
+    if (mrr->unlock_drops_hop < 0xFFFFFFFFU) {
+      mrr->unlock_drops_hop += 1U;
+    }
+  }
+
+  /* Counterfactual reactive loop without 2-Jet / XPU feedforward (ff = 0) */
+  uint16_t no_ff_h12 = ele_cpo_eval_heater_phase12(
+      mrr->target_phase12, th_phase12, 0, mrr->heater_phase12, NULL);
+  uint16_t no_ff_tot12 = (uint16_t)((actual_wave12 + no_ff_h12) & 0x0FFFU);
+  uint16_t no_ff_diff12 =
+      (uint16_t)(((mrr->target_phase12 & 0x0FFFU) - no_ff_tot12) & 0x0FFFU);
+  uint16_t no_ff_err12 =
+      (no_ff_diff12 > 2048U) ? (uint16_t)(4096U - no_ff_diff12) : no_ff_diff12;
+  if (no_ff_err12 > tol12 && mrr->unlock_drops_no_ff < 0xFFFFFFFFU) {
+    mrr->unlock_drops_no_ff += 1U;
+  }
+
+  /* 5. Heater power & 1 ms energy (1 mW * 1 ms = 1 uJ): Modulo-FSR vs Fixed */
+  uint32_t p_hop_uw = (uint32_t)next_h12 * (uint32_t)uw_lsb;
+  mrr->heater_power_uw = (p_hop_uw > 65535U) ? 65535U : (uint16_t)p_hop_uw;
+
+  /* Fixed-mode heater must hold ring above a 4-FSR (16,384 LSB) ceiling */
+  uint64_t fixed_lsb =
+      (mag_phase < 16384ULL) ? (16384ULL - mag_phase) : 4096ULL;
+  uint64_t p_conv_uw = fixed_lsb * (uint64_t)uw_lsb;
+  uint32_t d_hop_uj = (p_hop_uw + 500U) / 1000U;
+  uint32_t d_conv_uj = (uint32_t)ele_div_u64_u32(p_conv_uw + 500ULL, 1000U);
+
+  if (mrr->energy_hop_uj <= 0xFFFFFFFFU - d_hop_uj) {
+    mrr->energy_hop_uj += d_hop_uj;
+  } else {
+    mrr->energy_hop_uj = 0xFFFFFFFFU;
+  }
+  if (mrr->energy_conv_uj <= 0xFFFFFFFFU - d_conv_uj) {
+    mrr->energy_conv_uj += d_conv_uj;
+  } else {
+    mrr->energy_conv_uj = 0xFFFFFFFFU;
+  }
+  if (mrr->total_frames < 0xFFFFFFFFU) {
+    mrr->total_frames += 1U;
+  }
+
+  mrr->heater_phase12 = next_h12;
+  mrr->prev_raw_phase12 = th_phase12;
+  mrr->die_temp_mc = meas_temp_mc;
+  mrr->d_temp_mc = d_temp;
+  mrr->prev_gpu_watt = gpu_watt;
+  mrr->primed = 1U;
+  return p_hop_uw;
+}
+
+/* ============================================================================
+ * 15. HBM4 3D Thermal-Refresh Breaker & Rowhammer Guard (`ele_hbm_refresh`)
+ * ============================================================================
+ */
+
+static inline uint8_t ele_hbm_eval_jedec_mult(int32_t temp_mc) {
+  if (temp_mc >= 95000) {
+    return 8U;
+  }
+  if (temp_mc >= 85000) {
+    return 4U;
+  }
+  if (temp_mc >= 75000) {
+    return 2U;
+  }
+  return 1U;
+}
+
+void ele_hbm_stack64_init(EleHbmStack64 *hbm, int32_t amb_temp_mc,
+                          uint16_t r_th_mc_per_w, uint16_t p_ref_bank_mw,
+                          uint16_t rh_drfm_thresh, uint16_t live_bank_mask) {
+  if (!hbm) {
+    return;
+  }
+  ele_zero64(hbm);
+  hbm->temp_jedec_mc = amb_temp_mc;
+  hbm->temp_symp_mc = amb_temp_mc;
+  hbm->r_th_mc_per_w = (r_th_mc_per_w > 0U) ? r_th_mc_per_w : 1150U;
+  hbm->p_ref_bank_mw = (p_ref_bank_mw > 0U) ? p_ref_bank_mw : 350U;
+  hbm->rh_drfm_thresh = (rh_drfm_thresh > 0U) ? rh_drfm_thresh : 256U;
+  hbm->live_bank_mask = live_bank_mask;
+  hbm->cur_ref_mult = ele_hbm_eval_jedec_mult(amb_temp_mc);
+}
+
+void ele_hbm_rowhammer_window_reset(EleHbmStack64 *hbm) {
+  if (!hbm) {
+    return;
+  }
+  hbm->rh_cnt[0] = 0U;
+  hbm->rh_cnt[1] = 0U;
+  hbm->rh_cnt[2] = 0U;
+  hbm->rh_cnt[3] = 0U;
+  hbm->rh_spill_cnt = 0U;
+  hbm->rh_valid_mask = 0U;
+}
+
+bool ele_hbm_step_row_activate(EleHbmStack64 *hbm, uint16_t row_id,
+                               bool *out_preventive_ref) {
+  if (out_preventive_ref) {
+    *out_preventive_ref = false;
+  }
+  if (!hbm) {
+    return false;
+  }
+  uint16_t eff_thresh = (hbm->rh_drfm_thresh == 0U) ? 1U : hbm->rh_drfm_thresh;
+
+  /* 1. Check 4-slot associative match (priority 0 -> 1 -> 2 -> 3) */
+  for (uint8_t i = 0U; i < 4U; ++i) {
+    if (((hbm->rh_valid_mask >> i) & 1U) != 0U && hbm->rh_row[i] == row_id) {
+      uint32_t inc = (uint32_t)hbm->rh_cnt[i] + 1U;
+      if (inc >= (uint32_t)eff_thresh) {
+        hbm->rh_cnt[i] = hbm->rh_spill_cnt;
+        hbm->last_drfm_row = row_id;
+        if (hbm->drfm_mitigations < 0xFFFFFFFFU) {
+          hbm->drfm_mitigations += 1U;
+        }
+        return true;
+      }
+      hbm->rh_cnt[i] = (uint16_t)inc;
+      return false;
+    }
+  }
+
+  /* 2. Allocate free slot if any available */
+  if ((hbm->rh_valid_mask & 0x0FU) != 0x0FU) {
+    uint8_t free_idx = 0U;
+    for (uint8_t i = 0U; i < 4U; ++i) {
+      if (((hbm->rh_valid_mask >> i) & 1U) == 0U) {
+        free_idx = i;
+        break;
+      }
+    }
+    hbm->rh_valid_mask |= (uint8_t)(1U << free_idx);
+    hbm->rh_row[free_idx] = row_id;
+    uint32_t inc = (uint32_t)hbm->rh_spill_cnt + 1U;
+    if (inc >= (uint32_t)eff_thresh) {
+      hbm->rh_cnt[free_idx] = hbm->rh_spill_cnt;
+      hbm->last_drfm_row = row_id;
+      if (hbm->drfm_mitigations < 0xFFFFFFFFU) {
+        hbm->drfm_mitigations += 1U;
+      }
+      return true;
+    }
+    hbm->rh_cnt[free_idx] = (uint16_t)inc;
+    return false;
+  }
+
+  /* 3. Exact 2-level tournament min-slot selection (0-ULP == RTL) */
+  uint8_t min01_idx = (hbm->rh_cnt[1] < hbm->rh_cnt[0]) ? 1U : 0U;
+  uint16_t min01_val = hbm->rh_cnt[min01_idx];
+  uint8_t min23_idx = (hbm->rh_cnt[3] < hbm->rh_cnt[2]) ? 3U : 2U;
+  uint16_t min23_val = hbm->rh_cnt[min23_idx];
+  uint8_t min_idx = (min23_val < min01_val) ? min23_idx : min01_idx;
+  uint16_t min_val = hbm->rh_cnt[min_idx];
+
+  if (min_val == hbm->rh_spill_cnt) {
+    hbm->rh_row[min_idx] = row_id;
+    uint32_t inc = (uint32_t)hbm->rh_spill_cnt + 1U;
+    if (inc >= (uint32_t)eff_thresh) {
+      hbm->rh_cnt[min_idx] = hbm->rh_spill_cnt;
+      hbm->last_drfm_row = row_id;
+      if (hbm->drfm_mitigations < 0xFFFFFFFFU) {
+        hbm->drfm_mitigations += 1U;
+      }
+      return true;
+    }
+    hbm->rh_cnt[min_idx] = (uint16_t)inc;
+    return false;
+  }
+
+  /* 4. All 4 slots strictly exceed spill_cnt -> advance spillover bound */
+  uint32_t next_spill = (uint32_t)hbm->rh_spill_cnt + 1U;
+  if (next_spill >= (uint32_t)eff_thresh) {
+    if (out_preventive_ref) {
+      *out_preventive_ref = true;
+    }
+    hbm->last_drfm_row = row_id;
+    hbm->rh_valid_mask = 0U;
+    hbm->rh_cnt[0] = 0U;
+    hbm->rh_cnt[1] = 0U;
+    hbm->rh_cnt[2] = 0U;
+    hbm->rh_cnt[3] = 0U;
+    hbm->rh_spill_cnt = 0U;
+    if (hbm->preventive_refreshes < 0xFFFFFFFFU) {
+      hbm->preventive_refreshes += 1U;
+    }
+    return true;
+  }
+  hbm->rh_spill_cnt = (uint16_t)next_spill;
+  return false;
+}
+
+uint8_t ele_hbm_step_thermal_10ms(EleHbmStack64 *hbm, int32_t amb_temp_mc,
+                                  uint32_t p_io_mw, uint16_t live_bank_mask) {
+  if (!hbm) {
+    return 1U;
+  }
+  hbm->live_bank_mask = live_bank_mask;
+  uint32_t r_th = (hbm->r_th_mc_per_w > 0U) ? hbm->r_th_mc_per_w : 1150U;
+  uint32_t p_bank = (hbm->p_ref_bank_mw > 0U) ? hbm->p_ref_bank_mw : 350U;
+  uint32_t clamped_io = (p_io_mw > 200000U) ? 200000U : p_io_mw;
+  uint32_t live_banks = ele_popcount32((uint32_t)live_bank_mask & 0xFFFFU);
+
+  uint8_t mult_j = ele_hbm_eval_jedec_mult(hbm->temp_jedec_mc);
+  uint8_t mult_s = ele_hbm_eval_jedec_mult(hbm->temp_symp_mc);
+  hbm->cur_ref_mult = mult_s;
+
+  uint32_t p_ref_j_mw = 16U * (uint32_t)mult_j * p_bank;
+  uint32_t p_ref_s_mw = live_banks * (uint32_t)mult_s * p_bank;
+
+  uint64_t rise_j_mc = ele_div_u64_u32(
+      (uint64_t)(clamped_io + p_ref_j_mw) * (uint64_t)r_th, 1000U);
+  uint64_t rise_s_mc = ele_div_u64_u32(
+      (uint64_t)(clamped_io + p_ref_s_mw) * (uint64_t)r_th, 1000U);
+
+  int64_t eq_j = (int64_t)amb_temp_mc + (int64_t)rise_j_mc;
+  int64_t eq_s = (int64_t)amb_temp_mc + (int64_t)rise_s_mc;
+
+  hbm->temp_jedec_mc =
+      ele_sat_i64_i32((int64_t)hbm->temp_jedec_mc +
+                      ele_asr64(eq_j - (int64_t)hbm->temp_jedec_mc, 2U));
+  hbm->temp_symp_mc =
+      ele_sat_i64_i32((int64_t)hbm->temp_symp_mc +
+                      ele_asr64(eq_s - (int64_t)hbm->temp_symp_mc, 2U));
+
+  if (hbm->temp_jedec_mc >= 95000) {
+    hbm->runaway_jedec = 1U;
+  }
+  if (hbm->temp_symp_mc >= 95000) {
+    hbm->runaway_symp = 1U;
+  }
+
+  uint32_t pulses_j = 16U * (uint32_t)mult_j * 256U;
+  uint32_t pulses_s = live_banks * (uint32_t)mult_s * 256U;
+  if (hbm->ref_pulses_jedec <= 0xFFFFFFFFU - pulses_j) {
+    hbm->ref_pulses_jedec += pulses_j;
+  } else {
+    hbm->ref_pulses_jedec = 0xFFFFFFFFU;
+  }
+  if (hbm->ref_pulses_elided <= 0xFFFFFFFFU - pulses_s) {
+    hbm->ref_pulses_elided += pulses_s;
+  } else {
+    hbm->ref_pulses_elided = 0xFFFFFFFFU;
+  }
+
+  /* 10 ms * mW = 0.01 mJ -> accumulate in mJ */
+  uint32_t dj_mj = (p_ref_j_mw + 50U) / 100U;
+  uint32_t ds_mj = (p_ref_s_mw + 50U) / 100U;
+  if (hbm->energy_jedec_mj <= 0xFFFFFFFFU - dj_mj) {
+    hbm->energy_jedec_mj += dj_mj;
+  } else {
+    hbm->energy_jedec_mj = 0xFFFFFFFFU;
+  }
+  if (hbm->energy_symp_mj <= 0xFFFFFFFFU - ds_mj) {
+    hbm->energy_symp_mj += ds_mj;
+  } else {
+    hbm->energy_symp_mj = 0xFFFFFFFFU;
+  }
+  return hbm->cur_ref_mult;
+}
+
+/* ============================================================================
+ * 16. LC Resonant Adiabatic Clock & Crest Tank-Parker (`ele_resonant_clk`)
+ * ============================================================================
+ */
+
+void ele_resonant_clk64_init(EleResonantClk64 *rclk, uint32_t c_clk_ff,
+                             uint16_t v_dd_mv, uint16_t q_factor_milli,
+                             uint16_t freq_mhz, uint16_t target_pulse_ps,
+                             uint16_t zvs_tol_ps) {
+  if (!rclk) {
+    return;
+  }
+  ele_zero64(rclk);
+  rclk->c_clk_ff = (c_clk_ff > 0U) ? c_clk_ff : 500000U; /* 500 pF mesh */
+  rclk->v_dd_mv = (v_dd_mv > 0U) ? v_dd_mv : 750U;
+  rclk->q_factor_milli = (q_factor_milli > 0U) ? q_factor_milli : 12000U;
+  rclk->freq_mhz = (freq_mhz > 0U) ? freq_mhz : 2000U;
+  rclk->target_pulse_ps = (target_pulse_ps >= 40U && target_pulse_ps <= 2000U)
+                              ? target_pulse_ps
+                              : 120U;
+  rclk->sustain_pulse_ps = rclk->target_pulse_ps;
+  rclk->zvs_tol_ps = (zvs_tol_ps > 0U) ? zvs_tol_ps : 25U;
+  rclk->r_switch_mohm = 50U;
+}
+
+uint16_t ele_resonant_clk_step(EleResonantClk64 *rclk, bool clk_enable,
+                               int16_t zvs_err_ps) {
+  if (!rclk) {
+    return 0U;
+  }
+  uint32_t abs_err = ele_abs_i32_u32((int32_t)zvs_err_ps);
+  bool in_tol = (abs_err <= (uint32_t)rclk->zvs_tol_ps);
+
+  if (!clk_enable) {
+    if (rclk->state == (uint8_t)ELE_RCLK_OSCILLATING) {
+      rclk->park_cap_mv = rclk->tank_env_mv;
+      rclk->park_ready = 1U;
+    }
+    rclk->tank_env_mv = 0U;
+    rclk->sustain_pulse_ps = 0U;
+    rclk->state = (uint8_t)ELE_RCLK_PARKED;
+    rclk->zvs_locked = 0U;
+    if (rclk->parked_cycles < 0xFFFFFFFFU) {
+      rclk->parked_cycles += 1U;
+    }
+    return 0U;
+  }
+
+  if (rclk->state == (uint8_t)ELE_RCLK_PARKED) {
+    rclk->tank_env_mv =
+        (rclk->park_ready != 0U) ? rclk->park_cap_mv : rclk->v_dd_mv;
+    uint16_t tp = rclk->target_pulse_ps;
+    rclk->sustain_pulse_ps = (tp < 40U) ? 40U : ((tp > 2000U) ? 2000U : tp);
+    if (rclk->park_ready != 0U && rclk->restart_events < 65535U) {
+      rclk->restart_events += 1U;
+    }
+    rclk->state = (uint8_t)ELE_RCLK_OSCILLATING;
+    rclk->park_ready = 0U;
+    rclk->primed = 1U;
+    rclk->phase_err_ps = zvs_err_ps;
+    rclk->prev_phase_err_ps = zvs_err_ps;
+    rclk->zvs_locked = in_tol ? 1U : 0U;
+  } else {
+    int64_t err = (int64_t)zvs_err_ps;
+    int64_t prev =
+        (rclk->primed != 0U) ? (int64_t)rclk->prev_phase_err_ps : err;
+    int64_t d_err = err - prev;
+    int64_t adj = ele_asr64(err, 2U) + ele_asr64(d_err, 3U);
+    int64_t cand = (int64_t)rclk->sustain_pulse_ps - adj;
+    if (cand < 40LL) {
+      rclk->sustain_pulse_ps = 40U;
+    } else if (cand > 2000LL) {
+      rclk->sustain_pulse_ps = 2000U;
+    } else {
+      rclk->sustain_pulse_ps = (uint16_t)cand;
+    }
+    rclk->tank_env_mv = rclk->v_dd_mv;
+    rclk->primed = 1U;
+    rclk->phase_err_ps = zvs_err_ps;
+    rclk->prev_phase_err_ps = zvs_err_ps;
+    rclk->zvs_locked = in_tol ? 1U : 0U;
+  }
+
+  if (rclk->total_cycles < 0xFFFFFFFFU) {
+    rclk->total_cycles += 1U;
+  }
+  if (rclk->zvs_locked != 0U && rclk->zvs_lock_cycles < 0xFFFFFFFFU) {
+    rclk->zvs_lock_cycles += 1U;
+  }
+
+  /* Dynamic clock energy (pJ): E_cmos = C_clk(fF) * V_dd(mV)^2 / 10^9 */
+  uint32_t c_ff = (rclk->c_clk_ff > 0U) ? rclk->c_clk_ff : 500000U;
+  uint32_t v_mv = (rclk->v_dd_mv > 0U) ? rclk->v_dd_mv : 750U;
+  uint32_t q_milli =
+      (rclk->q_factor_milli > 0U) ? rclk->q_factor_milli : 12000U;
+  uint64_t cv2_fj = ele_div_u64_u32(
+      (uint64_t)c_ff * (uint64_t)v_mv * (uint64_t)v_mv, 1000000U);
+  uint64_t e_cmos_pj = ele_div_u64_u32(cv2_fj + 500ULL, 1000U);
+  if (e_cmos_pj == 0ULL) {
+    e_cmos_pj = 1ULL;
+  }
+  /* LC tank dissipates (pi / Q) * E_cmos at ZVS; non-ZVS adds phase-error loss
+   */
+  uint64_t pi_eff =
+      (rclk->zvs_locked != 0U) ? 3142ULL : (3142ULL + (uint64_t)(abs_err * 8U));
+  uint64_t e_res_pj =
+      ele_div_u64_u32(e_cmos_pj * pi_eff + (uint64_t)(q_milli - 1U), q_milli);
+
+  if (rclk->energy_cmos_pj <= 0xFFFFFFFFFFFFFFFFULL - e_cmos_pj) {
+    rclk->energy_cmos_pj += e_cmos_pj;
+  } else {
+    rclk->energy_cmos_pj = 0xFFFFFFFFFFFFFFFFULL;
+  }
+  if (rclk->energy_resonant_pj <= 0xFFFFFFFFFFFFFFFFULL - e_res_pj) {
+    rclk->energy_resonant_pj += e_res_pj;
+  } else {
+    rclk->energy_resonant_pj = 0xFFFFFFFFFFFFFFFFULL;
+  }
+  return rclk->sustain_pulse_ps;
+}
+
+/* ============================================================================
+ * 17. Asynchronous Level-Crossing Event ADC + Vernier TDC (`ele_event_adc`)
+ * ============================================================================
+ */
+
+void ele_event_adc64_init(EleEventAdc64 *adc, uint32_t lsb_step_uv,
+                          uint32_t hyst_uv, uint32_t coarse_clk_ps,
+                          uint16_t t_slow_delay_ps, uint16_t t_fast_delay_ps,
+                          uint16_t e_sar_conv_fj, uint16_t e_event_pulse_fj) {
+  if (!adc) {
+    return;
+  }
+  ele_zero64(adc);
+  adc->lsb_step_uv = (lsb_step_uv > 0U) ? lsb_step_uv : 5000U;
+  adc->hyst_uv = hyst_uv;
+  adc->coarse_clk_ps = (coarse_clk_ps > 0U) ? coarse_clk_ps : 1000U;
+  adc->t_slow_delay_ps = (t_slow_delay_ps > 0U) ? t_slow_delay_ps : 45U;
+  adc->t_fast_delay_ps =
+      (t_fast_delay_ps > 0U && t_fast_delay_ps < adc->t_slow_delay_ps)
+          ? t_fast_delay_ps
+          : (uint16_t)(adc->t_slow_delay_ps - 1U);
+  adc->vernier_res_ps = (uint16_t)(adc->t_slow_delay_ps - adc->t_fast_delay_ps);
+  adc->e_sar_conv_fj = (e_sar_conv_fj > 0U) ? e_sar_conv_fj : 800U;
+  adc->e_event_pulse_fj = (e_event_pulse_fj > 0U) ? e_event_pulse_fj : 250U;
+}
+
+uint16_t ele_vernier_tdc_eval_ps(uint16_t lead_ps, uint16_t t_slow_ps,
+                                 uint16_t t_fast_ps, uint16_t max_taps,
+                                 uint16_t *out_taps, bool *out_overflow) {
+  uint16_t res_ps =
+      (t_slow_ps > t_fast_ps) ? (uint16_t)(t_slow_ps - t_fast_ps) : 1U;
+  uint16_t cap_taps = (max_taps > 0U) ? max_taps : 63U;
+  uint32_t raw_taps = (uint32_t)lead_ps / (uint32_t)res_ps;
+  bool ovf = (raw_taps > (uint32_t)cap_taps);
+  uint16_t taps = ovf ? cap_taps : (uint16_t)raw_taps;
+  if (out_taps) {
+    *out_taps = taps;
+  }
+  if (out_overflow) {
+    *out_overflow = ovf;
+  }
+  uint32_t fine_ps = (uint32_t)taps * (uint32_t)res_ps;
+  return (fine_ps > 65535U) ? 65535U : (uint16_t)fine_ps;
+}
+
+int8_t ele_event_adc_step(EleEventAdc64 *adc, int32_t v_in_uv,
+                          uint16_t crossing_lead_ps) {
+  if (!adc) {
+    return 0;
+  }
+  uint32_t eff_lsb = (adc->lsb_step_uv == 0U) ? 1U : adc->lsb_step_uv;
+  uint64_t thresh64 = (uint64_t)eff_lsb + (uint64_t)adc->hyst_uv;
+
+  if (adc->nyquist_samples < 0xFFFFFFFFU) {
+    adc->nyquist_samples += 1U;
+  }
+  uint32_t d_nyq_pj = ((uint32_t)adc->e_sar_conv_fj + 5U) / 10U;
+  if (d_nyq_pj == 0U && adc->e_sar_conv_fj > 0U) {
+    d_nyq_pj = 1U;
+  }
+  if (adc->energy_nyquist_pj <= 0xFFFFFFFFU - d_nyq_pj) {
+    adc->energy_nyquist_pj += d_nyq_pj;
+  } else {
+    adc->energy_nyquist_pj = 0xFFFFFFFFU;
+  }
+
+  if (adc->primed == 0U) {
+    adc->primed = 1U;
+    adc->dac_ref_uv = v_in_uv;
+    adc->recon_sig_uv = v_in_uv;
+    adc->last_dir = 0;
+    adc->event_fired = 0U;
+    adc->last_vernier_steps = 0U;
+    adc->tdc_overflow = 0U;
+    if (adc->quiet_ticks < 65535U) {
+      adc->quiet_ticks += 1U;
+    }
+    return 0;
+  }
+
+  int64_t diff64 = (int64_t)v_in_uv - (int64_t)adc->dac_ref_uv;
+  uint64_t abs_diff64 =
+      (diff64 < 0LL) ? (0ULL - (uint64_t)diff64) : (uint64_t)diff64;
+
+  int8_t dir = 0;
+  if (diff64 >= 0LL && abs_diff64 >= thresh64) {
+    dir = 1;
+    adc->dac_ref_uv =
+        ele_sat_i64_i32((int64_t)adc->dac_ref_uv + (int64_t)eff_lsb);
+  } else if (diff64 < 0LL && abs_diff64 >= thresh64) {
+    dir = -1;
+    adc->dac_ref_uv =
+        ele_sat_i64_i32((int64_t)adc->dac_ref_uv - (int64_t)eff_lsb);
+  } else {
+    if (abs_diff64 >= (uint64_t)eff_lsb &&
+        adc->chatter_suppressed < 0xFFFFFFFFU) {
+      adc->chatter_suppressed += 1U;
+    }
+  }
+
+  if (dir != 0) {
+    adc->recon_sig_uv = adc->dac_ref_uv;
+    adc->last_dir = dir;
+    adc->event_fired = 1U;
+    adc->quiet_ticks = 0U;
+    if (adc->event_samples < 0xFFFFFFFFU) {
+      adc->event_samples += 1U;
+    }
+
+    uint16_t taps = 0U;
+    bool ovf = false;
+    uint16_t fine_ps =
+        ele_vernier_tdc_eval_ps(crossing_lead_ps, adc->t_slow_delay_ps,
+                                adc->t_fast_delay_ps, 63U, &taps, &ovf);
+    adc->last_vernier_steps = taps;
+    adc->tdc_overflow = ovf ? 1U : 0U;
+    uint64_t t_coarse =
+        (uint64_t)adc->nyquist_samples * (uint64_t)adc->coarse_clk_ps;
+    uint64_t t_evt =
+        (t_coarse > (uint64_t)fine_ps) ? (t_coarse - (uint64_t)fine_ps) : 0ULL;
+    adc->last_event_time_ps =
+        (t_evt > 0xFFFFFFFFULL) ? 0xFFFFFFFFU : (uint32_t)t_evt;
+
+    uint32_t d_evt_pj = ((uint32_t)adc->e_event_pulse_fj + 5U) / 10U;
+    if (d_evt_pj == 0U && adc->e_event_pulse_fj > 0U) {
+      d_evt_pj = 1U;
+    }
+    if (adc->energy_event_pj <= 0xFFFFFFFFU - d_evt_pj) {
+      adc->energy_event_pj += d_evt_pj;
+    } else {
+      adc->energy_event_pj = 0xFFFFFFFFU;
+    }
+  } else {
+    adc->last_dir = 0;
+    adc->event_fired = 0U;
+    if (adc->quiet_ticks < 65535U) {
+      adc->quiet_ticks += 1U;
+    }
+  }
+
+  int64_t err64 = (int64_t)v_in_uv - (int64_t)adc->recon_sig_uv;
+  uint64_t abs_err = (err64 < 0LL) ? (0ULL - (uint64_t)err64) : (uint64_t)err64;
+  uint16_t err16 = (abs_err > 65535ULL) ? 65535U : (uint16_t)abs_err;
+  if (err16 > adc->peak_recon_err_uv) {
+    adc->peak_recon_err_uv = err16;
+  }
+  return dir;
+}
+
+/* ============================================================================
+ * 18. BSPDN Active Resonance Damper & Spread-Spectrum (`ele_pdn_emi`)
+ * ============================================================================
+ */
+
+void ele_pdn_emi64_init(ElePdnEmi64 *emi, uint16_t nom_period_ps,
+                        uint8_t max_dither_ps, uint8_t damping_gain_q8,
+                        uint16_t seed) {
+  if (!emi) {
+    return;
+  }
+  ele_zero64(emi);
+  emi->nom_period_ps = (nom_period_ps >= 20U) ? nom_period_ps : 500U;
+  emi->max_dither_ps = (max_dither_ps > 127U) ? 127U : max_dither_ps;
+  emi->damping_gain_q8 = (damping_gain_q8 > 0U) ? damping_gain_q8 : 64U;
+  emi->lfsr_state = (seed != 0U) ? seed : 0xACE1U;
+}
+
+uint16_t ele_pdn_emi_step_cycle(ElePdnEmi64 *emi, int16_t di_excite_ma) {
+  if (!emi) {
+    return 0U;
+  }
+  uint16_t cur_lfsr = (emi->lfsr_state != 0U) ? emi->lfsr_state : 0xACE1U;
+  uint16_t next_lfsr =
+      (uint16_t)((cur_lfsr >> 1U) ^ (((cur_lfsr & 1U) != 0U) ? 0xB400U : 0U));
+
+  uint16_t eff_nom = (emi->nom_period_ps >= 20U) ? emi->nom_period_ps : 500U;
+  uint16_t head_lo = (uint16_t)(eff_nom - 20U);
+  uint16_t head_hi = (uint16_t)(65535U - eff_nom);
+  uint16_t sym_cap = (head_lo < head_hi) ? head_lo : head_hi;
+  uint8_t cap_dither = (emi->max_dither_ps > 127U) ? 127U : emi->max_dither_ps;
+  uint8_t eff_dither =
+      ((uint16_t)cap_dither > sym_cap) ? (uint8_t)sym_cap : cap_dither;
+  uint32_t raw_prod =
+      ((uint32_t)(cur_lfsr & 0x7FU) * (uint32_t)eff_dither) >> 7U;
+  uint8_t scaled_mag = (raw_prod > 127U) ? 127U : (uint8_t)raw_prod;
+  int16_t even_delta =
+      ((cur_lfsr & 0x80U) != 0U) ? -(int16_t)scaled_mag : (int16_t)scaled_mag;
+  int16_t cur_delta =
+      (emi->pair_phase != 0U) ? (int16_t)emi->held_delta_ps : even_delta;
+
+  int32_t cand_period = (int32_t)eff_nom + (int32_t)cur_delta;
+  uint16_t mod_period =
+      (cand_period < 20)
+          ? 20U
+          : ((cand_period > 65535) ? 65535U : (uint16_t)cand_period);
+
+  uint8_t spec_bin =
+      (uint8_t)((cur_lfsr & 0x07U) ^ (uint16_t)(emi->pair_phase & 1U));
+  if (emi->bin_hits[spec_bin] < 65535U) {
+    emi->bin_hits[spec_bin] += 1U;
+  }
+
+  if (emi->pair_phase == 0U) {
+    emi->held_delta_ps = (int8_t)(-even_delta);
+    emi->pair_phase = 1U;
+    emi->lfsr_state = next_lfsr;
+  } else {
+    emi->pair_phase = 0U;
+    emi->lfsr_state = cur_lfsr;
+  }
+
+  emi->sum_period_base_ps += (uint64_t)eff_nom;
+  emi->sum_period_ss_ps += (uint64_t)mod_period;
+
+  /* Symplectic Semi-Implicit Euler BSPDN Coupled LC Resonator (0-ULP == RTL) */
+  int64_t vu = (int64_t)emi->v_osc_undamped_uv;
+  int64_t iu = (int64_t)emi->i_osc_undamped_ma;
+  int64_t vd = (int64_t)emi->v_osc_damped_uv;
+  int64_t id = (int64_t)emi->i_osc_damped_ma;
+  int64_t exc = (int64_t)di_excite_ma;
+
+  int64_t vu_next = vu - ele_asr64(vu, 6U) + (iu * 4LL) + (exc * 8LL);
+  int64_t iu_next = iu - ele_asr64(vu_next, 2U);
+
+  int64_t damp_term = ele_asr64(vd * (int64_t)emi->damping_gain_q8, 8U);
+  int64_t vd_next =
+      vd - ele_asr64(vd, 6U) - damp_term + (id * 4LL) + (exc * 8LL);
+  int64_t id_next = id - ele_asr64(vd_next, 2U);
+
+  emi->v_osc_undamped_uv = ele_sat_i64_i32(vu_next);
+  emi->i_osc_undamped_ma = ele_sat_i64_i32(iu_next);
+  emi->v_osc_damped_uv = ele_sat_i64_i32(vd_next);
+  emi->i_osc_damped_ma = ele_sat_i64_i32(id_next);
+
+  uint32_t abs_vu = ele_abs_i32_u32(emi->v_osc_undamped_uv);
+  uint32_t abs_vd = ele_abs_i32_u32(emi->v_osc_damped_uv);
+  if (abs_vu > emi->peak_v_undamped_uv) {
+    emi->peak_v_undamped_uv = abs_vu;
+  }
+  if (abs_vd > emi->peak_v_damped_uv) {
+    emi->peak_v_damped_uv = abs_vd;
+  }
+
+  return mod_period;
 }
