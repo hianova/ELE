@@ -1,117 +1,81 @@
-LLVM_BIN := $(firstword $(wildcard /opt/homebrew/opt/llvm/bin /usr/local/opt/llvm/bin))
-ifneq ($(LLVM_BIN),)
-export PATH := $(LLVM_BIN):/opt/homebrew/bin:/usr/local/bin:$(PATH)
-endif
+export PATH := $(HOME)/.elan/bin:/opt/homebrew/opt/llvm/bin:/opt/homebrew/bin:/usr/local/bin:$(PATH)
 
-ifeq ($(origin CC),default)
-CC := $(if $(LLVM_BIN),$(LLVM_BIN)/clang,clang)
-endif
-ifeq ($(origin AR),default)
-AR := $(if $(LLVM_BIN),$(LLVM_BIN)/llvm-ar,$(shell command -v llvm-ar 2>/dev/null || command -v ar))
-endif
+LEAN      ?= lean
+VERILATOR ?= verilator
+YOSYS     ?= yosys
+PREFIX    ?= /usr/local
 
-RV32_CC ?= $(if $(LLVM_BIN),$(LLVM_BIN)/clang,$(shell command -v clang 2>/dev/null || echo $(CC)))
-RANLIB ?= $(if $(LLVM_BIN),$(LLVM_BIN)/llvm-ranlib,$(shell command -v llvm-ranlib 2>/dev/null || command -v ranlib))
-OBJDUMP ?= $(if $(LLVM_BIN),$(LLVM_BIN)/llvm-objdump,$(shell command -v llvm-objdump 2>/dev/null || command -v objdump))
-NM ?= $(if $(LLVM_BIN),$(LLVM_BIN)/llvm-nm,$(shell command -v llvm-nm 2>/dev/null || command -v nm))
-CLANG_FORMAT ?= $(if $(LLVM_BIN),$(LLVM_BIN)/clang-format,clang-format)
-LEAN ?= $(firstword $(wildcard $(HOME)/.elan/bin/lean /usr/local/bin/lean /opt/homebrew/bin/lean))
-VERILATOR ?= $(shell command -v verilator 2>/dev/null)
-YOSYS ?= $(shell command -v yosys 2>/dev/null)
+FLOW_DIR   ?= $(abspath ../FLOW)
+UNIT_DIR   ?= $(abspath ../UNIT)
+FLOW_BUILD := $(FLOW_DIR)/build
+UNIT_BUILD := $(UNIT_DIR)/build
+FLOW_BIN   ?= $(FLOW_BUILD)/flow
 
-CFLAGS ?= -std=c17 -Wall -Wextra -Wpedantic -Wmissing-prototypes -Werror -O3
-override CFLAGS += -Iinclude
+BUILD_DIR     := build
+ELE_OLEAN     := $(BUILD_DIR)/Ele.olean
+VERILATOR_DIR := $(BUILD_DIR)/verilator
+COSIM_BIN     := $(VERILATOR_DIR)/Vele_cosim_tb
 
-RV32_FLAGS := --target=riscv32-unknown-none-elf -march=rv32imac -mabi=ilp32 \
-              -ffreestanding -nostdlib -fno-builtin -fno-stack-protector \
-              -O3 -Wall -Wextra -Werror -Iinclude -DELE_BARE_METAL_MMIO=1
-
-BUILD_DIR := build
-LIBELE_A := $(BUILD_DIR)/libele.a
-HOST_OBJ := $(BUILD_DIR)/obj/ele_core.o
-RV32_OBJ := $(BUILD_DIR)/riscv32/ele_core_rv32.o
-RV32_O0_OBJ := $(BUILD_DIR)/riscv32/ele_core_rv32_O0.o
-CORE_LL := $(BUILD_DIR)/ele_core.ll
-TEST_BIN := $(BUILD_DIR)/test-ele-energy
-RTL_SV := rtl/ele_cache_bus65.sv rtl/ele_ternary_mac_dualrail.sv rtl/ele_vrm_zvs_ctrl.sv rtl/ele_grid_gfm_ctrl.sv rtl/ele_fll_droop.sv rtl/ele_sscb_trip.sv rtl/ele_slm_canary_trace.sv rtl/ele_cpo_mrr_lock.sv rtl/ele_hbm_rowhammer_guard.sv rtl/ele_resonant_clk_zvs.sv rtl/ele_level_crossing_adc.sv rtl/ele_pdn_emi_damping.sv rtl/ele_silicon_top.sv
-
-FMT_FILES := $(wildcard include/*.h src/*.c tests/*.c tests/*.cpp)
+RTL_IPS := rtl/ele_em_phy.sv rtl/ele_flow_core.sv
+RTL_TB  := rtl/ele_cosim_tb.sv
 
 .DEFAULT_GOAL := all
-.PHONY: all clean test riscv32 fmt fmt-check
+.PHONY: all test clean install uninstall upstream-deps synth-gate
 
-all: $(LIBELE_A) $(RV32_OBJ)
+all: $(ELE_OLEAN) $(COSIM_BIN)
 
 $(BUILD_DIR):
-	mkdir -p $(BUILD_DIR)/obj $(BUILD_DIR)/riscv32
+	@mkdir -p $(BUILD_DIR)
 
-$(HOST_OBJ): src/ele_core.c $(wildcard include/*.h) | $(BUILD_DIR)
-	$(CC) $(CFLAGS) -c $< -o $@
+upstream-deps:
+	@test -f "$(FLOW_BUILD)/Flow.olean" && test -x "$(FLOW_BIN)" || $(MAKE) -C "$(FLOW_DIR)" all
+	@test -f "$(UNIT_BUILD)/Unit.olean" || $(MAKE) -C "$(UNIT_DIR)" all
 
-$(LIBELE_A): $(HOST_OBJ)
-	$(AR) rcs $@ $^
-	$(RANLIB) $@
+$(ELE_OLEAN): Ele.lean | $(BUILD_DIR) upstream-deps
+	@echo "=== [Gate 1] ELE Pure Lean 4 Formal Proof Check (0 sorryAx, 0 C/C++ files) ==="
+	LEAN_PATH="$(FLOW_BUILD):$(UNIT_BUILD)" $(LEAN) -DwarningAsError=true -o $@ Ele.lean
+	@ax="$$(printf 'import Ele\n#print axioms Ele.Electron.fll_quadratic_envelope_guarantees_zero_sdc\n#print axioms Ele.Electron.fll_guardband_elimination_strictly_saves_dynamic_energy\n#print axioms Ele.Electron.fllEmergencyIsolatesDroopSurge\n#print axioms Ele.Power.sscb_jet2_separates_rc_inrush_from_short_circuit\n#print axioms Ele.Power.phase_interleaving_conserves_work_cuts_peak_and_i2r\n#print axioms Ele.Power.sscbTrippedIsolatesShortCurrent\n#print axioms Ele.MagWave.rmw_preserves_unmasked_datasheet_bits\n#print axioms Ele.MagWave.bus_invert_65wire_strictly_caps_flips_at_32\n#print axioms Ele.MagWave.dual_rail_ternary_zero_ulp_equivalence\n#print axioms Ele.MagWave.symplectic_spread_spectrum_conserves_two_cycle_period\n' | LEAN_PATH="$(FLOW_BUILD):$(UNIT_BUILD):$(BUILD_DIR)" $(LEAN) --stdin)" && \
+		! printf '%s\n' "$$ax" | grep -q 'sorryAx'
+	@test -z "$$(find . -maxdepth 3 \( -name '*.c' -o -name '*.h' -o -name '*.cpp' -o -name '*.cc' \) -not -path './build/*')"
+	@echo "  [PASS] $(ELE_OLEAN) compiled (0 sorryAx, 0 .c/.h/.cpp files)"
 
-$(RV32_OBJ): src/ele_core.c $(wildcard include/*.h) | $(BUILD_DIR)
-	$(RV32_CC) $(RV32_FLAGS) -c $< -o $@
+$(COSIM_BIN): $(RTL_IPS) $(RTL_TB) | $(BUILD_DIR)
+	@echo "=== [Gate 2] Verilator -Wall Strict RTL Lint & Pure-SV Binary Build ==="
+	@mkdir -p $(VERILATOR_DIR)
+	$(VERILATOR) --lint-only -Wall --top-module ele_flow_core rtl/ele_flow_core.sv
+	$(VERILATOR) --lint-only -Wall --top-module ele_flow_atlas_top rtl/ele_flow_core.sv
+	$(VERILATOR) --lint-only -Wall --top-module ele_bus_invert65 rtl/ele_em_phy.sv
+	$(VERILATOR) --lint-only -Wall --top-module ele_ternary_mac_dualrail rtl/ele_em_phy.sv
+	$(VERILATOR) --binary -Wall -Mdir $(VERILATOR_DIR) --top-module ele_cosim_tb \
+		$(RTL_IPS) $(RTL_TB) -o Vele_cosim_tb
+	@echo "  [PASS] $(COSIM_BIN) built cleanly from pure IEEE 1800 SystemVerilog (0 warnings)"
 
-$(RV32_O0_OBJ): src/ele_core.c $(wildcard include/*.h) | $(BUILD_DIR)
-	$(RV32_CC) $(RV32_FLAGS) -O0 -c $< -o $@
+synth-gate: $(RTL_IPS)
+	@echo "=== [Gate 4] Yosys CMOS Gate-Level Synthesis & Zero-Latch DRC ==="
+	$(YOSYS) -q -p "read_verilog -nolatches -sv rtl/ele_flow_core.sv; synth -top ele_flow_core; check -assert; select -assert-none t:\$$_DLATCH* t:\$$dlatch*"
+	$(YOSYS) -q -p "read_verilog -nolatches -sv rtl/ele_em_phy.sv; synth -top ele_bus_invert65; check -assert; select -assert-none t:\$$_DLATCH* t:\$$dlatch*"
+	$(YOSYS) -q -p "read_verilog -nolatches -sv rtl/ele_em_phy.sv; synth -top ele_ternary_mac_dualrail; check -assert; select -assert-none t:\$$_DLATCH* t:\$$dlatch*"
+	@echo "  [PASS] Yosys synthesized ele_flow_core, ele_bus_invert65 & ele_ternary_mac_dualrail (0 latches, 0 DRC errors)"
 
-$(CORE_LL): src/ele_core.c $(wildcard include/*.h) | $(BUILD_DIR)
-	$(CC) $(CFLAGS) -S -emit-llvm $< -o $@
+test: $(ELE_OLEAN) $(COSIM_BIN) TestEle.lean
+	@echo "=== [Gate 3] 3-Way 0-ULP 512-Bit Co-Verification (Lean == FLOW C99 == Verilator SV) ==="
+	FLOW_BIN="$(FLOW_BIN)" LEAN_PATH="$(FLOW_BUILD):$(UNIT_BUILD):$(BUILD_DIR)" \
+		$(LEAN) -DwarningAsError=true --run TestEle.lean
+	@$(MAKE) synth-gate
+	@echo "================================================================================"
+	@echo "   ALL 4 ELE VERIFICATION GATES PASSED (0 .c/.h/.cpp, 0 sorryAx, 0-ULP, 0 LATCHES)"
+	@echo "================================================================================"
 
-riscv32: $(RV32_OBJ)
-	@$(OBJDUMP) -f $(RV32_OBJ)
+install: $(ELE_OLEAN)
+	mkdir -p $(DESTDIR)$(PREFIX)/lib/flow $(DESTDIR)$(PREFIX)/share/ele/rtl
+	install -m 644 Ele.lean $(DESTDIR)$(PREFIX)/lib/flow/Ele.lean
+	install -m 644 $(ELE_OLEAN) $(DESTDIR)$(PREFIX)/lib/flow/Ele.olean
+	install -m 644 rtl/ele_flow_core.sv $(DESTDIR)$(PREFIX)/share/ele/rtl/ele_flow_core.sv
+	install -m 644 rtl/ele_em_phy.sv $(DESTDIR)$(PREFIX)/share/ele/rtl/ele_em_phy.sv
 
-$(TEST_BIN): tests/test_ele_energy.c $(LIBELE_A) | $(BUILD_DIR)
-	$(CC) $(CFLAGS) $< $(LIBELE_A) -o $@
-
-fmt:
-	$(CLANG_FORMAT) -i $(FMT_FILES)
-
-fmt-check:
-	$(CLANG_FORMAT) --dry-run --Werror $(FMT_FILES)
-
-test: $(TEST_BIN) $(RV32_OBJ) $(RV32_O0_OBJ) $(CORE_LL)
-	@echo "=== [Gate 0] Bare-Metal RISC-V (RV32IMAC) Cross-Compile & Zero-Symbol Verification ==="
-	@$(OBJDUMP) -f $(RV32_OBJ) | grep -E "file format|architecture"
-	@test -z "$$($(NM) -u $(RV32_OBJ))" || (echo "ERROR: Undefined symbols in RV32IMAC -O3 object:" && $(NM) -u $(RV32_OBJ) && exit 1)
-	@test -z "$$($(NM) -u $(RV32_O0_OBJ))" || (echo "ERROR: Undefined symbols in RV32IMAC -O0 object:" && $(NM) -u $(RV32_O0_OBJ) && exit 1)
-	@echo "  ✓ Bare-metal RV32IMAC objects (-O0 & -O3) verified (0 undefined symbols, 0 libc, MMIO ready)"
-	@echo "=== [Gate 1] Zero-Code Silicon Driver & Electro-Thermal Physics Benchmark ==="
-	@$(TEST_BIN)
-	@echo "=== [Gate 2] Native LLVM IR Audit (FloatOps == 0, HeapCalls == 0) ==="
-	@! grep -v '^[[:space:]]*;' $(CORE_LL) | grep -v '^[[:space:]]*!' | grep -Eq '\b(fadd|fsub|fmul|fdiv|frem|fcmp|fpext|fptrunc|fptosi|fptoui|sitofp|uitofp|float|double)\b'
-	@! grep -v '^[[:space:]]*;' $(CORE_LL) | grep -v '^[[:space:]]*!' | grep -Eq '@(malloc|calloc|realloc|free|aligned_alloc|posix_memalign)\b'
-	@echo "  ✓ LLVM IR verified: 0 floating-point ops/types, 0 heap allocation calls"
-	@echo "=== [Gate 3] Lean 4 Formal Specification, Verilator Co-Sim & Yosys CMOS Synthesis ==="
-	@python3 -c 'import re,sys; s=open("research/EnergyOptimality.lean").read(); s=re.sub(r"/-.*?-/", "", s, flags=re.S); s=re.sub(r"--[^\n]*", "", s); sys.exit(1 if re.search(r"\b(sorry|admit|axiom|unsafe|implemented_by|extern)\b", s) else 0)'
-	@if [ -n "$(LEAN)" ]; then \
-		"$(LEAN)" research/EnergyOptimality.lean && \
-		echo "  ✓ Lean 4 formal proofs verified (43 theorems, 0 sorry)"; \
-	else \
-		echo "  ✓ Lean 4 static axiom-free check passed (install lean to run kernel checker)"; \
-	fi
-	@if [ -n "$(VERILATOR)" ]; then \
-		set -e; \
-		"$(VERILATOR)" --lint-only -Wall -Wno-DECLFILENAME --top-module ele_silicon_top $(RTL_SV); \
-		"$(VERILATOR)" --cc -Wall -Wno-DECLFILENAME --top-module ele_silicon_top $(RTL_SV) \
-			-CFLAGS "-std=c++17 -I$(abspath include)" \
-			--exe $(abspath tests/sim_ele_rtl.cpp) $(abspath $(LIBELE_A)) \
-			--Mdir $(BUILD_DIR)/verilator --build -j 2 -Wno-fatal >/dev/null || \
-		"$(VERILATOR)" --cc -Wall -Wno-DECLFILENAME --top-module ele_silicon_top $(RTL_SV) \
-			-CFLAGS "-std=c++17 -I$(abspath include)" \
-			--exe $(abspath tests/sim_ele_rtl.cpp) $(abspath $(LIBELE_A)) \
-			--Mdir $(BUILD_DIR)/verilator --build -j 2; \
-		./$(BUILD_DIR)/verilator/Vele_silicon_top; \
-		echo "  ✓ SystemVerilog RTL linted & cycle-accurate 0-ULP C17 co-simulation passed"; \
-	fi
-	@if [ -n "$(YOSYS)" ]; then \
-		set -e; \
-		"$(YOSYS)" -q -p "read_verilog -nolatches -sv $(RTL_SV); synth -top ele_silicon_top; check -assert; select -assert-none t:\$$_DLATCH* t:\$$dlatch*"; \
-		echo "  ✓ Yosys CMOS gate-level synthesis verified (0 latches, 0 DRC errors)"; \
-	fi
+uninstall:
+	rm -f $(DESTDIR)$(PREFIX)/lib/flow/Ele.lean $(DESTDIR)$(PREFIX)/lib/flow/Ele.olean
+	rm -rf $(DESTDIR)$(PREFIX)/share/ele
 
 clean:
 	rm -rf $(BUILD_DIR)
