@@ -12,7 +12,7 @@ on:
 
 jobs:
   verify-ele:
-    name: Pure SystemVerilog + FLOW v6.0.0 0-ULP Co-Sim + Yosys Synthesis (${{ matrix.os }})
+    name: FLOW Self-Hosting Silicon Bootstrap + 7x SAT QED + 0-ULP Co-Sim (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -23,6 +23,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: hianova/FLOW
+          ref: v6.0.0
           path: FLOW
 
       - name: Checkout ELE
@@ -41,6 +42,6 @@ jobs:
         run: |
           brew install verilator yosys
 
-      - name: Run All 4 ELE v6.0.0 Silicon Verification Gates
+      - name: Run All 5 ELE v6.0.0 Self-Hosting Silicon Sign-Off Gates
         run: |
           make -C ELE clean && make -C ELE test
