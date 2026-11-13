@@ -12,46 +12,35 @@ on:
 
 jobs:
   verify-ele:
-    name: Pure Lean 4 + Verilator 0-ULP Co-Sim + Yosys Synthesis (${{ matrix.os }})
+    name: Pure SystemVerilog + FLOW v6.0.0 0-ULP Co-Sim + Yosys Synthesis (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
         os: [ ubuntu-latest, macos-latest ]
     steps:
-      - name: Checkout FLOW (v5.0.0)
+      - name: Checkout FLOW (v6.0.0)
         uses: actions/checkout@v4
         with:
           repository: hianova/FLOW
           path: FLOW
-
-      - name: Checkout UNIT (v2.0.0)
-        uses: actions/checkout@v4
-        with:
-          repository: hianova/UNIT
-          path: UNIT
 
       - name: Checkout ELE
         uses: actions/checkout@v4
         with:
           path: ELE
 
-      - name: Install Lean 4, Verilator & Yosys (Linux)
+      - name: Install Clang, Verilator & Yosys (Linux)
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y clang verilator yosys curl
-          curl https://raw.githubusercontent.com/leanprover/elan/master/elan-init.sh -sSf | sh -s -- -y --default-toolchain leanprover/lean4:stable
+          sudo apt-get install -y clang verilator yosys
 
-      - name: Install Lean 4, Verilator & Yosys (macOS)
+      - name: Install Verilator & Yosys (macOS)
         if: runner.os == 'macOS'
         run: |
           brew install verilator yosys
-          curl https://raw.githubusercontent.com/leanprover/elan/master/elan-init.sh -sSf | sh -s -- -y --default-toolchain leanprover/lean4:stable
 
-      - name: Build Upstream FLOW & UNIT + Run All 4 ELE Verification Gates
+      - name: Run All 4 ELE v6.0.0 Silicon Verification Gates
         run: |
-          export PATH="$HOME/.elan/bin:$PATH"
-          make -C FLOW all
-          make -C UNIT all
           make -C ELE clean && make -C ELE test
