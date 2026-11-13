@@ -173,6 +173,8 @@ module ele_flow_core (
     logic [63:0] r0_q, r1_q, r2_q;
     logic [63:0] r1_sq_q;
     logic        disc_neg_q;
+    logic        disc_ovf_q;
+    logic        qcit_ovf_q;
 
     // isqrt registers
     logic        isqrt_hi_q;
@@ -188,6 +190,7 @@ module ele_flow_core (
     logic [63:0] div_rem_q;
     logic [63:0] div_quot_q;
     logic [63:0] div_den_q;
+    logic        div_pre_ovf_q;
     logic        div_neg_q;
     logic [63:0] root_a_q;
     logic [63:0] root_b_q;
@@ -220,19 +223,24 @@ module ele_flow_core (
     logic [64:0] j3_lq_c, j3_g0_c;
     logic [64:0] j4_g1_c;
     logic        j4_op_ovf_tot_c;
+    logic [64:0] j6_two_r0_r2_c, j6_disc_sub_c;
     logic [63:0] j6_disc_c, j6_abs_disc_c;
     logic        j6_hi_r_c;
     logic [63:0] isq_b_bit_c, isq_cand_c, isq_rem_n_c, isq_root_n_c, isq_d_mag_c, isq_signed_d_c;
+    logic [64:0] isq_qcit_add_c;
 
-    logic        grad_neg_c;
-    logic [63:0] tun_d_c, abs_r2_c, abs_r2_i64_c;
+    logic        descend_neg_c;
+    logic [64:0] two_r0_c, neg_two_r0_c, neg_qcit_c, neg_r0_c, neg_r1_c, tun_num_c;
+    logic        num_ovf_a_c, num_ovf_b_c, num_ovf_l_c, num_ovf_t_c;
+    logic [63:0] v_num_c, tun_d_c, abs_r2_c, abs_r2_i64_c;
     logic [63:0] div_num_sel_c, div_den_sel_c;
     logic [63:0] div_anum_c, div_aden_c, div_safe_den_c;
-    logic        div_den_zero_c, div_hi_num_c;
+    logic        div_den_zero_c, div_pre_ovf_c;
     logic [64:0] div_r_sh_c, div_r_diff_c;
     logic [63:0] div_r_nx_c, div_q_nx_c, div_clamped_c, div_res_c;
 
     logic        d_pick_a_c, d_has_r2_c, d_real_roots_c, d_active_c, d_zero_quant_c, d_clamp_c;
+    logic        d_quad_ovf_c, d_solver_ovf_c;
     logic [63:0] d_step_quad_c, d_grad_dir_c, d_raw_step_c, d_nz_step_c, d_raw_abs_c;
     logic [64:0] d_neg_dt_c, d_xp_c;
     logic [63:0] d_signed_cap_c, d_delta_c;
@@ -319,7 +327,9 @@ module ele_flow_core (
         j4_g1_c         = qadd64(b_w_q[1], qmul_res_c[63:0]);
         j4_op_ovf_tot_c = op_ovf_q | qmul_res_c[64] | j4_g1_c[64];
 
-        j6_disc_c       = r1_sq_q - (qmul_res_c[63:0] + qmul_res_c[63:0]);
+        j6_two_r0_r2_c  = qadd64(qmul_res_c[63:0], qmul_res_c[63:0]);
+        j6_disc_sub_c   = qsub64(r1_sq_q, j6_two_r0_r2_c[63:0]);
+        j6_disc_c       = j6_disc_sub_c[63:0];
         j6_abs_disc_c   = abs_i64(j6_disc_c);
         j6_hi_r_c       = ((j6_abs_disc_c >> 48) != 64'd0);
 
@@ -330,28 +340,41 @@ module ele_flow_core (
         isq_root_n_c    = (isqrt_rem_q >= isq_cand_c) ? ((isqrt_root_q >> 1) + isq_b_bit_c) : (isqrt_root_q >> 1);
         isq_d_mag_c     = isqrt_hi_q ? (isq_root_n_c << 8) : isq_root_n_c;
         isq_signed_d_c  = r1_q[63] ? (64'd0 - isq_d_mag_c) : isq_d_mag_c;
+        isq_qcit_add_c  = qadd64(r1_q, isq_signed_d_c);
 
         // Divider candidate & step
-        grad_neg_c      = ($signed(r1_q) > 64'sd0);
-        tun_d_c         = grad_neg_c ? (64'd0 - d_mag_q) : d_mag_q;
+        descend_neg_c   = (r1_q != 64'd0) && (($signed(r0_q) > 64'sd0) == ($signed(r1_q) > 64'sd0));
+        two_r0_c        = qadd64(r0_q, r0_q);
+        neg_two_r0_c    = qsub64(64'd0, two_r0_c[63:0]);
+        num_ovf_a_c     = qcit_ovf_q | two_r0_c[64] | neg_two_r0_c[64];
+        neg_qcit_c      = qsub64(64'd0, q_cit_q);
+        num_ovf_b_c     = qcit_ovf_q | neg_qcit_c[64];
+        neg_r0_c        = qsub64(64'd0, r0_q);
+        num_ovf_l_c     = neg_r0_c[64];
+
+        neg_r1_c        = qsub64(64'd0, r1_q);
+        v_num_c         = r2_q[63] ? r1_q : neg_r1_c[63:0];
+        tun_d_c         = v_num_c[63] ? (64'd0 - d_mag_q) : d_mag_q;
+        tun_num_c       = qadd64(v_num_c, tun_d_c);
+        num_ovf_t_c     = (r2_q[63] ? 1'b0 : neg_r1_c[64]) | tun_num_c[64];
         abs_r2_c        = abs_i64(r2_q);
         abs_r2_i64_c    = (abs_r2_c > 64'h7FFFFFFF_FFFFFFFF) ? 64'h7FFFFFFF_FFFFFFFF : abs_r2_c;
 
         case (div_idx_q)
             2'd0: begin
-                div_num_sel_c = 64'd0 - (r0_q + r0_q);
+                div_num_sel_c = neg_two_r0_c[63:0];
                 div_den_sel_c = q_cit_q;
             end
             2'd1: begin
-                div_num_sel_c = 64'd0 - q_cit_q;
+                div_num_sel_c = neg_qcit_c[63:0];
                 div_den_sel_c = r2_q;
             end
             2'd2: begin
-                div_num_sel_c = 64'd0 - r0_q;
+                div_num_sel_c = neg_r0_c[63:0];
                 div_den_sel_c = r1_q;
             end
             default: begin
-                div_num_sel_c = (64'd0 - r1_q) + tun_d_c;
+                div_num_sel_c = tun_num_c[63:0];
                 div_den_sel_c = abs_r2_i64_c;
             end
         endcase
@@ -360,7 +383,7 @@ module ele_flow_core (
         div_aden_c     = abs_i64(div_den_sel_c);
         div_den_zero_c = (div_aden_c == 64'd0);
         div_safe_den_c = div_aden_c | (div_den_zero_c ? 64'd1 : 64'd0);
-        div_hi_num_c   = ((div_anum_c >> 47) != 64'd0);
+        div_pre_ovf_c  = div_den_zero_c || ((div_anum_c >> 48) >= div_safe_den_c);
 
         div_r_sh_c     = {div_rem_q, div_quot_q[63]};
         div_r_diff_c   = div_r_sh_c - {1'b0, div_den_q};
@@ -371,16 +394,18 @@ module ele_flow_core (
             div_r_nx_c = div_r_sh_c[63:0];
             div_q_nx_c = {div_quot_q[62:0], 1'b0};
         end
-        div_clamped_c  = (div_q_nx_c > 64'h7FFFFFFF_FFFFFFFF) ? 64'h7FFFFFFF_FFFFFFFF : div_q_nx_c;
+        div_clamped_c  = (div_pre_ovf_q || (div_q_nx_c > 64'h7FFFFFFF_FFFFFFFF)) ? 64'h7FFFFFFF_FFFFFFFF : div_q_nx_c;
         div_res_c      = div_neg_q ? (64'd0 - div_clamped_c) : div_clamped_c;
 
         // Step selection & horizon clamping
         d_pick_a_c     = (abs_i64(root_a_q) <= abs_i64(root_b_q));
         d_step_quad_c  = d_pick_a_c ? root_a_q : root_b_q;
-        d_grad_dir_c   = grad_neg_c ? 64'hFFFFFFFF_FFFFFFFF : 64'd1;
+        d_quad_ovf_c   = num_ovf_a_c | num_ovf_b_c;
+        d_grad_dir_c   = descend_neg_c ? 64'hFFFFFFFF_FFFFFFFF : 64'd1;
         d_has_r2_c     = (r2_q != 64'd0);
         d_real_roots_c = ~disc_neg_q;
         d_raw_step_c   = d_has_r2_c ? (d_real_roots_c ? d_step_quad_c : div_res_c) : step_lin_q;
+        d_solver_ovf_c = d_has_r2_c ? (disc_ovf_q | (d_real_roots_c ? d_quad_ovf_c : num_ovf_t_c)) : num_ovf_l_c;
         d_active_c     = (r0_q != 64'd0) && ((r1_q != 64'd0) || (r2_q != 64'd0));
         d_zero_quant_c = d_active_c && (d_raw_step_c == 64'd0);
         d_nz_step_c    = (~d_active_c) ? 64'd0 : (d_zero_quant_c ? d_grad_dir_c : d_raw_step_c);
@@ -405,7 +430,7 @@ module ele_flow_core (
         p7_j1_next_c    = op_en_c ? j1_op_q : p7_j1_c[63:0];
         p7_conv_sub_c   = qsub64(p7_j0_next_c, b0_eff_q);
         p7_res_after_c  = op_en_c ? p7_j0_next_c : p7_conv_sub_c[63:0];
-        p7_converged_c  = (~(p7_tot_ovf_c | p7_conv_sub_c[64])) && (abs_i64(p7_res_after_c) <= 64'd4);
+        p7_converged_c  = (~(p7_tot_ovf_c | ((~op_en_c) & p7_conv_sub_c[64]))) && (abs_i64(p7_res_after_c) <= 64'd4);
 
         p7_chart_orig_c = s_w_q[5][31:16];
         p7_mode_orig_c  = s_w_q[5][15:0];
@@ -468,6 +493,8 @@ module ele_flow_core (
             r2_q            <= 64'd0;
             r1_sq_q         <= 64'd0;
             disc_neg_q      <= 1'b0;
+            disc_ovf_q      <= 1'b0;
+            qcit_ovf_q      <= 1'b0;
             isqrt_hi_q      <= 1'b0;
             isqrt_rem_q     <= 64'd0;
             isqrt_root_q    <= 64'd0;
@@ -479,6 +506,7 @@ module ele_flow_core (
             div_rem_q       <= 64'd0;
             div_quot_q      <= 64'd0;
             div_den_q       <= 64'd1;
+            div_pre_ovf_q   <= 1'b0;
             div_neg_q       <= 1'b0;
             root_a_q        <= 64'd0;
             root_b_q        <= 64'd0;
@@ -624,12 +652,14 @@ module ele_flow_core (
                 end
 
                 S_JMUL_5: begin
-                    r1_sq_q <= qmul_res_c[63:0];
-                    st_q    <= S_JMUL_6;
+                    r1_sq_q    <= qmul_res_c[63:0];
+                    disc_ovf_q <= qmul_res_c[64];
+                    st_q       <= S_JMUL_6;
                 end
 
                 S_JMUL_6: begin
                     disc_neg_q   <= j6_disc_c[63];
+                    disc_ovf_q   <= disc_ovf_q | qmul_res_c[64] | j6_two_r0_r2_c[64] | j6_disc_sub_c[64];
                     isqrt_hi_q   <= j6_hi_r_c;
                     isqrt_rem_q  <= j6_hi_r_c ? j6_abs_disc_c : (j6_abs_disc_c << 16);
                     isqrt_root_q <= 64'd0;
@@ -639,10 +669,11 @@ module ele_flow_core (
 
                 S_ISQRT: begin
                     if (isqrt_sh_q == 6'd0) begin
-                        d_mag_q   <= isq_d_mag_c;
-                        q_cit_q   <= r1_q + isq_signed_d_c;
-                        div_idx_q <= 2'd0;
-                        st_q      <= S_DIV_INIT;
+                        d_mag_q    <= isq_d_mag_c;
+                        q_cit_q    <= isq_qcit_add_c[63:0];
+                        qcit_ovf_q <= isq_qcit_add_c[64];
+                        div_idx_q  <= 2'd0;
+                        st_q       <= S_DIV_INIT;
                     end else begin
                         isqrt_rem_q  <= isq_rem_n_c;
                         isqrt_root_q <= isq_root_n_c;
@@ -651,12 +682,13 @@ module ele_flow_core (
                 end
 
                 S_DIV_INIT: begin
-                    div_quot_q <= div_hi_num_c ? div_anum_c : (div_anum_c << 16);
-                    div_den_q  <= div_hi_num_c ? ((div_safe_den_c >> 16) | 64'd1) : div_safe_den_c;
-                    div_rem_q  <= 64'd0;
-                    div_neg_q  <= (div_num_sel_c[63] != div_den_sel_c[63]);
-                    div_cnt_q  <= 7'd64;
-                    st_q       <= S_DIV_STEP;
+                    div_quot_q    <= (div_anum_c << 16);
+                    div_den_q     <= div_safe_den_c;
+                    div_rem_q     <= div_pre_ovf_c ? 64'd0 : (div_anum_c >> 48);
+                    div_pre_ovf_q <= div_pre_ovf_c;
+                    div_neg_q     <= (div_num_sel_c[63] != div_den_sel_c[63]);
+                    div_cnt_q     <= 7'd64;
+                    st_q          <= S_DIV_STEP;
                 end
 
                 S_DIV_STEP: begin
@@ -681,7 +713,7 @@ module ele_flow_core (
                                 delta_q  <= d_delta_c;
                                 dt_res_q <= abs_i64(d_delta_c);
                                 xp_q     <= d_xp_c[63:0];
-                                ovf_q    <= ovf_q | d_neg_dt_c[64] | d_xp_c[64];
+                                ovf_q    <= ovf_q | (d_active_c & d_solver_ovf_c) | d_neg_dt_c[64] | d_xp_c[64];
                                 st_q     <= S_POST_0;
                             end
                         endcase

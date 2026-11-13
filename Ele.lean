@@ -29,7 +29,7 @@ import Unit
 
 namespace Ele
 
-def version : String := "2.0.0"
+def version : String := "2.0.1"
 
 /-! ## 1. `Ele.Electron` (電子): Semiconductor Physics, Clocking & Mixed-Signal -/
 namespace Electron
@@ -915,12 +915,11 @@ def qdivI64 (numQ16 denQ16 : Int) : Int :=
   let aden := absI64ToU64 denQ16
   let denZero := aden == 0
   let safeDen := if denZero then 1 else aden
-  let hiNum := (anum >>> 47) != 0
-  let qLo := UInt64.ofNat (((anum <<< 16).toNat) / safeDen.toNat)
-  let safeDenHi := (safeDen >>> 16) ||| 1
-  let qHi := UInt64.ofNat (anum.toNat / safeDenHi.toNat)
-  let qMag := if hiNum then qHi else qLo
-  let clamped : UInt64 := if qMag > 0x7FFFFFFFFFFFFFFF then 0x7FFFFFFFFFFFFFFF else qMag
+  let hi := anum >>> 48
+  let preOvf := denZero || (hi >= safeDen)
+  let qMagNat : Nat := if preOvf then 0x7FFFFFFFFFFFFFFF else (anum.toNat <<< 16) / safeDen.toNat
+  let clamped : UInt64 :=
+    if preOvf || qMagNat > 0x7FFFFFFFFFFFFFFF then 0x7FFFFFFFFFFFFFFF else UInt64.ofNat qMagNat
   let neg := decide (numQ16 < 0) != decide (denQ16 < 0)
   let raw := if neg then (0 : UInt64) - clamped else clamped
   u64ToI64 raw
@@ -972,30 +971,40 @@ def stepChartExact (state bound : Flow.Cell64) (capMask : UInt64)
   let r1 := if opEn then g1 else u64ToI64 state.w1
   let r2 := if opEn then b2 else u64ToI64 state.w2
 
-  let (r1Sq, _) := qmulI64 r1 r1
-  let (r0R2, _) := qmulI64 r0 r2
-  let (twoR0R2, _) := qaddI64 r0R2 r0R2
-  let (disc, _) := qsubI64 r1Sq twoR0R2
+  let (r1Sq, do1) := qmulI64 r1 r1
+  let (r0R2, do2) := qmulI64 r0 r2
+  let (twoR0R2, do3) := qaddI64 r0R2 r0R2
+  let (disc, do4) := qsubI64 r1Sq twoR0R2
+  let discOvf := do1 || do2 || do3 || do4
 
-  let dMag := qsqrtU64 (absI64ToU64 disc)
-  let signedD := if r1 < 0 then (0 : UInt64) - dMag else dMag
-  let qCit := u64ToI64 (i64ToU64 r1 + signedD)
-  let (twoR0, _) := qaddI64 r0 r0
-  let (negTwoR0, _) := qsubI64 0 twoR0
-  let (negQ, _) := qsubI64 0 qCit
+  let dMag := u64ToI64 (qsqrtU64 (absI64ToU64 disc))
+  let negDMag := -dMag
+  let signedD := if r1 < 0 then negDMag else dMag
+  let (qCit, qcitOvf) := qaddI64 r1 signedD
+  let (twoR0, na1) := qaddI64 r0 r0
+  let (negTwoR0, na2) := qsubI64 0 twoR0
+  let numOvfA := qcitOvf || na1 || na2
+  let (negQ, nb1) := qsubI64 0 qCit
+  let numOvfB := qcitOvf || nb1
 
   let rootA := qdivI64 negTwoR0 qCit
   let rootB := qdivI64 negQ r2
   let pickA := absI64ToU64 rootA <= absI64ToU64 rootB
   let stepQuad := if pickA then rootA else rootB
+  let quadOvf := numOvfA || numOvfB
 
-  let (negR0, _) := qsubI64 0 r0
+  let (negR0, numOvfL) := qsubI64 0 r0
   let stepLin := qdivI64 negR0 r1
 
-  let (negR1, _) := qsubI64 0 r1
-  let gradNeg := decide (r1 > 0)
-  let tunD := u64ToI64 (if gradNeg then (0 : UInt64) - dMag else dMag)
-  let (tunNum, _) := qaddI64 negR1 tunD
+  let descendNeg := (r1 != 0) && (decide (r0 > 0) == decide (r1 > 0))
+  let gradDir : Int := if descendNeg then -1 else 1
+
+  let (negR1, negR1Ovf) := qsubI64 0 r1
+  let r2Neg := decide (r2 < 0)
+  let vNum := if r2Neg then r1 else negR1
+  let tunD := if vNum < 0 then negDMag else dMag
+  let (tunNum, tunAddOvf) := qaddI64 vNum tunD
+  let numOvfT := (if r2Neg then false else negR1Ovf) || tunAddOvf
   let absR2 := absI64ToU64 r2
   let absR2I64 := u64ToI64 (if absR2 > 0x7FFFFFFFFFFFFFFF then 0x7FFFFFFFFFFFFFFF else absR2)
   let stepTunnel := qdivI64 tunNum absR2I64
@@ -1003,9 +1012,9 @@ def stepChartExact (state bound : Flow.Cell64) (capMask : UInt64)
   let hasR2 := r2 != 0
   let realRoots := decide (disc >= 0)
   let rawStep := if hasR2 then (if realRoots then stepQuad else stepTunnel) else stepLin
+  let solverOvf := if hasR2 then (discOvf || (if realRoots then quadOvf else numOvfT)) else numOvfL
 
   let active := (r0 != 0) && ((r1 != 0) || (r2 != 0))
-  let gradDir : Int := if gradNeg then -1 else 1
   let zeroQuant := active && (rawStep == 0)
   let nzStep := if !active then 0 else if zeroQuant then gradDir else rawStep
 
@@ -1037,14 +1046,14 @@ def stepChartExact (state bound : Flow.Cell64) (capMask : UInt64)
   let (j1Au, pu7) := qaddI64 (u64ToI64 state.w1) r2D
   let pushOvf := pu1 || pu2 || pu3 || pu4 || pu5 || pu6 || pu7
 
-  let totOvf := ovf1 || ovNegDt || ovXp || (if opEn then postOpOvf else pushOvf)
+  let totOvf := ovf1 || (active && solverOvf) || ovNegDt || ovXp || (if opEn then postOpOvf else pushOvf)
   let j0Next := if opEn then j0Op else j0Au
   let j1Next := if opEn then j1Op else j1Au
   let j2Next := r2
 
   let (convDiff, convOvf) := qsubI64 j0Next b0Eff
   let resAfter := if opEn then j0Next else convDiff
-  let converged := !(totOvf || convOvf) && (absI64ToU64 resAfter <= 4)
+  let converged := !(totOvf || (!opEn && convOvf)) && (absI64ToU64 resAfter <= 4)
 
   let chartOrig : UInt16 := ((state.w5 >>> 16) &&& 0xFFFF).toUInt16
   let modeOrig : UInt16 := (state.w5 &&& 0xFFFF).toUInt16
