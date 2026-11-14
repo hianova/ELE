@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: MIT
-// ele_primordial.sv — Primordial Physical Silicon Seed Atoms for ELE v6.0.0
+// ele_primordial.sv — Primordial Physical Silicon Seed Atoms for ELE v7.0.1
 //
 // Physically honest leaf silicon primitives targeted by the self-hosting
-// FLOW 2-Jet lattice bootstrap synthesizer (`tools/ele_bootstrap.c`):
+// SEARU x FLOW 2-Jet lattice bootstrap synthesizer (`tools/ele_bootstrap.c`):
 //   1. `ele_mul33_atom`     : Operand-isolated 33x33 -> 66 signed DSP multiplier
 //                             aligned to FLOW_MAX_Q16 (+/-0x7FFFFFFF), unsigned
 //                             32-bit multi-precision limbs, and 33-bit signed

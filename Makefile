@@ -5,8 +5,10 @@ VERILATOR ?= verilator
 YOSYS     ?= yosys
 PREFIX    ?= /usr/local
 
-FLOW_DIR := $(abspath ../FLOW)
-FLOW_H   := $(FLOW_DIR)/flow.h
+FLOW_DIR   := $(abspath ../FLOW)
+FLOW_H     := $(FLOW_DIR)/flow.h
+SEARU_H    := $(FLOW_DIR)/searu.h
+FLOW_OPT_H := $(FLOW_DIR)/flow_opt_params.h
 
 BUILD_DIR          := build
 BOOTSTRAP_BIN      := $(BUILD_DIR)/ele_bootstrap
@@ -37,39 +39,64 @@ hygiene-gate:
 	@cfiles="$$(find . -maxdepth 3 \( -name '*.c' -o -name '*.h' \) -not -path './build/*' -not -path './tools/ele_bootstrap.c')" && \
 		if [ -n "$$cfiles" ]; then echo "ERROR: Unexpected C/H files outside tools/ele_bootstrap.c: $$cfiles" >&2; exit 1; fi
 	@test -f "$(FLOW_H)" || (echo "ERROR: Missing upstream $(FLOW_H)" >&2 && exit 1)
-	@echo "  [PASS] Single C17 FLOW synthesizer (tools/ele_bootstrap.c) + Pure IEEE 1800 SV RTL verified"
+	@test -f "$(SEARU_H)" || (echo "ERROR: Missing upstream $(SEARU_H)" >&2 && exit 1)
+	@test -f "$(FLOW_OPT_H)" || (echo "ERROR: Missing upstream $(FLOW_OPT_H)" >&2 && exit 1)
+	@echo "  [PASS] Single C17 SEARU x FLOW synthesizer (tools/ele_bootstrap.c) + Pure IEEE 1800 SV RTL verified"
 
-$(BOOTSTRAP_BIN): tools/ele_bootstrap.c $(FLOW_H) | $(BUILD_DIR)
-	$(CC) -std=c17 -O2 -Wall -Wextra -Werror -I"$(FLOW_DIR)" -o $@ tools/ele_bootstrap.c
+$(BOOTSTRAP_BIN): tools/ele_bootstrap.c $(FLOW_H) $(SEARU_H) $(FLOW_OPT_H) | $(BUILD_DIR)
+	$(CC) -std=c17 -mgeneral-regs-only -O2 -Wall -Wextra -Werror -I"$(FLOW_DIR)" -o $@ tools/ele_bootstrap.c
 
 bootstrap-gate: hygiene-gate $(BOOTSTRAP_BIN)
-	@echo "=== [Gate 2] FLOW v6.0.0 2-Jet Lattice Self-Hosting Bootstrap & Pareto Synthesis ==="
+	@echo "=== [Gate 2] SEARU x FLOW v7.0.1 2-Jet Symbiotic Self-Hosting Bootstrap & Pareto Synthesis ==="
 	./$(BOOTSTRAP_BIN) --dsp-count 1 --max-depth 22 -o $(CORE_AREA_SV)
 	./$(BOOTSTRAP_BIN) --dsp-count 3 --max-depth 36 -o $(CORE_CANON_SV)
 	@if cmp -s "$(CORE_AREA_SV)" "$(CORE_CANON_SV)"; then \
 		echo "ERROR: Pareto profiles generated identical SV!" >&2; exit 1; \
 	fi
-	@echo "  [PASS] Distinct converged FLOW 2-Jet schedules emitted (Area Profile A vs Canonical Profile B)"
+	@echo "  [PASS] Distinct converged SEARU x FLOW 2-Jet schedules emitted (Area Profile A vs Canonical Profile B)"
 
-$(FLOW_OBJ): $(FLOW_H) | $(BUILD_DIR)
+$(FLOW_OBJ): $(FLOW_H) $(SEARU_H) $(FLOW_OPT_H) | $(BUILD_DIR)
 	printf '%s\n' \
-		'#define FLOW_EXPORT_KERNEL' \
 		'#include "flow.h"' \
+		'#include "searu.h"' \
 		'uint8_t ele_dpi_try_swap(uint64_t *arena, uint64_t idx, uint64_t cap_mask, uint32_t new_epoch, const uint64_t cand[8]);' \
 		'uint8_t ele_dpi_try_swap(uint64_t *arena, uint64_t idx, uint64_t cap_mask, uint32_t new_epoch, const uint64_t cand[8]) {' \
 		'    return (uint8_t)flow_arena_try_swap((flow_cell *)arena, idx, cap_mask, new_epoch, cand);' \
-		'}' | $(CC) -x c -std=c99 -O3 -Wall -Wextra -Werror -I"$(FLOW_DIR)" -c - -o $@
+		'}' \
+		'uint8_t ele_dpi_searu_heal(uint64_t *arena, uint64_t cap_mask, const uint64_t st[8], int64_t u_ext_q16, int64_t target_x_q16, uint64_t *io_seed, uint32_t *io_epoch, uint64_t out_chart[8]);' \
+		'uint8_t ele_dpi_searu_heal(uint64_t *arena, uint64_t cap_mask, const uint64_t st[8], int64_t u_ext_q16, int64_t target_x_q16, uint64_t *io_seed, uint32_t *io_epoch, uint64_t out_chart[8]) {' \
+		'    static const searu_bilevel_term k_terms[24] = {' \
+		'        {-311296, -8192, 0, 0}, {192512, 4096, 0, 0},   {-294912, -8192, 0, 0},' \
+		'        {143360, -4096, 0, 0},  {-278528, -8192, 0, 0}, {221184, 8192, 0, 0},' \
+		'        {-262144, -8192, 0, 0}, {-184320, 4096, 0, 0},  {307200, 12288, 0, 0},' \
+		'        {-286720, -8192, 0, 0}, {167936, -4096, 0, 0},  {-270336, -8192, 0, 0},' \
+		'        {253952, 8192, 0, 0},   {-290816, -8192, 0, 0}, {-135168, 4096, 0, 0},' \
+		'        {208896, 8192, 0, 0},   {-254720, -8192, 0, 0}, {176128, -4096, 0, 0},' \
+		'        {-151552, 16384, 0, 0}, {237568, 8192, 0, 0},   {188416, -12288, 0, 0},' \
+		'        {-118784, 12288, 0, 0}, {274432, 4096, 0, 0},   {-98304, 16384, 0, 0},' \
+		'    };' \
+		'    for (uint32_t w = 0U; w < 8U; ++w) { out_chart[w] = UINT64_C(0); }' \
+		'    bool ok = searu_heal_and_swap((flow_cell *)arena, cap_mask, st, k_terms, 24U, UINT64_C(0),' \
+		'                                  u_ext_q16, target_x_q16, 6U, io_seed, io_epoch, 8192U, NULL);' \
+		'    if (ok) {' \
+		'        flow_arena_load_acq(out_chart, (const flow_cell *)arena, (st[5] >> 16U), cap_mask);' \
+		'    }' \
+		'    return (uint8_t)(ok ? 1U : 0U);' \
+		'}' | $(CC) -x c -std=c17 -O3 -Wall -Wextra -Werror -DFLOW_EXPORT_KERNEL=1 -DSEARU_EXPORT_RING0=1 -DSEARU_EXPORT_SOLVERS=1 -I"$(FLOW_DIR)" -c - -o $@
 
 $(COSIM_CANON_BIN): bootstrap-gate $(RTL_SEEDS) $(RTL_TB) $(FLOW_OBJ)
 	@echo "=== [Gate 3] Strict Verilator -Wall Lint, X-Poisoning & Full Dual-Profile 0-ULP Co-Sim Build ==="
 	@mkdir -p $(VERILATOR_CANON) $(VERILATOR_AREA)
-	$(VERILATOR) --lint-only -Wall --top-module ele_bus_invert65 rtl/ele_em_phy.sv
-	$(VERILATOR) --lint-only -Wall --top-module ele_ternary_mac_dualrail rtl/ele_em_phy.sv
+	$(VERILATOR) --lint-only -Wall --top-module ele_bus_invert65 rtl/ele_em_phy.sv rtl/ele_primordial.sv $(CORE_CANON_SV)
+	$(VERILATOR) --lint-only -Wall --top-module ele_bus_invert17 rtl/ele_em_phy.sv rtl/ele_primordial.sv $(CORE_CANON_SV)
+	$(VERILATOR) --lint-only -Wall --top-module ele_ternary_mac_dualrail rtl/ele_em_phy.sv rtl/ele_primordial.sv $(CORE_CANON_SV)
 	$(VERILATOR) --lint-only -Wall --top-module ele_mul33_atom rtl/ele_primordial.sv
 	$(VERILATOR) --lint-only -Wall --top-module ele_rad2_step_atom rtl/ele_primordial.sv
 	$(VERILATOR) --lint-only -Wall --top-module ele_sram_1rw64 rtl/ele_primordial.sv
 	$(VERILATOR) --lint-only -Wall --top-module ele_flow_atlas_top rtl/ele_primordial.sv $(CORE_AREA_SV)
 	$(VERILATOR) --lint-only -Wall --top-module ele_flow_atlas_top rtl/ele_primordial.sv $(CORE_CANON_SV)
+	$(VERILATOR) --lint-only -Wall --top-module ele_flow_qfn_top rtl/ele_em_phy.sv rtl/ele_primordial.sv $(CORE_AREA_SV)
+	$(VERILATOR) --lint-only -Wall --top-module ele_flow_qfn_top rtl/ele_em_phy.sv rtl/ele_primordial.sv $(CORE_CANON_SV)
 	$(VERILATOR) --binary -j 0 -Wall --x-assign unique --x-initial unique \
 		-Mdir $(VERILATOR_CANON) --top-module ele_cosim_tb \
 		$(RTL_SEEDS) $(CORE_CANON_SV) $(RTL_TB) "$(abspath $(FLOW_OBJ))" -o Vele_cosim_tb
@@ -84,9 +111,11 @@ cosim-gate: $(COSIM_CANON_BIN)
 	./$(COSIM_AREA_BIN)
 
 formal-gate: bootstrap-gate $(RTL_SEEDS)
-	@echo "=== [Gate 4] Yosys Bit-Blasted SAT & Unbounded Temporal Induction Proofs (7x QED) ==="
+	@echo "=== [Gate 4] Yosys Bit-Blasted SAT & Unbounded Temporal Induction Proofs (9x QED) ==="
 	$(YOSYS) -q -p "read_verilog -sv -formal rtl/ele_em_phy.sv; prep -top ele_bus_invert65 -flatten; async2sync; dffunmap; sat -verify -tempinduct -set-init-zero -prove-asserts"
 	@echo "  [QED] ele_bus_invert65         : unbounded k-induction (flips <= 32/65, exact HD, lossless rx)"
+	$(YOSYS) -q -p "read_verilog -sv -formal rtl/ele_em_phy.sv; prep -top ele_bus_invert17 -flatten; async2sync; dffunmap; sat -verify -tempinduct -set-init-zero -prove-asserts"
+	@echo "  [QED] ele_bus_invert17         : unbounded k-induction (flips <= 8/17, exact HD, lossless rx, idle hold)"
 	$(YOSYS) -q -p "read_verilog -sv -formal rtl/ele_em_phy.sv; prep -top ele_ternary_mac_dualrail -flatten; async2sync; dffunmap; sat -verify -tempinduct -set-init-zero -prove-asserts"
 	@echo "  [QED] ele_ternary_mac_dualrail : unbounded k-induction (0-ULP across 2^32 signed inputs + 0-flip zero-skip)"
 	$(YOSYS) -q -p "read_verilog -sv -formal rtl/ele_primordial.sv; prep -top ele_mul33_atom; async2sync; sat -verify -prove-asserts"
@@ -99,17 +128,21 @@ formal-gate: bootstrap-gate $(RTL_SEEDS)
 	@echo "  [QED] ele_flow_core (dsp=1)    : reset safety, busy write-ignore invariance, idle gating, SEU & KanLock"
 	$(YOSYS) -q -p "read_verilog -sv -formal rtl/ele_primordial.sv $(CORE_CANON_SV); prep -top ele_flow_atlas_top; delete ele_flow_atlas_top/u_core ele_flow_atlas_top/u_chart_sram; select -module ele_flow_atlas_top; async2sync; dffunmap; techmap; opt -fast -purge; sat -verify -tempinduct -set-init-zero -prove-asserts"
 	@echo "  [QED] ele_flow_atlas_top       : unbounded k-induction (reset, cap_mask <= 15, @swap firewall & busy immunity)"
+	$(YOSYS) -q -p "read_verilog -sv -formal rtl/ele_em_phy.sv rtl/ele_primordial.sv $(CORE_CANON_SV); prep -top ele_flow_qfn_top; delete ele_flow_qfn_top/u_atlas; flatten; async2sync; dffunmap; techmap; opt -fast -purge; sat -verify -tempinduct -set-init-zero -prove-asserts"
+	@echo "  [QED] ele_flow_qfn_top         : unbounded k-induction (42-pin QFN-48 reset, busy flit-ignore, 4-beat Tx & <=8/17 SSO)"
 
 synth-gate: bootstrap-gate $(RTL_SEEDS)
-	@echo "=== [Gate 5] Yosys Physical Silicon Audit (<160 Pins, True \$$mem_v2 SRAM, 0 Latches, Gate/LTP Pareto Proof) ==="
+	@echo "=== [Gate 5] Yosys Physical Silicon Audit (42-Pin QFN-48, True \$$mem_v2 SRAM, 0 Latches, Gate/LTP Pareto Proof) ==="
 	$(YOSYS) -q -p "read_verilog -nolatches -sv rtl/ele_primordial.sv $(CORE_CANON_SV); hierarchy -top ele_flow_core; proc; splitnets -ports; select -assert-count 141 ele_flow_core/x:*; select -assert-max 159 ele_flow_core/x:*"
 	$(YOSYS) -q -p "read_verilog -nolatches -sv rtl/ele_primordial.sv $(CORE_CANON_SV); hierarchy -top ele_flow_atlas_top; proc; splitnets -ports; select -assert-count 157 ele_flow_atlas_top/x:*; select -assert-max 159 ele_flow_atlas_top/x:*"
-	@echo "  [PASS] Physical pinout verified: ele_flow_core = 141 pins (<160), ele_flow_atlas_top = 157 pins (<160)"
+	$(YOSYS) -q -p "read_verilog -nolatches -sv rtl/ele_em_phy.sv rtl/ele_primordial.sv $(CORE_CANON_SV); hierarchy -top ele_flow_qfn_top; proc; splitnets -ports; select -assert-count 42 ele_flow_qfn_top/x:*; select -assert-max 47 ele_flow_qfn_top/x:*"
+	@echo "  [PASS] Physical pinout verified: ele_flow_qfn_top = 42 pins (<48 QFN-48), ele_flow_core = 141, ele_flow_atlas_top = 157"
 	@sram_log="$$( $(YOSYS) -p "read_verilog -nolatches -sv rtl/ele_primordial.sv $(CORE_CANON_SV); prep -top ele_flow_atlas_top; check -assert; select -assert-none t:\$$_DLATCH* t:\$$dlatch*; select -assert-count 1 *ele_sram_1rw64*/t:\$$mem*; select -assert-count 0 ele_flow_core/t:\$$mem*; select -assert-count 0 ele_flow_atlas_top/t:\$$mem*" 2>&1 )" || { echo "$$sram_log" >&2; exit 1; }; \
-	if printf '%s\n' "$$sram_log" | grep -q "Replacing memory"; then \
+	qfn_sram_log="$$( $(YOSYS) -p "read_verilog -nolatches -sv rtl/ele_em_phy.sv rtl/ele_primordial.sv $(CORE_CANON_SV); prep -top ele_flow_qfn_top; check -assert; select -assert-none t:\$$_DLATCH* t:\$$dlatch*; select -assert-count 1 *ele_sram_1rw64*/t:\$$mem*; select -assert-count 0 ele_flow_core/t:\$$mem*; select -assert-count 0 ele_flow_atlas_top/t:\$$mem*; select -assert-count 0 ele_flow_qfn_top/t:\$$mem*" 2>&1 )" || { echo "$$qfn_sram_log" >&2; exit 1; }; \
+	if printf '%s\n%s\n' "$$sram_log" "$$qfn_sram_log" | grep -q "Replacing memory"; then \
 		echo "ERROR: Unpacked memory-to-register explosion detected!" >&2; exit 1; \
 	fi
-	@echo "  [PASS] True synchronous 1RW 64-bit SRAM inferred (1 \$$mem_v2 in ele_sram_1rw64, 0 memory explosions, 0 latches)"
+	@echo "  [PASS] True synchronous 1RW 64-bit SRAM inferred across atlas_top & qfn_top (1 \$$mem_v2, 0 memory explosions, 0 latches)"
 	@log_a="$$( $(YOSYS) -p "read_verilog -nolatches -sv rtl/ele_primordial.sv $(CORE_AREA_SV); synth -top ele_flow_core -flatten; check -assert; select -assert-none t:\$$_DLATCH* t:\$$dlatch*; stat; ltp -noff" 2>&1 )" || { echo "$$log_a" >&2; exit 1; }; \
 	log_b="$$( $(YOSYS) -p "read_verilog -nolatches -sv rtl/ele_primordial.sv $(CORE_CANON_SV); synth -top ele_flow_core -flatten; check -assert; select -assert-none t:\$$_DLATCH* t:\$$dlatch*; stat; ltp -noff" 2>&1 )" || { echo "$$log_b" >&2; exit 1; }; \
 	gates_a="$$(printf '%s\n' "$$log_a" | awk '/Number of cells:/ {v=$$NF} /^[[:space:]]*[0-9]+[[:space:]]+cells$$/ {v=$$1} END {print v}')"; \
@@ -129,7 +162,7 @@ synth-gate: bootstrap-gate $(RTL_SEEDS)
 
 test: cosim-gate formal-gate synth-gate
 	@echo "================================================================================"
-	@echo "   ALL 5 ELE v6.0.0 SELF-HOSTING SILICON GATES PASSED (0-ULP, 7x QED, <160 PINS)"
+	@echo "   ALL 5 ELE v7.0.1 SELF-HOSTING SILICON GATES PASSED (0-ULP, 9x QED, 42-PIN QFN)"
 	@echo "================================================================================"
 
 mutate-check: bootstrap-gate $(COSIM_CANON_BIN)
@@ -138,7 +171,7 @@ mutate-check: bootstrap-gate $(COSIM_CANON_BIN)
 
 verify: test mutate-check
 	@echo "================================================================================"
-	@echo "   ALL 6 ELE v6.0.0 SILICON & MUTATION GATES VERIFIED (100.0% MUTANT KILL RATE)"
+	@echo "   ALL 6 ELE v7.0.1 SILICON & MUTATION GATES VERIFIED (100.0% MUTANT KILL RATE)"
 	@echo "================================================================================"
 
 install: hygiene-gate bootstrap-gate

@@ -1,13 +1,15 @@
 #!/usr/bin/env python3
 """
-rtl_sabotage_check.py — SystemVerilog Single-Fault RTL Mutation & Kill-Rate Gate for ELE v6.0.0
+rtl_sabotage_check.py — SystemVerilog Single-Fault RTL Mutation & Kill-Rate Gate for ELE v7.0.1
 ===============================================================================================
 Empirically proves functional & protocol completeness of ELE's pure-SV co-simulation wind-tunnel
-by injecting 54 stratified single-fault SystemVerilog hardware mutations across BOTH:
+by injecting 64 stratified single-fault SystemVerilog hardware mutations across ALL THREE tiers:
+  - `rtl/ele_em_phy.sv` (8 padframe & 17-wire Bus-Invert PHY mutants across `ele_bus_invert17`
+    and `ele_flow_qfn_top`),
   - `rtl/ele_primordial.sv` (10 leaf-silicon mutants across `ele_mul33_atom`, `ele_rad2_step_atom`,
     and `ele_sram_1rw64`), and
-  - `rtl/ele_flow_core.sv` (44 datapath, FSM, reset, Schmitt/KanLock, and `@swap` firewall mutants
-    across `ele_flow_core` and `ele_flow_atlas_top`).
+  - `rtl/ele_flow_core.sv` (46 datapath, FSM, reset, Schmitt/KanLock, bound-cache coherence, and
+    `@swap` firewall mutants across `ele_flow_core` and `ele_flow_atlas_top`).
 
 Every mutant is required to:
   1. Match uniquely (`count == 1`) in the golden RTL source (0 silent no-op mutants).
@@ -220,8 +222,8 @@ def build_rtl_mutants() -> list[RtlMutant]:
             "ROUND_ISQRT_GT_TO_GE",
             "datapath_limb_carry_round",
             "rtl/ele_flow_core.sv",
-            "d_mag_q <= rad2_acc_w[2] + {63'd0, (rad2_rem_w[2] > rad2_acc_w[2])};",
-            "d_mag_q <= rad2_acc_w[2] + {63'd0, (rad2_rem_w[2] >= rad2_acc_w[2])};",
+            "sr_acc_q <= rad2_acc_w[2] + {63'd0, (rad2_rem_w[2] > rad2_acc_w[2])};",
+            "sr_acc_q <= rad2_acc_w[2] + {63'd0, (rad2_rem_w[2] >= rad2_acc_w[2])};",
         ),
         RtlMutant(
             "ROUND_ISQRT_DROP_ROUND_BIT",
@@ -384,43 +386,43 @@ def build_rtl_mutants() -> list[RtlMutant]:
             "SWAP_FW_NEXT_LO_CAP_OFF1",
             "swap_firewall_commit",
             "rtl/ele_flow_core.sv",
-            "({8'd0, cand_buf_q[5][31:24]} <= cap_mask_q) &",
-            "({8'd0, cand_buf_q[5][31:24]} <= (cap_mask_q + 16'd1)) &",
+            "({8'd0, cand_next_lo_q} <= cap_mask_q) &",
+            "({8'd0, cand_next_lo_q} <= (cap_mask_q + 16'd1)) &",
         ),
         RtlMutant(
             "SWAP_FW_NEXT_LO_LE_TO_LT",
             "swap_firewall_commit",
             "rtl/ele_flow_core.sv",
-            "({8'd0, cand_buf_q[5][31:24]} <= cap_mask_q) &",
-            "({8'd0, cand_buf_q[5][31:24]} < cap_mask_q) &",
+            "({8'd0, cand_next_lo_q} <= cap_mask_q) &",
+            "({8'd0, cand_next_lo_q} < cap_mask_q) &",
         ),
         RtlMutant(
             "SWAP_FW_NEXT_HI_CAP_OFF1",
             "swap_firewall_commit",
             "rtl/ele_flow_core.sv",
-            "({8'd0, cand_buf_q[5][23:16]} <= cap_mask_q) &",
-            "({8'd0, cand_buf_q[5][23:16]} <= (cap_mask_q + 16'd1)) &",
+            "({8'd0, cand_next_hi_q} <= cap_mask_q) &",
+            "({8'd0, cand_next_hi_q} <= (cap_mask_q + 16'd1)) &",
         ),
         RtlMutant(
             "SWAP_FW_NEXT_HI_LE_TO_LT",
             "swap_firewall_commit",
             "rtl/ele_flow_core.sv",
-            "({8'd0, cand_buf_q[5][23:16]} <= cap_mask_q) &",
-            "({8'd0, cand_buf_q[5][23:16]} < cap_mask_q) &",
+            "({8'd0, cand_next_hi_q} <= cap_mask_q) &",
+            "({8'd0, cand_next_hi_q} < cap_mask_q) &",
         ),
         RtlMutant(
             "SWAP_FW_DT_MAX_GT_TO_GE",
             "swap_firewall_commit",
             "rtl/ele_flow_core.sv",
-            "($signed(cand_buf_q[4][63:32]) > 32'sd0) &",
-            "($signed(cand_buf_q[4][63:32]) >= 32'sd0) &",
+            "cand_dt_ok_q <= ($signed(cmd_data_i[63:32]) > 32'sd0);",
+            "cand_dt_ok_q <= ($signed(cmd_data_i[63:32]) >= 32'sd0);",
         ),
         RtlMutant(
             "SWAP_FW_HYSTERESIS_INVERT",
             "swap_firewall_commit",
             "rtl/ele_flow_core.sv",
-            "($signed(cand_buf_q[3][63:32]) <= $signed(cand_buf_q[3][31:0]));",
-            "($signed(cand_buf_q[3][63:32]) >= $signed(cand_buf_q[3][31:0]));",
+            "cand_b_ok_q <= ($signed(cmd_data_i[63:32]) <= $signed(cmd_data_i[31:0]));",
+            "cand_b_ok_q <= ($signed(cmd_data_i[63:32]) >= $signed(cmd_data_i[31:0]));",
         ),
         RtlMutant(
             "SWAP_COMMIT_EPOCH_LANE_SHIFT",
@@ -428,6 +430,77 @@ def build_rtl_mutants() -> list[RtlMutant]:
             "rtl/ele_flow_core.sv",
             "sram_wdata_c = {swap_epoch_q, 32'd0};",
             "sram_wdata_c = {32'd0, swap_epoch_q};",
+        ),
+        RtlMutant(
+            "TOP_CACHE_SKIP_SWAP_INVAL",
+            "swap_firewall_commit",
+            "rtl/ele_flow_core.sv",
+            "if (swap_slot_q == bound_cache_slot_q) begin\n                            bound_cache_valid_q <= 1'b0;\n                        end",
+            "if (1'b0) begin\n                            bound_cache_valid_q <= 1'b0;\n                        end",
+        ),
+        RtlMutant(
+            "TOP_CACHE_SKIP_WRITE_INVAL",
+            "swap_firewall_commit",
+            "rtl/ele_flow_core.sv",
+            "if (wr_chart_slot_c == bound_cache_slot_q) begin\n                                    bound_cache_valid_q <= 1'b0;\n                                end",
+            "if (1'b0) begin\n                                    bound_cache_valid_q <= 1'b0;\n                                end",
+        ),
+        # --- Category 8: QFN-48 Charge-Minimal Padframe & 17-Wire Bus-Invert PHY (`rtl/ele_em_phy.sv`, 8 mutants) ---
+        RtlMutant(
+            "BI17_SSO_THRESH_8_TO_9",
+            "qfn48_phy_padframe",
+            "rtl/ele_em_phy.sv",
+            "invert_sel = (pop_p0 > 5'd8);",
+            "invert_sel = (pop_p0 > 5'd9);",
+        ),
+        RtlMutant(
+            "BI17_DECODE_DROP_INV",
+            "qfn48_phy_padframe",
+            "rtl/ele_em_phy.sv",
+            "assign rx_data_o = prev_wire_q[15:0] ^ {16{prev_wire_q[16]}};",
+            "assign rx_data_o = prev_wire_q[15:0];",
+        ),
+        RtlMutant(
+            "QFN_RX_DECODE_DROP_INV",
+            "qfn48_phy_padframe",
+            "rtl/ele_em_phy.sv",
+            "assign rx_dec = rx_bi_lane_i[15:0] ^ {16{rx_bi_lane_i[16]}};",
+            "assign rx_dec = rx_bi_lane_i[15:0];",
+        ),
+        RtlMutant(
+            "QFN_READY_TX_GUARD_DROP",
+            "qfn48_phy_padframe",
+            "rtl/ele_em_phy.sv",
+            "assign ready_o = atlas_ready_w & (~tx_active_q) & (~tx_valid_q);",
+            "assign ready_o = atlas_ready_w;",
+        ),
+        RtlMutant(
+            "QFN_AUX_HI_MUX_BYPASS",
+            "qfn48_phy_padframe",
+            "rtl/ele_em_phy.sv",
+            "atlas_cmd_aux_c   = issue_atlas_cmd_c ? {(rx_dec[14] ? aux_hi_q : 8'd0), rx_dec[13:6]} : 16'd0;",
+            "atlas_cmd_aux_c   = issue_atlas_cmd_c ? {8'd0, rx_dec[13:6]} : 16'd0;",
+        ),
+        RtlMutant(
+            "QFN_TX_BURST_SHORT_2",
+            "qfn48_phy_padframe",
+            "rtl/ele_em_phy.sv",
+            "if (tx_idx_q == 2'd3) begin",
+            "if (tx_idx_q == 2'd2) begin",
+        ),
+        RtlMutant(
+            "QFN_WBUF_LANE_STUCK0",
+            "qfn48_phy_padframe",
+            "rtl/ele_em_phy.sv",
+            "wbuf_q[q_idx_q*16 +: 16] <= rx_dec;",
+            "wbuf_q[0 +: 16] <= rx_dec;",
+        ),
+        RtlMutant(
+            "QFN_SWAP_ACC_DROP",
+            "qfn48_phy_padframe",
+            "rtl/ele_em_phy.sv",
+            "assign swap_accepted_o = rst_n ? (atlas_swap_done_w ? atlas_swap_acc_w : swap_acc_lat_q) : 1'b0;",
+            "assign swap_accepted_o = 1'b0;",
         ),
     ]
 
@@ -513,23 +586,27 @@ def eval_rtl_mutant(
         mdir = wdir / "mdir_fast"
         mdir.mkdir(parents=True, exist_ok=True)
 
+        phy_text = sources["rtl/ele_em_phy.sv"]
         prim_text = sources["rtl/ele_primordial.sv"]
         core_text = sources["rtl/ele_flow_core.sv"]
-        if m.rel_file == "rtl/ele_primordial.sv":
+        if m.rel_file == "rtl/ele_em_phy.sv":
+            phy_text = phy_text.replace(m.target, m.replacement, 1)
+        elif m.rel_file == "rtl/ele_primordial.sv":
             prim_text = prim_text.replace(m.target, m.replacement, 1)
         else:
             core_text = core_text.replace(m.target, m.replacement, 1)
 
+        phy_path = wdir / "ele_em_phy.sv"
         prim_path = wdir / "ele_primordial.sv"
         core_path = wdir / "ele_flow_core.sv"
+        phy_path.write_text(phy_text, encoding="utf-8")
         prim_path.write_text(prim_text, encoding="utf-8")
         core_path.write_text(core_text, encoding="utf-8")
 
-        phy_sv = root / "rtl" / "ele_em_phy.sv"
         tb_sv = root / "rtl" / "ele_cosim_tb.sv"
 
         compiled_ok, killed, rc, detail = run_verilator_sim(
-            verilator, env, mdir, phy_sv, prim_path, core_path, tb_sv, flow_obj, fast_mode=True
+            verilator, env, mdir, phy_path, prim_path, core_path, tb_sv, flow_obj, fast_mode=True
         )
         if not compiled_ok:
             return (m, False, False, rc, detail)
@@ -539,7 +616,7 @@ def eval_rtl_mutant(
             mdir_full = wdir / f"mdir_full_{m.name}"
             mdir_full.mkdir(parents=True, exist_ok=True)
             compiled_ok, killed, rc, detail = run_verilator_sim(
-                verilator, env, mdir_full, phy_sv, prim_path, core_path, tb_sv, flow_obj, fast_mode=False
+                verilator, env, mdir_full, phy_path, prim_path, core_path, tb_sv, flow_obj, fast_mode=False
             )
 
         return (m, compiled_ok, killed, rc, detail)
@@ -573,6 +650,7 @@ def main() -> int:
             return 1
 
     sources = {
+        "rtl/ele_em_phy.sv": (root / "rtl" / "ele_em_phy.sv").read_text(encoding="utf-8"),
         "rtl/ele_primordial.sv": (root / "rtl" / "ele_primordial.sv").read_text(encoding="utf-8"),
         "rtl/ele_flow_core.sv": (root / "rtl" / "ele_flow_core.sv").read_text(encoding="utf-8"),
     }
@@ -594,14 +672,18 @@ def main() -> int:
         if m.target == m.replacement:
             raise RuntimeError(f"Mutant {m.name} replacement is identical to target!")
 
+    phy_cnt = sum(1 for m in mutants if m.rel_file == "rtl/ele_em_phy.sv")
     prim_cnt = sum(1 for m in mutants if m.rel_file == "rtl/ele_primordial.sv")
     core_cnt = sum(1 for m in mutants if m.rel_file == "rtl/ele_flow_core.sv")
 
     print("================================================================================")
-    print("  ELE v6.0.0 — Adversarial SystemVerilog Single-Fault RTL Sabotage Audit")
+    print("  ELE v7.0.1 — Adversarial SystemVerilog Single-Fault RTL Sabotage Audit")
     print("================================================================================")
     print("  golden_profiles_status : PASS (Canonical dsp=3 & Area dsp=1 both exit 0)")
-    print(f"  adversarial_rtl_mutants: {len(mutants)} single-fault SV mutants ({prim_cnt} primordial + {core_cnt} core/top)")
+    print(
+        f"  adversarial_rtl_mutants: {len(mutants)} single-fault SV mutants "
+        f"({phy_cnt} phy/qfn + {prim_cnt} primordial + {core_cnt} core/top)"
+    )
 
     tmpdir = Path(tempfile.mkdtemp(prefix="ele_rtl_sabotage_"))
     compile_errors: list[tuple[RtlMutant, str]] = []

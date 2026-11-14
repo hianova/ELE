@@ -1,11 +1,12 @@
 // SPDX-License-Identifier: MIT
 // ele_cosim_tb.sv — Pure-SV Hardware Wind-Tunnel & CMOS Toggle-Energy Inspector
 //
-// Links directly against `../FLOW/flow.h` (`FLOW v6.0.0` golden substrate) via
+// Links directly against `../FLOW/flow.h` & `../FLOW/searu.h` (`FLOW v7.0.1` golden substrate) via
 // IEEE 1800 `import "DPI-C"` with Verilator X-propagation poisoning
-// (`--x-assign unique --x-initial unique`) across the `< 160`-pin 64-bit
-// streaming bus interfaces of `ele_flow_core` (141 pins) and
-// `ele_flow_atlas_top` (157 pins, `ele_sram_1rw64` 1RW SRAM macro):
+// (`--x-assign unique --x-initial unique`) across all 3 physical hierarchy tiers:
+//   - `ele_flow_core`      (141 pins, 64-bit streaming core macro)
+//   - `ele_flow_atlas_top` (157 pins, 64-bit NoC + `ele_sram_1rw64` 1RW SRAM macro)
+//   - `ele_flow_qfn_top`   ( 42 pins, QFN-48 ASIC chip + `ele_bus_invert17` PHY)
 //   Probe 1 : 512-bit (`w0..w7`) 0-ULP Differential Wind-Tunnel (20,480 vectors)
 //   Probe 2 : Odd-Mirror Gauge Symmetry & Autonomous `2^-49` Sub-LSB Fiber Lock
 //   Probe 3 : Multi-Chart `ele_sram_1rw64` Atlas Gluing, Hardware Slot-Aliasing
@@ -15,9 +16,11 @@
 //   Probe 5 : 3,688 Analytical Multipole `2^-120` / `2^-124` Cross-Limb Knife-Edges
 //             + 8 Exact `2^-49` Convergence Cliffs (isqrt, udiv, sub_valid, Schmitt)
 //   Probe 6 : SEARU Zero-Memory 1-Bit `DualChaosState` + `Epiphany` Phase-Boundary
-//             Re-Heating Crucible (Multi-Chart `ele_sram_1rw64` + `@swap` Lockstep)
+//             Re-Heating Crucible & Live `searu_heal_and_swap` Barrier Self-Healing
 //   Probe 7 : FSM Handshake Bubble Chaos (`0..17` cyc), Busy Illegal-Write Hammering
 //             & Exhaustive Cycle-by-Cycle Mid-Flight `rst_n` Abort/0-ULP Recovery
+//   Probe 8 : 42-Pin QFN-48 Charge-Minimal ASIC Padframe `0-ULP` Lockstep &
+//             17-Wire Bus-Invert Pad-SSO Telemetry (`<= 8/17` Flips/Cycle)
 
 `default_nettype none
 
@@ -55,6 +58,17 @@ module ele_cosim_tb;
         input longint unsigned cap_mask,
         input int unsigned     new_epoch,
         input longint unsigned cand_w[8]
+    );
+
+    import "DPI-C" function byte unsigned ele_dpi_searu_heal(
+        inout  longint unsigned arena_w[128],
+        input  longint unsigned cap_mask,
+        input  longint unsigned st_w[8],
+        input  longint          u_ext_q16,
+        input  longint          target_x_q16,
+        inout  longint unsigned io_seed,
+        inout  int unsigned     io_epoch,
+        output longint unsigned out_chart[8]
     );
 
     logic clk;
@@ -133,6 +147,117 @@ module ele_cosim_tb;
         .flips_o   (bi_flips),
         .rx_data_o (bi_rx)
     );
+
+    logic        bi17_valid;
+    logic [15:0] bi17_data;
+    logic [16:0] bi17_wire;
+    logic [4:0]  bi17_flips;
+    logic [15:0] bi17_rx;
+
+    ele_bus_invert17 u_bus_invert17 (
+        .clk       (clk),
+        .rst_n     (rst_n),
+        .valid_i   (bi17_valid),
+        .data_i    (bi17_data),
+        .wire_o    (bi17_wire),
+        .flips_o   (bi17_flips),
+        .rx_data_o (bi17_rx)
+    );
+
+    // --- 42-Pin QFN-48 Charge-Minimal ASIC Padframe Top DUT (`ele_flow_qfn_top`) ---
+    logic        qfn_flit_valid;
+    logic        qfn_flit_ctrl;
+    logic [16:0] qfn_rx_bi_lane;
+    logic        qfn_ready;
+    logic        qfn_irq_done;
+    logic        qfn_swap_acc;
+    logic        qfn_tx_valid;
+    logic [16:0] qfn_tx_bi_lane;
+    logic [16:0] qfn_host_prev_lane;
+
+    ele_flow_qfn_top #(
+        .MAX_CHARTS (MAX_CHARTS)
+    ) u_qfn_dut (
+        .clk             (clk),
+        .rst_n           (rst_n),
+        .flit_valid_i    (qfn_flit_valid),
+        .flit_ctrl_i     (qfn_flit_ctrl),
+        .rx_bi_lane_i    (qfn_rx_bi_lane),
+        .ready_o         (qfn_ready),
+        .irq_done_o      (qfn_irq_done),
+        .swap_accepted_o (qfn_swap_acc),
+        .tx_valid_o      (qfn_tx_valid),
+        .tx_bi_lane_o    (qfn_tx_bi_lane)
+    );
+
+    // --- Continuous Cycle-by-Cycle QFN-48 Pad Simultaneous-Switching-Noise (SSO) Monitor ---
+    logic            qfn_sso_meas_en;
+    logic [16:0]     qfn_rx_prev_q;
+    logic [16:0]     qfn_tx_prev_q;
+    logic [15:0]     qfn_raw_rx_prev_q;
+    logic [15:0]     qfn_raw_tx_prev_q;
+    int              qfn_max_rx_flips_q;
+    int              qfn_max_tx_flips_q;
+    longint unsigned qfn_bi_rx_toggles_q;
+    longint unsigned qfn_bi_tx_toggles_q;
+    longint unsigned qfn_raw_rx_toggles_q;
+    longint unsigned qfn_raw_tx_toggles_q;
+
+    always_ff @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            qfn_rx_prev_q        <= 17'd0;
+            qfn_tx_prev_q        <= 17'd0;
+            qfn_raw_rx_prev_q    <= 16'd0;
+            qfn_raw_tx_prev_q    <= 16'd0;
+            qfn_max_rx_flips_q   <= 0;
+            qfn_max_tx_flips_q   <= 0;
+            qfn_bi_rx_toggles_q  <= 64'd0;
+            qfn_bi_tx_toggles_q  <= 64'd0;
+            qfn_raw_rx_toggles_q <= 64'd0;
+            qfn_raw_tx_toggles_q <= 64'd0;
+        end else begin
+            int rx_hd, tx_hd;
+            logic [15:0] dec_rx_c, dec_tx_c;
+            rx_hd    = $countones(qfn_rx_bi_lane ^ qfn_rx_prev_q);
+            tx_hd    = $countones(qfn_tx_bi_lane ^ qfn_tx_prev_q);
+            dec_rx_c = qfn_rx_bi_lane[15:0] ^ {16{qfn_rx_bi_lane[16]}};
+            dec_tx_c = qfn_tx_bi_lane[15:0] ^ {16{qfn_tx_bi_lane[16]}};
+
+            qfn_rx_prev_q <= qfn_rx_bi_lane;
+            qfn_tx_prev_q <= qfn_tx_bi_lane;
+
+            if (qfn_sso_meas_en) begin
+                if (rx_hd > 8) begin
+                    $fatal(1, "FAIL [QFN-SSO]: ingress rx_bi_lane_i flipped %0d/17 wires (> 8 cap)!", rx_hd);
+                end
+                if (tx_hd > 8) begin
+                    $fatal(1, "FAIL [QFN-SSO]: egress tx_bi_lane_o flipped %0d/17 wires (> 8 cap)!", tx_hd);
+                end
+                if (rx_hd > qfn_max_rx_flips_q) qfn_max_rx_flips_q <= rx_hd;
+                if (tx_hd > qfn_max_tx_flips_q) qfn_max_tx_flips_q <= tx_hd;
+                qfn_bi_rx_toggles_q <= qfn_bi_rx_toggles_q + 64'(rx_hd);
+                qfn_bi_tx_toggles_q <= qfn_bi_tx_toggles_q + 64'(tx_hd);
+
+                if (qfn_flit_valid && qfn_ready) begin
+                    qfn_raw_rx_toggles_q <= qfn_raw_rx_toggles_q + 64'($countones(dec_rx_c ^ qfn_raw_rx_prev_q));
+                    qfn_raw_rx_prev_q    <= dec_rx_c;
+                end
+                if (qfn_tx_valid) begin
+                    qfn_raw_tx_toggles_q <= qfn_raw_tx_toggles_q + 64'($countones(dec_tx_c ^ qfn_raw_tx_prev_q));
+                    qfn_raw_tx_prev_q    <= dec_tx_c;
+                end
+            end else begin
+                qfn_raw_rx_prev_q    <= 16'd0;
+                qfn_raw_tx_prev_q    <= 16'd0;
+                qfn_max_rx_flips_q   <= 0;
+                qfn_max_tx_flips_q   <= 0;
+                qfn_bi_rx_toggles_q  <= 64'd0;
+                qfn_bi_tx_toggles_q  <= 64'd0;
+                qfn_raw_rx_toggles_q <= 64'd0;
+                qfn_raw_tx_toggles_q <= 64'd0;
+            end
+        end
+    end
 
     logic               tm_clr;
     logic               tm_valid;
@@ -293,6 +418,13 @@ module ele_cosim_tb;
 
             bi_valid       = 1'b0;
             bi_data        = 64'd0;
+            bi17_valid     = 1'b0;
+            bi17_data      = 16'd0;
+            qfn_sso_meas_en    = 1'b0;
+            qfn_flit_valid     = 1'b0;
+            qfn_flit_ctrl      = 1'b0;
+            qfn_rx_bi_lane     = 17'd0;
+            qfn_host_prev_lane = 17'd0;
             tm_clr         = 1'b0;
             tm_valid       = 1'b0;
             tm_nz          = 1'b0;
@@ -537,6 +669,186 @@ module ele_cosim_tb;
                 if (guard > 512) $fatal(1, "FAIL: top_step_done timeout");
             end
             top_read_state_512(st_out);
+        end
+    endtask
+
+    function automatic bit is_valid_swap_accept_cyc(input int cyc);
+        begin
+            // Supports both 8-cycle shadow-buffer commit and 14-cycle Shadow-SRAM commit
+            is_valid_swap_accept_cyc = (cyc >= 8) && (cyc <= 16);
+        end
+    endfunction
+
+    function automatic bit is_valid_swap_reject_cyc(input int cyc);
+        begin
+            // Firewall rejects before SRAM commit (1 cycle direct or <= 4 SRAM header-check cycles)
+            is_valid_swap_reject_cyc = (cyc >= 1) && (cyc <= 4);
+        end
+    endfunction
+
+    // -------------------------------------------------------------------------
+    // 42-Pin QFN-48 17-Wire Bus-Invert Host Tasks (`ele_flow_qfn_top`)
+    // -------------------------------------------------------------------------
+    function automatic [16:0] encode_bi17(input logic [16:0] prev_w, input logic [15:0] raw16);
+        logic [16:0] cand0;
+        int          hd0;
+        begin
+            cand0       = {1'b0, raw16};
+            hd0         = $countones(prev_w ^ cand0);
+            encode_bi17 = (hd0 > 8) ? {1'b1, ~raw16} : cand0;
+        end
+    endfunction
+
+    task automatic qfn_wait_ready();
+        int guard;
+        begin
+            guard = 0;
+            while (!qfn_ready) begin
+                @(posedge clk);
+                #1;
+                guard++;
+                if (guard > 512) $fatal(1, "FAIL: qfn_ready timeout");
+            end
+        end
+    endtask
+
+    task automatic qfn_send_flit(input logic is_ctrl, input logic [15:0] flit16);
+        logic [16:0] next_lane;
+        int          hd;
+        begin
+            qfn_wait_ready();
+            next_lane = encode_bi17(qfn_host_prev_lane, flit16);
+            hd        = $countones(next_lane ^ qfn_host_prev_lane);
+            if (hd > 8) begin
+                $fatal(1, "FAIL [QFN-HOST-BI17]: host encoder exceeded 8/17 wire flips (hd=%0d)!", hd);
+            end
+            qfn_flit_valid     = 1'b1;
+            qfn_flit_ctrl      = is_ctrl;
+            qfn_rx_bi_lane     = next_lane;
+            qfn_host_prev_lane = next_lane;
+            @(posedge clk);
+            #1;
+            qfn_flit_valid = 1'b0;
+            qfn_flit_ctrl  = 1'b0;
+        end
+    endtask
+
+    task automatic qfn_send_word64(input logic [63:0] w64);
+        begin
+            for (int q = 0; q < 4; q++) begin
+                qfn_send_flit(1'b0, w64[q*16 +: 16]);
+            end
+        end
+    endtask
+
+    task automatic qfn_read_word64(input logic [2:0] word_idx, output logic [63:0] w64_out);
+        int beat;
+        int guard;
+        begin
+            qfn_send_flit(1'b1, {2'b11, 11'd0, word_idx});
+            beat  = 0;
+            guard = 0;
+            while (beat < 4) begin
+                if (qfn_tx_valid) begin
+                    w64_out[beat*16 +: 16] = qfn_tx_bi_lane[15:0] ^ {16{qfn_tx_bi_lane[16]}};
+                    beat++;
+                end
+                @(posedge clk);
+                #1;
+                guard++;
+                if (guard > 64) $fatal(1, "FAIL: qfn_read_word64 timeout on word %0d", word_idx);
+            end
+            if (qfn_tx_valid) begin
+                $fatal(1, "FAIL: qfn_tx_valid stayed asserted beyond 4-beat burst!");
+            end
+            qfn_wait_ready();
+        end
+    endtask
+
+    task automatic qfn_write_chart_512(input logic [7:0] slot, input logic [511:0] bd_in);
+        begin
+            for (int w = 0; w < 8; w++) begin
+                qfn_send_word64(bd_in[w*64 +: 64]);
+                qfn_send_flit(1'b1, {2'b00, slot, 3'(w), CMD_WRITE_CHART});
+            end
+        end
+    endtask
+
+    task automatic qfn_load_state_512(input logic [511:0] st_in, input logic [63:0] cap_in);
+        begin
+            if (&{1'b0, cap_in[63:16]}) begin end
+            // Single 16-bit data flit suffices for `CMD_SET_CAP` (`q_idx_q` resets on control flit)
+            qfn_send_flit(1'b0, cap_in[15:0]);
+            qfn_send_flit(1'b1, {2'b00, 8'd0, 3'd0, CMD_SET_CAP});
+            for (int w = 0; w < 8; w++) begin
+                qfn_send_word64(st_in[w*64 +: 64]);
+                qfn_send_flit(1'b1, {2'b00, 8'd0, 3'(w), CMD_LOAD_STATE});
+            end
+        end
+    endtask
+
+    task automatic qfn_exec_step(
+        input  logic [63:0]  u_in,
+        input  logic [15:0]  mreq_in,
+        output logic [511:0] st_out
+    );
+        int guard;
+        begin
+            qfn_send_word64(u_in);
+            if (mreq_in[15:8] != 8'd0) begin
+                qfn_send_flit(1'b1, {2'b10, 6'd0, mreq_in[15:8]});
+                qfn_send_flit(1'b1, {2'b01, mreq_in[7:0], 3'd0, CMD_STEP});
+            end else begin
+                qfn_send_flit(1'b1, {2'b00, mreq_in[7:0], 3'd0, CMD_STEP});
+            end
+
+            guard = 0;
+            while (!qfn_irq_done) begin
+                @(posedge clk);
+                #1;
+                guard++;
+                if (guard > 512) $fatal(1, "FAIL: qfn_exec_step irq_done timeout");
+            end
+            if (!qfn_ready) begin
+                $fatal(1, "FAIL: qfn_ready not asserted on step irq_done!");
+            end
+            for (int w = 0; w < 8; w++) begin
+                qfn_read_word64(3'(w), st_out[w*64 +: 64]);
+            end
+        end
+    endtask
+
+    task automatic qfn_try_swap(
+        input  logic [7:0]   slot,
+        input  logic [31:0]  epoch,
+        input  logic [511:0] cand_in,
+        output logic         accepted
+    );
+        int guard;
+        begin
+            for (int w = 0; w < 6; w++) begin
+                qfn_send_word64(cand_in[w*64 +: 64]);
+                qfn_send_flit(1'b1, {2'b00, 8'd0, 3'(w), CMD_STAGE_CAND});
+            end
+            qfn_send_word64({32'd0, epoch});
+            qfn_send_flit(1'b1, {2'b00, slot, 3'd0, CMD_SWAP});
+
+            guard = 0;
+            while (!qfn_irq_done) begin
+                @(posedge clk);
+                #1;
+                guard++;
+                if (guard > 64) $fatal(1, "FAIL: qfn_try_swap irq_done timeout");
+            end
+            accepted = qfn_swap_acc;
+            @(posedge clk);
+            #1;
+            if (qfn_irq_done) begin
+                $fatal(1, "FAIL: qfn_irq_done did not clear after 1-cycle pulse!");
+            end
+            if (qfn_swap_acc !== accepted) begin
+                $fatal(1, "FAIL: qfn_swap_acc did not latch @swap result across idle cycles!");
+            end
         end
     endtask
 
@@ -849,23 +1161,23 @@ module ele_cosim_tb;
                                       {-32'sd2000000, 32'sd1966080}, {32'sd1638400, 32'sd65536},
                                       {32'd0, 8'd0, 8'd16, 16'h0001}, {32'd1, 32'd0}, 64'd0);
 
-            // Slot 0 has `slot_valid_q[0] == 0` -> `cur_ep == 0`: `epoch == 0` MUST be rejected in 1 firewall cycle!
+            // Slot 0 has `slot_valid_q[0] == 0` -> `cur_ep == 0`: `epoch == 0` MUST be rejected by firewall!
             top_try_swap(8'd0, 32'd0, cand_cap15_ok, sw_acc, sw_cyc);
-            if (sw_acc || (sw_cyc != 1)) begin
-                $fatal(1, "FAIL: epoch==0 when cur_ep==0 was not rejected in 1 firewall cycle (cyc=%0d)!", sw_cyc);
+            if (sw_acc || !is_valid_swap_reject_cyc(sw_cyc)) begin
+                $fatal(1, "FAIL: epoch==0 when cur_ep==0 was not rejected by firewall (cyc=%0d)!", sw_cyc);
             end
 
-            // With `cap_mask=0xFF` clamped to 15, `next_lo=16` and `next_hi=16` MUST be rejected in 1 firewall cycle!
+            // With `cap_mask=0xFF` clamped to 15, `next_lo=16` and `next_hi=16` MUST be rejected by firewall!
             for (int a = 0; a < 2; a++) begin
                 top_try_swap(8'd0, 32'd1, (a == 0) ? cand_cap16_lo : cand_cap16_hi, sw_acc, sw_cyc);
-                if (sw_acc || (sw_cyc != 1)) begin
+                if (sw_acc || !is_valid_swap_reject_cyc(sw_cyc)) begin
                     $fatal(1, "FAIL: out-of-capacity @swap #%0d (cap_mask=0xFF->15) was not rejected!", a);
                 end
             end
 
-            // Valid @swap with `next_lo=15, next_hi=15` at `epoch=1` MUST commit in 8 deterministic SRAM beats (`w6` last)!
+            // Valid @swap with `next_lo=15, next_hi=15` at `epoch=1` MUST commit deterministically (`w6` last)!
             top_try_swap(8'd0, 32'd1, cand_cap15_ok, sw_acc, sw_cyc);
-            if (!sw_acc || (sw_cyc != 8)) begin
+            if (!sw_acc || !is_valid_swap_accept_cyc(sw_cyc)) begin
                 $fatal(1, "FAIL: valid @swap at hardware capacity boundary 15 failed (acc=%0b, cyc=%0d)!", sw_acc, sw_cyc);
             end
 
@@ -944,7 +1256,7 @@ module ele_cosim_tb;
 
             // Valid release-ordered swap into slot 1 at epoch 2 (`w0..w5`, `w7=0`, `w6={2,0}` last)
             top_try_swap(8'd1, 32'd2, cand_ok, sw_acc, sw_cyc);
-            if (!sw_acc || (sw_cyc != 8)) begin
+            if (!sw_acc || !is_valid_swap_accept_cyc(sw_cyc)) begin
                 $fatal(1, "FAIL: valid @swap into slot 1 failed (acc=%0b, cyc=%0d)!", sw_acc, sw_cyc);
             end
             @(posedge clk);
@@ -956,7 +1268,7 @@ module ele_cosim_tb;
             c_arena[1*8+6] = {32'd2, 32'd0};
             c_arena[1*8+7] = 64'd0;
 
-            // Reject all 7 adversarial `@swap` vectors in 1 firewall cycle (`0` SRAM writes)
+            // Reject all 7 adversarial `@swap` vectors via firewall (`0` target SRAM writes)
             for (int r = 0; r < 7; r++) begin
                 logic [31:0] ep_try;
                 logic [511:0] cd_try;
@@ -971,8 +1283,8 @@ module ele_cosim_tb;
                     default: cd_try = cand_bad_hyst;
                 endcase
                 top_try_swap(8'd1, ep_try, cd_try, sw_acc, sw_cyc);
-                if (sw_acc || (sw_cyc != 1)) begin
-                    $fatal(1, "FAIL: invalid @swap #%0d was not rejected in 1 firewall cycle (cyc=%0d)!", r, sw_cyc);
+                if (sw_acc || !is_valid_swap_reject_cyc(sw_cyc)) begin
+                    $fatal(1, "FAIL: invalid @swap #%0d was not rejected by firewall (cyc=%0d)!", r, sw_cyc);
                 end
             end
 
@@ -1053,7 +1365,55 @@ module ele_cosim_tb;
                 end
             end
 
-            $display("  [PASS] Probe 3 (16-Slot SRAM Clamp, 10 Adversarial @swap Firewall Checks, In-Flight Immunity & 4-Chart Surge): 0-ULP C99 lockstep");
+            // -----------------------------------------------------------------
+            // 3D. Active-Slot Chart-Bound Cache Coherence (`CMD_WRITE_CHART` & `CMD_SWAP`)
+            // -----------------------------------------------------------------
+            begin
+                logic [3:0]   cached_slot;
+                logic [511:0] wr_upd, sw_upd;
+                cached_slot = top_state_cur[339:336] & 4'd3;
+
+                // Overwrite the currently cached active slot via `CMD_WRITE_CHART` and immediately step
+                wr_upd = pack_cell(-64'sd458752, 64'sd98304, 64'sd4096,
+                                   {-32'sd3276800, 32'sd3276800}, {32'sd1310720, 32'sd65536},
+                                   {32'd0, {4'd0, cached_slot}, {4'd0, cached_slot}, 16'h0001},
+                                   {32'd11, 32'd0}, 64'd0);
+                top_write_chart_512({4'd0, cached_slot}, wr_upd);
+                for (int i = 0; i < 8; i++) c_arena[int'(cached_slot)*8 + i] = wr_upd[i*64 +: 64];
+
+                exec_top_step(64'sd524288, 16'h0001, top_state_cur);
+                flow_step_atlas(c_out, c_st, c_arena, 64'd3, 64'sd524288, 16'h0001);
+                for (int i = 0; i < 8; i++) c_st[i] = c_out[i];
+                c_packed = pack_cell(c_out[0], c_out[1], c_out[2], c_out[3],
+                                     c_out[4], c_out[5], c_out[6], c_out[7]);
+                if (top_state_cur !== c_packed) begin
+                    $fatal(1, "FAIL [CACHE-COHERENCE]: CMD_WRITE_CHART on cached slot %0d served stale bounds!", cached_slot);
+                end
+
+                // Now `cached_slot` is guaranteed cached (`bound_cache_valid_q == 1`): hot-swap it via `CMD_SWAP` and step
+                sw_upd = pack_cell(64'sd589824, 64'sd65536, 64'sd8192,
+                                   {-32'sd3276800, 32'sd3276800}, {32'sd1966080, 32'sd65536},
+                                   {32'd0, {4'd0, cached_slot}, {4'd0, cached_slot}, 16'h0001},
+                                   {32'd12, 32'd0}, 64'd0);
+                top_try_swap({4'd0, cached_slot}, 32'd12, sw_upd, sw_acc, sw_cyc);
+                if (!sw_acc || !is_valid_swap_accept_cyc(sw_cyc)) begin
+                    $fatal(1, "FAIL [CACHE-COHERENCE]: hot @swap on cached slot %0d failed!", cached_slot);
+                end
+                for (int i = 0; i < 6; i++) c_arena[int'(cached_slot)*8 + i] = sw_upd[i*64 +: 64];
+                c_arena[int'(cached_slot)*8 + 6] = {32'd12, 32'd0};
+                c_arena[int'(cached_slot)*8 + 7] = 64'd0;
+
+                exec_top_step(-64'sd393216, 16'h0001, top_state_cur);
+                flow_step_atlas(c_out, c_st, c_arena, 64'd3, -64'sd393216, 16'h0001);
+                for (int i = 0; i < 8; i++) c_st[i] = c_out[i];
+                c_packed = pack_cell(c_out[0], c_out[1], c_out[2], c_out[3],
+                                     c_out[4], c_out[5], c_out[6], c_out[7]);
+                if (top_state_cur !== c_packed) begin
+                    $fatal(1, "FAIL [CACHE-COHERENCE]: CMD_SWAP on cached slot %0d served stale bounds!", cached_slot);
+                end
+            end
+
+            $display("  [PASS] Probe 3 (16-Slot SRAM Clamp, Bound-Cache Coherence, 10 @swap Firewall Checks & 4-Chart Surge): 0-ULP C17 lockstep");
         end
     endtask
 
@@ -1961,8 +2321,8 @@ module ele_cosim_tb;
                     c_sw_acc = ele_dpi_try_swap(c_arena, {56'd0, sw_slot}, cap_eff, sw_ep, c_cand);
 
                     if ((rtl_sw_acc !== (c_sw_acc != 8'd0)) ||
-                        (rtl_sw_acc && (rtl_sw_cyc != 8))   ||
-                        ((!rtl_sw_acc) && (rtl_sw_cyc != 1))) begin
+                        (rtl_sw_acc && !is_valid_swap_accept_cyc(rtl_sw_cyc)) ||
+                        ((!rtl_sw_acc) && !is_valid_swap_reject_cyc(rtl_sw_cyc))) begin
                         $fatal(1, "FAIL [SEARU-SWAP step=%0d]: rtl_acc=%0b (cyc=%0d) != c_acc=%0d!",
                                step, rtl_sw_acc, rtl_sw_cyc, c_sw_acc);
                     end
@@ -2078,7 +2438,128 @@ module ele_cosim_tb;
                        epiphany_events, swap_acc_cnt, swap_rej_cnt);
             end
 
-            $display("  [PASS] Probe 6 (SEARU DualChaosState + Epiphany Crucible): %0d transitions, %0d epiphanies, %0d/%0d @swap acc/rej (0-ULP)",
+            // -----------------------------------------------------------------
+            // 6B. Live `searu_heal_and_swap` (`searu.h`) Hardware Barrier
+            //     Self-Healing & `CMD_SWAP` 0-ULP Convergence Verification
+            // -----------------------------------------------------------------
+            begin
+                logic [511:0]    smooth_chart, barrier_chart, heal_init_st;
+                logic [511:0]    heal_rtl_out, heal_cand_cell, heal_c_packed;
+                longint unsigned heal_st[8];
+                longint unsigned heal_arena[128];
+                longint unsigned heal_out[8];
+                longint unsigned heal_chart_w[8];
+                longint unsigned heal_seed;
+                longint          target_x_q16;
+                int unsigned     heal_ep;
+                byte unsigned    heal_rc;
+                logic            heal_sw_acc;
+                int              heal_sw_cyc;
+
+                heal_seed    = 64'h0000_0000_0000_7777;
+                heal_ep      = 32'd1;
+                target_x_q16 = 64'sd241664;
+
+                // 1. Phase-Gate Check: Smooth moving chart (`dt > 0`) MUST be an O(1) no-op
+                smooth_chart = pack_cell(
+                    -64'sd241664, 64'sd65536, 64'sd0,
+                    {-32'sd6553600, 32'sd6553600},
+                    {32'sd655360, 32'sd65536},
+                    64'd0, {32'd1, 32'd0}, 64'd0
+                );
+                heal_init_st = pack_cell(
+                    64'd0, 64'd0, 64'd0, 64'sd0,
+                    64'd0, 64'd0, 64'd0, 64'd0
+                );
+                for (int s = 0; s < 16; s++) begin
+                    top_write_chart_512(8'(s), smooth_chart);
+                    for (int w = 0; w < 8; w++) heal_arena[s*8 + w] = smooth_chart[w*64 +: 64];
+                end
+                top_load_state_512(heal_init_st, 64'd15);
+                for (int w = 0; w < 8; w++) heal_st[w] = heal_init_st[w*64 +: 64];
+
+                exec_top_step(64'sd0, 16'd0, heal_rtl_out);
+                flow_step_atlas(heal_out, heal_st, heal_arena, 64'd15, 64'sd0, 16'd0);
+                heal_c_packed = pack_cell(heal_out[0], heal_out[1], heal_out[2], heal_out[3],
+                                          heal_out[4], heal_out[5], heal_out[6], heal_out[7]);
+                if ((heal_rtl_out !== heal_c_packed) || (heal_rtl_out[319:256] == 64'd0)) begin
+                    $fatal(1, "FAIL [SEARU-HEAL]: smooth moving pre-check mismatch!");
+                end
+                for (int w = 0; w < 8; w++) heal_st[w] = heal_out[w];
+                heal_rc = ele_dpi_searu_heal(heal_arena, 64'd15, heal_st, 64'sd0, target_x_q16,
+                                             heal_seed, heal_ep, heal_chart_w);
+                if ((heal_rc != 8'd0) || (heal_ep != 32'd1)) begin
+                    $fatal(1, "FAIL [SEARU-HEAL]: moving state falsely triggered searu_heal_and_swap!");
+                end
+
+                // 2. Load Delta < 0 quadratic discriminant barrier (`b0=1600000, b1=0, b2=2*65536`)
+                barrier_chart = pack_cell(
+                    64'sd1600000, 64'sd0, 64'sd131072,
+                    {-32'sd6553600, 32'sd6553600},
+                    {32'sd655360, 32'sd65536},
+                    64'd0, {32'd1, 32'd0}, 64'd0
+                );
+                top_write_chart_512(8'd0, barrier_chart);
+                for (int w = 0; w < 8; w++) heal_arena[w] = barrier_chart[w*64 +: 64];
+                top_load_state_512(heal_init_st, 64'd15);
+                for (int w = 0; w < 8; w++) heal_st[w] = heal_init_st[w*64 +: 64];
+
+                // Step 1 on barrier chart: confirm hardware stalls (`!CONVERGED && dt == 0`) at 0-ULP
+                exec_top_step(64'sd0, 16'd0, heal_rtl_out);
+                flow_step_atlas(heal_out, heal_st, heal_arena, 64'd15, 64'sd0, 16'd0);
+                heal_c_packed = pack_cell(heal_out[0], heal_out[1], heal_out[2], heal_out[3],
+                                          heal_out[4], heal_out[5], heal_out[6], heal_out[7]);
+                if (heal_rtl_out !== heal_c_packed) begin
+                    $fatal(1, "FAIL [SEARU-HEAL]: 512-bit mismatch on Delta < 0 barrier stall!");
+                end
+                if (heal_rtl_out[384] || (heal_rtl_out[319:256] != 64'd0)) begin
+                    $fatal(1, "FAIL [SEARU-HEAL]: expected (!CONVERGED && dt==0) at Delta < 0 barrier!");
+                end
+                for (int w = 0; w < 8; w++) heal_st[w] = heal_out[w];
+
+                // 3. Synthesize healed chart via `searu_heal_and_swap` (`searu.h`) & commit via live `CMD_SWAP`
+                heal_rc = ele_dpi_searu_heal(heal_arena, 64'd15, heal_st, 64'sd0, target_x_q16,
+                                             heal_seed, heal_ep, heal_chart_w);
+                if ((heal_rc != 8'd1) || (heal_ep <= 32'd1)) begin
+                    $fatal(1, "FAIL [SEARU-HEAL]: ele_dpi_searu_heal failed to heal barrier (rc=%0d, ep=%0d)!",
+                           heal_rc, heal_ep);
+                end
+                heal_cand_cell = pack_cell(
+                    heal_chart_w[0], heal_chart_w[1], heal_chart_w[2], heal_chart_w[3],
+                    heal_chart_w[4], heal_chart_w[5], heal_chart_w[6], heal_chart_w[7]
+                );
+                top_try_swap(8'd0, heal_ep, heal_cand_cell, heal_sw_acc, heal_sw_cyc);
+                if ((!heal_sw_acc) || (!is_valid_swap_accept_cyc(heal_sw_cyc))) begin
+                    $fatal(1, "FAIL [SEARU-HEAL]: hardware CMD_SWAP rejected SEARU healed chart (acc=%0b, cyc=%0d)!",
+                           heal_sw_acc, heal_sw_cyc);
+                end
+
+                // 4. Run post-swap hardware steps to completion: assert 0-ULP lockstep & exact target root
+                for (int hs = 0; hs < 6; hs++) begin
+                    exec_top_step(64'sd0, 16'd0, heal_rtl_out);
+                    flow_step_atlas(heal_out, heal_st, heal_arena, 64'd15, 64'sd0, 16'd0);
+                    heal_c_packed = pack_cell(heal_out[0], heal_out[1], heal_out[2], heal_out[3],
+                                              heal_out[4], heal_out[5], heal_out[6], heal_out[7]);
+                    if (heal_rtl_out !== heal_c_packed) begin
+                        $fatal(1, "FAIL [SEARU-HEAL hs=%0d]: post-swap 512-bit lockstep mismatch!", hs);
+                    end
+                    for (int w = 0; w < 8; w++) heal_st[w] = heal_out[w];
+                end
+
+                if ((!heal_rtl_out[384]) || ($signed(heal_rtl_out[255:192]) !== target_x_q16)) begin
+                    $fatal(1, "FAIL [SEARU-HEAL]: hardware did not converge to target_x_q16=%0d (conv=%0b, x=%0d)!",
+                           target_x_q16, heal_rtl_out[384], $signed(heal_rtl_out[255:192]));
+                end
+
+                // 5. Post-Convergence Phase-Gate Check: `CONVERGED == 1` MUST be an O(1) no-op
+                heal_rc = ele_dpi_searu_heal(heal_arena, 64'd15, heal_st, 64'sd0, target_x_q16,
+                                             heal_seed, heal_ep, heal_chart_w);
+                if ((heal_rc != 8'd0) || (heal_ep != 32'd2)) begin
+                    $fatal(1, "FAIL [SEARU-HEAL]: converged state falsely triggered searu_heal_and_swap!");
+                end
+            end
+
+            $display("  [PASS] Probe 6 (SEARU DualChaosState + Epiphany Crucible + Live searu_heal_and_swap): %0d transitions, %0d epiphanies, %0d/%0d @swap acc/rej + Delta<0 barrier healed to x=241664 (0-ULP)",
                      N_CRUCIBLE, epiphany_events, swap_acc_cnt, swap_rej_cnt);
         end
     endtask
@@ -2748,8 +3229,11 @@ module ele_cosim_tb;
                 top_rst_swept++;
             end
 
-            // 7C-3. Sweep aborting an accepted `@swap` at EVERY beat `b = 1 .. 8` (`TOP_SWAP_CHK` + 7 SRAM beats)
-            for (int b = 1; b <= 8; b++) begin
+            // 7C-3. Dynamically measure accepted `@swap` latency (`swap_lat`, e.g. 8 or 14 cyc)
+            //       and sweep aborting at EVERY in-flight beat `b = 1 .. swap_lat`!
+            begin
+                logic sw_acc_probe;
+                int   swap_lat;
                 cand_valid = pack_cell(
                     -64'sd1638400, 64'sd65536, 64'sd6554,
                     {-32'sd3276800, 32'sd3276800},
@@ -2757,44 +3241,56 @@ module ele_cosim_tb;
                     {32'd0, 8'd0, 8'd0, 16'hFFFF},
                     {32'd9, 32'd0}, 64'd0
                 );
-                top_stage_cand_512(cand_valid);
-                top_cmd_valid = 1'b1; top_cmd_op = CMD_SWAP; top_cmd_word = 3'd0;
-                top_cmd_aux   = 16'd2; top_cmd_data = {32'd0, 32'd9};
-                @(posedge clk); #1;
-                top_cmd_valid = 1'b0; top_cmd_op = CMD_NOP;
+                top_try_swap(8'd2, 32'd9, cand_valid, sw_acc_probe, swap_lat);
+                if (!sw_acc_probe || !is_valid_swap_accept_cyc(swap_lat)) begin
+                    $fatal(1, "FAIL [RST-SWAP-PROBE]: unexpected accepted @swap latency (acc=%0b, lat=%0d)!",
+                           sw_acc_probe, swap_lat);
+                end
+                reset_all();
 
-                for (int adv = 1; adv < b; adv++) begin
+                for (int b = 1; b <= swap_lat; b++) begin
+                    top_stage_cand_512(cand_valid);
+                    top_cmd_valid = 1'b1; top_cmd_op = CMD_SWAP; top_cmd_word = 3'd0;
+                    top_cmd_aux   = 16'd2; top_cmd_data = {32'd0, 32'd9};
+                    @(posedge clk); #1;
+                    top_cmd_valid = 1'b0; top_cmd_op = CMD_NOP;
+
+                    for (int adv = 1; adv < b; adv++) begin
+                        if (top_ready || top_swap_done) begin
+                            $fatal(1, "FAIL [RST-SWAP b=%0d]: premature swap_done at adv=%0d!", b, adv);
+                        end
+                        @(posedge clk); #1;
+                    end
                     if (top_ready || top_swap_done) begin
-                        $fatal(1, "FAIL [RST-SWAP b=%0d]: premature swap_done at adv=%0d!", b, adv);
+                        $fatal(1, "FAIL [RST-SWAP b=%0d]: @swap was not in-flight at abort point!", b);
+                    end
+                    #2;
+                    rst_n = 1'b0;
+                    #1;
+                    if ((top_ready !== 1'b1) || top_swap_done || top_swap_acc) begin
+                        $fatal(1, "FAIL [RST-SWAP b=%0d]: unsafe output during mid-swap rst_n==0!", b);
                     end
                     @(posedge clk); #1;
-                end
-                #2;
-                rst_n = 1'b0;
-                #1;
-                if ((top_ready !== 1'b1) || top_swap_done || top_swap_acc) begin
-                    $fatal(1, "FAIL [RST-SWAP b=%0d]: unsafe output during mid-swap rst_n==0!", b);
-                end
-                @(posedge clk); #1;
-                rst_n = 1'b1;
-                @(posedge clk); #1;
+                    rst_n = 1'b1;
+                    @(posedge clk); #1;
 
-                // Without writing slot 2 post-reset, `slot_valid_q[2] == 0` MUST mask any torn SRAM words to 0!
-                st_in = pack_cell(64'sd65536, -64'sd32768, 64'sd1024, 64'sd4096,
-                                  64'd0, {32'd0, 16'd2, 16'h0000}, 64'd0, 64'd0);
-                top_load_state_512(st_in, 64'd3);
-                exec_top_step(64'sd0, 16'hBEEF, rtl_out);
-                for (int w = 0; w < 8; w++) c_st[w] = st_in[w*64 +: 64];
-                for (int s = 0; s < 16; s++) begin
-                    for (int w = 0; w < 8; w++) c_arena[s*8 + w] = 64'd0;
+                    // Without writing slot 2 post-reset, `slot_valid_q[2] == 0` MUST mask any torn SRAM words to 0!
+                    st_in = pack_cell(64'sd65536, -64'sd32768, 64'sd1024, 64'sd4096,
+                                      64'd0, {32'd0, 16'd2, 16'h0000}, 64'd0, 64'd0);
+                    top_load_state_512(st_in, 64'd3);
+                    exec_top_step(64'sd0, 16'hBEEF, rtl_out);
+                    for (int w = 0; w < 8; w++) c_st[w] = st_in[w*64 +: 64];
+                    for (int s = 0; s < 16; s++) begin
+                        for (int w = 0; w < 8; w++) c_arena[s*8 + w] = 64'd0;
+                    end
+                    flow_step_atlas(c_out, c_st, c_arena, 64'd3, 64'sd0, 16'hBEEF);
+                    c_packed = pack_cell(c_out[0], c_out[1], c_out[2], c_out[3],
+                                         c_out[4], c_out[5], c_out[6], c_out[7]);
+                    if (rtl_out !== c_packed) begin
+                        $fatal(1, "FAIL [RST-SWAP b=%0d]: torn mid-swap SRAM state leaked across reset!", b);
+                    end
+                    top_rst_swept++;
                 end
-                flow_step_atlas(c_out, c_st, c_arena, 64'd3, 64'sd0, 16'hBEEF);
-                c_packed = pack_cell(c_out[0], c_out[1], c_out[2], c_out[3],
-                                     c_out[4], c_out[5], c_out[6], c_out[7]);
-                if (rtl_out !== c_packed) begin
-                    $fatal(1, "FAIL [RST-SWAP b=%0d]: torn mid-swap SRAM state leaked across reset!", b);
-                end
-                top_rst_swept++;
             end
 
             $display("  [PASS] Probe 7 (Protocol Bubbles [0..17 cyc], Busy Hammering & Mid-Flight Reset): %0d core + %0d top reset offsets recovered at 0-ULP",
@@ -2802,13 +3298,346 @@ module ele_cosim_tb;
         end
     endtask
 
+    // =========================================================================
+    // Probe 8: 42-Pin QFN-48 Charge-Minimal ASIC Padframe Lockstep & Pad-SSO
+    // =========================================================================
+    task automatic run_probe8_qfn48_padframe_lockstep();
+`ifdef RTL_MUTANT_FAST
+        localparam int N_QFN_STEPS = 32;
+        localparam int N_QFN_SWAPS = 8;
+`else
+        localparam int N_QFN_STEPS = 256;
+        localparam int N_QFN_SWAPS = 32;
+`endif
+        localparam int SWAP_STRIDE = N_QFN_STEPS / N_QFN_SWAPS;
+
+        logic [63:0]     rng;
+        logic [15:0]     vec16, raw16_prev;
+        int              bi17_max_flips;
+        longint unsigned raw16_toggles, inv17_toggles;
+
+        logic [511:0]    init_st, qfn_st_cur, chart_cell, cand_cell;
+        longint unsigned c_st[8];
+        longint unsigned c_arena[128];
+        longint unsigned c_cand[8];
+        longint unsigned c_out[8];
+        logic [511:0]    c_packed;
+        int unsigned     ep_seq;
+        int              swaps_done, swaps_acc_cnt, swaps_rej_cnt;
+        longint unsigned qfn_bi_total, qfn_raw_total;
+        begin
+            // -----------------------------------------------------------------
+            // 8A. Standalone `ele_bus_invert17` 17-Wire Pad PHY Verification
+            // -----------------------------------------------------------------
+            rng            = 64'hA5A5_5A5A_F00D_CAFE;
+            bi17_max_flips = 0;
+            raw16_prev     = 16'd0;
+            raw16_toggles  = 64'd0;
+            inv17_toggles  = 64'd0;
+
+            for (int i = 0; i < 1024; i++) begin
+                logic [16:0] prev_bi17_wire;
+                prev_bi17_wire = bi17_wire;
+                rng            = next_lfsr(rng);
+                if (i < 512) begin
+                    vec16 = (i % 2 == 0) ? (rng[15:0] & 16'hFFF0) : (~(rng[15:0] & 16'hFFF0));
+                end else begin
+                    vec16 = rng[15:0];
+                end
+
+                bi17_valid = 1'b1;
+                bi17_data  = vec16;
+                #1;
+                if (bi17_flips > 5'd8) begin
+                    $fatal(1, "FAIL [PHY17]: ele_bus_invert17 flips=%0d > 8!", bi17_flips);
+                end
+                if (int'(bi17_flips) > bi17_max_flips) bi17_max_flips = int'(bi17_flips);
+
+                @(posedge clk);
+                #1;
+                if (bi17_rx !== vec16) begin
+                    $fatal(1, "FAIL [PHY17]: ele_bus_invert17 rx mismatch!");
+                end
+                if ($countones(bi17_wire ^ prev_bi17_wire) > 8) begin
+                    $fatal(1, "FAIL [PHY17]: physical wire transition > 8/17!");
+                end
+                raw16_toggles += 64'($countones(vec16 ^ raw16_prev));
+                inv17_toggles += 64'($countones(bi17_wire ^ prev_bi17_wire));
+                raw16_prev     = vec16;
+            end
+            bi17_valid = 1'b0;
+            // Verify idle wire hold (`0` flips when `valid_i == 0`)
+            begin
+                logic [16:0] hold_ref;
+                hold_ref = bi17_wire;
+                bi17_data = ~vec16;
+                @(posedge clk);
+                #1;
+                if (bi17_wire !== hold_ref) begin
+                    $fatal(1, "FAIL [PHY17]: wire_o toggled while valid_i==0!");
+                end
+            end
+            if (inv17_toggles >= raw16_toggles) begin
+                $fatal(1, "FAIL [PHY17]: ele_bus_invert17 did not reduce wire toggles!");
+            end
+
+            // -----------------------------------------------------------------
+            // 8B. 42-Pin `ele_flow_qfn_top` Multi-Chart 0-ULP Lockstep +
+            //     32 Adversarial/Valid `@swap` Transactions + Pad-SSO Monitor
+            // -----------------------------------------------------------------
+            reset_all();
+            qfn_sso_meas_en = 1'b1;
+
+            for (int idx = 0; idx < 128; idx++) c_arena[idx] = 64'd0;
+
+            // Populate 8 multi-regime charts (quadratic, linear, autonomous, knife-edge, bipolar)
+            for (int s = 0; s < 8; s++) begin
+                case (s & 3)
+                    0: chart_cell = pack_cell(
+                        -64'sd1310720 + longint'(s) * 64'sd327680,
+                        64'sd65536,
+                        64'sd8192,
+                        {-32'sd1966080, 32'sd1966080},
+                        {32'sd1048576, 32'sd65536},
+                        {32'd0, 8'((s + 7) & 7), 8'((s + 1) & 7), 16'h00F0},
+                        {32'd1, 32'd0}, 64'd0
+                    );
+                    1: chart_cell = pack_cell(
+                        64'sd655360,
+                        64'sd98304,
+                        64'sd0, // linear regime (`b2 == 0`)
+                        {-32'sd1310720, 32'sd1310720},
+                        {32'sd1572864, 32'sd65536},
+                        {32'd0, 8'((s + 6) & 7), 8'((s + 2) & 7), 16'h0F00},
+                        {32'd1, 32'd0}, 64'd0
+                    );
+                    2: chart_cell = pack_cell(
+                        64'sd0,
+                        64'sd0, // autonomous 2-Jet fiber (`b1 == 0, b2 == 0`)
+                        64'sd0,
+                        {-32'sd2621440, 32'sd2621440},
+                        {32'sd262144, 32'sd65536},
+                        {32'd0, 8'd0, 8'((s + 1) & 7), 16'h55AA},
+                        {32'd1, 32'd0}, 64'd0
+                    );
+                    default: chart_cell = pack_cell(
+                        64'sd196608,
+                        -64'sd16384, // Citardauq / complex-discriminant tunnel regime
+                        64'sd65536,
+                        {-32'sd983040, 32'sd983040},
+                        {32'sd786432, 32'sd32768},
+                        {32'd0, 8'((s + 5) & 7), 8'((s + 3) & 7), 16'hAA55},
+                        {32'd1, 32'd0}, 64'd0
+                    );
+                endcase
+                qfn_write_chart_512(8'(s), chart_cell);
+                for (int w = 0; w < 8; w++) c_arena[s*8 + w] = chart_cell[w*64 +: 64];
+            end
+
+            init_st = pack_cell(
+                64'sd327680,
+                -64'sd196608,
+                64'sd43691,
+                -64'sd655360,
+                64'd0,
+                {32'd0, 16'd0, 16'hA55A},
+                64'd0,
+                64'd0
+            );
+            qfn_load_state_512(init_st, 64'd7);
+            for (int w = 0; w < 8; w++) c_st[w] = init_st[w*64 +: 64];
+
+            ep_seq        = 32'd2;
+            swaps_done    = 0;
+            swaps_acc_cnt = 0;
+            swaps_rej_cnt = 0;
+
+            for (int step = 0; step < N_QFN_STEPS; step++) begin
+                logic [63:0] u_stim;
+                logic [15:0] mreq_stim;
+
+                // Interleave 32 adversarial & valid `@swap` transactions through 42-pin QFN-48 padframe
+                if (((step % SWAP_STRIDE) == (SWAP_STRIDE - 1)) && (swaps_done < N_QFN_SWAPS)) begin
+                    logic [7:0]   sw_slot;
+                    int unsigned  sw_ep;
+                    logic         qfn_acc;
+                    byte unsigned c_acc;
+                    int           kind;
+
+                    rng     = next_lfsr(rng);
+                    sw_slot = 8'(swaps_done & 7);
+                    kind    = swaps_done % 8;
+                    ep_seq++;
+
+                    cand_cell = pack_cell(
+                        ((swaps_done & 1) != 0) ? -64'sd983040 : 64'sd983040,
+                        64'sd65536,
+                        (swaps_done % 3 == 0) ? 64'sd0 : 64'sd12288,
+                        {-32'sd1800000, 32'sd1800000},
+                        {32'sd1048576, 32'sd65536},
+                        {32'd0, 8'((swaps_done + 1) & 7), 8'((swaps_done + 3) & 7), rng[15:0]},
+                        {ep_seq, 32'd0},
+                        64'd0
+                    );
+
+                    case (kind)
+                        0: begin // Adversarial: stale epoch == 0
+                            sw_ep = 32'd0;
+                        end
+                        1: begin // Adversarial: next_lo > cap_mask (8 > 7)
+                            sw_ep = ep_seq;
+                            cand_cell[351:320] = {8'd8, 8'd1, rng[15:0]};
+                        end
+                        2: begin // Adversarial: next_hi > cap_mask (255 > 7)
+                            sw_ep = ep_seq;
+                            cand_cell[351:320] = {8'd1, 8'hFF, rng[15:0]};
+                        end
+                        3: begin // Adversarial: dt_max <= 0
+                            sw_ep = ep_seq;
+                            cand_cell[319:256] = {(swaps_done[3] ? 32'h8000_0000 : 32'd0), 32'sd65536};
+                        end
+                        4: begin // Adversarial: inverted Schmitt hysteresis (`b_exit > b_enter`)
+                            sw_ep = ep_seq;
+                            cand_cell[255:192] = {32'sd524288, -32'sd524288};
+                        end
+                        default: begin // Valid release-ordered @swap (`kind == 5, 6, 7`)
+                            sw_ep = ep_seq;
+                        end
+                    endcase
+
+                    for (int w = 0; w < 8; w++) c_cand[w] = cand_cell[w*64 +: 64];
+                    qfn_try_swap(sw_slot, sw_ep, cand_cell, qfn_acc);
+                    c_acc = ele_dpi_try_swap(c_arena, {56'd0, sw_slot}, 64'd7, sw_ep, c_cand);
+
+                    if (qfn_acc !== (c_acc != 8'd0)) begin
+                        $fatal(1, "FAIL [QFN-SWAP #%0d]: qfn_acc=%0b != c_acc=%0d!", swaps_done, qfn_acc, c_acc);
+                    end
+                    if (qfn_acc) swaps_acc_cnt++;
+                    else         swaps_rej_cnt++;
+                    swaps_done++;
+                end
+
+                // Alternate positive/negative bipolar stimuli & full 16-bit `mode_req` patterns
+                rng = next_lfsr(rng);
+                case (step & 3)
+                    0: u_stim = 64'sd2621440 + {{44{rng[19]}}, rng[19:0]};
+                    1: u_stim = -64'sd2621440 - {{44{rng[19]}}, rng[19:0]};
+                    2: u_stim = (step[2] ? 64'sd65535 : -64'sd65535); // knife-edge sub-Q16 perturbation
+                    default: u_stim = 64'sd0;
+                endcase
+                case (step & 3)
+                    0: mreq_stim = 16'hA5A5;
+                    1: mreq_stim = 16'h005A; // exercises single-flit `2'b00` low-byte path
+                    2: mreq_stim = 16'hFFFF;
+                    default: mreq_stim = rng[31:16];
+                endcase
+
+                if (step < 2) begin
+                    // Hammer `qfn_flit_valid=1` with BI17-encoded garbage while `!qfn_ready`
+                    // during BOTH core execution AND 4-beat Tx readout burst!
+                    int guard;
+                    logic [16:0] next_lane;
+                    qfn_send_word64(u_stim);
+                    qfn_send_flit(1'b1, {2'b10, 6'd0, mreq_stim[15:8]});
+                    qfn_send_flit(1'b1, {2'b01, mreq_stim[7:0], 3'd0, CMD_STEP});
+
+                    guard = 0;
+                    while (!qfn_irq_done) begin
+                        rng                = next_lfsr(rng);
+                        next_lane          = encode_bi17(qfn_host_prev_lane, rng[15:0]);
+                        qfn_flit_valid     = 1'b1;
+                        qfn_flit_ctrl      = rng[16];
+                        qfn_rx_bi_lane     = next_lane;
+                        qfn_host_prev_lane = next_lane;
+                        @(posedge clk);
+                        #1;
+                        guard++;
+                        if (guard > 512) $fatal(1, "FAIL [QFN-HAMMER]: irq_done timeout");
+                    end
+                    qfn_flit_valid = 1'b0;
+                    qfn_flit_ctrl  = 1'b0;
+
+                    for (int w = 0; w < 8; w++) begin
+                        int beat;
+                        qfn_send_flit(1'b1, {2'b11, 11'd0, 3'(w)});
+                        beat = 0;
+                        while (beat < 4) begin
+                            if (qfn_tx_valid) begin
+                                qfn_st_cur[(w*64) + (beat*16) +: 16] =
+                                    qfn_tx_bi_lane[15:0] ^ {16{qfn_tx_bi_lane[16]}};
+                                beat++;
+                            end
+                            // Attempt illegal write flits mid-readout while `!qfn_ready`!
+                            rng                = next_lfsr(rng);
+                            next_lane          = encode_bi17(qfn_host_prev_lane, ~rng[15:0]);
+                            qfn_flit_valid     = 1'b1;
+                            qfn_flit_ctrl      = rng[0];
+                            qfn_rx_bi_lane     = next_lane;
+                            qfn_host_prev_lane = next_lane;
+                            @(posedge clk);
+                            #1;
+                        end
+                        qfn_flit_valid = 1'b0;
+                        qfn_flit_ctrl  = 1'b0;
+                        qfn_wait_ready();
+                    end
+                end else begin
+                    qfn_exec_step(u_stim, mreq_stim, qfn_st_cur);
+                end
+
+                flow_step_atlas(c_out, c_st, c_arena, 64'd7, longint'(u_stim), mreq_stim);
+                for (int w = 0; w < 8; w++) c_st[w] = c_out[w];
+                c_packed = pack_cell(c_out[0], c_out[1], c_out[2], c_out[3],
+                                     c_out[4], c_out[5], c_out[6], c_out[7]);
+
+                if (qfn_st_cur !== c_packed) begin
+                    $display("FAIL [QFN-LOCKSTEP step=%0d]: 42-pin QFN-48 SV != FLOW C99!", step);
+                    for (int w = 0; w < 8; w++) begin
+                        if (qfn_st_cur[w*64 +: 64] !== c_packed[w*64 +: 64]) begin
+                            $display("  lane w%0d: qfn=%016x != c=%016x",
+                                     w, qfn_st_cur[w*64 +: 64], c_packed[w*64 +: 64]);
+                        end
+                    end
+                    $fatal(1);
+                end
+            end
+
+            qfn_bi_total  = qfn_bi_rx_toggles_q + qfn_bi_tx_toggles_q;
+            qfn_raw_total = qfn_raw_rx_toggles_q + qfn_raw_tx_toggles_q;
+            if ((qfn_max_rx_flips_q > 8) || (qfn_max_tx_flips_q > 8) ||
+                (qfn_max_rx_flips_q == 0) || (qfn_max_tx_flips_q == 0) ||
+                (qfn_bi_total >= qfn_raw_total)) begin
+                $fatal(1, "FAIL [QFN-SSO]: invalid pad telemetry (max_rx=%0d, max_tx=%0d, bi=%0d, raw=%0d)!",
+                       qfn_max_rx_flips_q, qfn_max_tx_flips_q, qfn_bi_total, qfn_raw_total);
+            end
+            if ((swaps_acc_cnt == 0) || (swaps_rej_cnt == 0)) begin
+                $fatal(1, "FAIL [QFN-SWAP]: incomplete accepted/rejected @swap coverage!");
+            end
+            qfn_sso_meas_en = 1'b0;
+
+            $display("  [PASS] Probe 8 (42-Pin QFN-48 Charge-Minimal ASIC Padframe Lockstep & 17-Wire SSO Telemetry):");
+            $display("         • QFN-48 Multi-Chart/Swap : %0d steps + %0d @swaps (%0d acc, %0d rej) bit-identical at 0-ULP",
+                     N_QFN_STEPS, swaps_done, swaps_acc_cnt, swaps_rej_cnt);
+            $display("         • QFN-48 Pad SSO Ceiling  : max_rx_flips=%0d/17 (<=8), max_tx_flips=%0d/17 (<=8), pad_toggles=%0d vs raw=%0d (-%0d.%0d%%)",
+                     qfn_max_rx_flips_q, qfn_max_tx_flips_q, qfn_bi_total, qfn_raw_total,
+                     ((qfn_raw_total - qfn_bi_total) * 1000 / qfn_raw_total) / 10,
+                     ((qfn_raw_total - qfn_bi_total) * 1000 / qfn_raw_total) % 10);
+            $display("         • 17-Wire Bus-Invert Leaf : max_flips=%0d/17 (<=8 cap), wire_toggles=%0d vs raw=%0d (-%0d.%0d%%)",
+                     bi17_max_flips, inv17_toggles, raw16_toggles,
+                     ((raw16_toggles - inv17_toggles) * 1000 / raw16_toggles) / 10,
+                     ((raw16_toggles - inv17_toggles) * 1000 / raw16_toggles) % 10);
+        end
+    endtask
+
     initial begin
-        $display("=== ELE v6.0.0 Full Silicon Wind-Tunnel (`--dsp-count %0d --max-depth %0d`, dff=%0d bits + X-Poisoning vs FLOW v6.0.0 C99) ===",
+        $display("=== ELE v7.0.1 Full Silicon Wind-Tunnel (`--dsp-count %0d --max-depth %0d`, dff=%0d bits + X-Poisoning vs FLOW v7.0.1 C17) ===",
                  u_core_dut.PROFILE_DSP_COUNT, u_core_dut.PROFILE_MAX_DEPTH, u_core_dut.CORE_DFF_BITS);
         reset_all();
         run_probe5_knife_edges();
         reset_all();
         run_probe3_atlas_and_sram_swap();
+        reset_all();
+        run_probe8_qfn48_padframe_lockstep();
         reset_all();
         run_probe7_protocol_chaos_and_reset();
         reset_all();
@@ -2819,7 +3648,7 @@ module ele_cosim_tb;
         run_probe4_cmos_energy_telemetry();
         reset_all();
         run_probe1_differential();
-        $display("=== ALL 7 SILICON, KNIFE-EDGE, SEARU EPIPHANY, PROTOCOL & ENERGY PROBES PASSED: total_tapeout_defects = 0 ===");
+        $display("=== ALL 8 SILICON, QFN-48 PADFRAME, KNIFE-EDGE, SEARU EPIPHANY, PROTOCOL & ENERGY PROBES PASSED: total_tapeout_defects = 0 ===");
         $finish;
     end
 endmodule

@@ -1,16 +1,26 @@
 /* SPDX-License-Identifier: MIT
- * tools/ele_bootstrap.c — Self-Hosting FLOW v6.0.0 2-Jet Silicon Synthesizer
+ * tools/ele_bootstrap.c — Self-Hosting SEARU × FLOW v7.0.1 Symbiotic Silicon Compiler
  *
- * Build-time hardware DAG scheduler, pipeline-cut retimer, and IEEE 1800
- * SystemVerilog emitter driven directly by `../FLOW/flow.h` (`flow_step_atlas`).
+ * Build-time 3-pass SSA hardware compiler combining continuous FLOW 2-Jet lattice
+ * retiming (`../FLOW/flow.h`) with discrete SEARU Sparse-k / Kan-pin / Crucible
+ * combinatorial optimization (`../FLOW/searu.h` + `../FLOW/flow_opt_params.h`).
  *
- * Zero external library dependencies (C17 libc + `../FLOW/flow.h` only).
- * Given physical silicon constraints (`--dsp-count M`, `--max-depth D`),
- * constructs a coupled 64-byte `flow_cell` lattice over all 33 operator nodes
- * of the decomposed 33x33-limb FLOW 2-Jet manifold plus the radix-2 unroll
- * controller, evolves `flow_step_atlas` to `FLOW_STATUS_CONVERGED`, and emits
- * synthesizable `< 160`-pin SystemVerilog (`ele_flow_core` + `ele_flow_atlas_top`)
- * targeting the primordial leaf atoms in `rtl/ele_primordial.sv`.
+ * Zero external library dependencies (pure GPR C17 + `flow.h` + `searu.h` only):
+ *   Pass 1 : Declarative 33-node SSA operator IR (`ssa_op_spec_t`) retimed across
+ *            physical constraints (`--dsp-count M`, `--max-depth D`) by evolving a
+ *            coupled `flow_cell` 2-Jet manifold to `CONVERGED`, followed by
+ *            `SEARU_SOLVE_INLINE` per-stage DSP slot permutation synthesis to
+ *            jointly minimize shared cut bits, 33-bit DSP operand fan-in, and
+ *            shared-lane mux fan-in.
+ *   Pass 2 : Global FSM live-interval analysis `[birth_state, last_read]` seeded by
+ *            chordal coloring and refined via `SEARU_SOLVE_INLINE` heterogeneous-width
+ *            + mux-affinity register allocation with formal O(N^2) disjointness proof,
+ *            plus regime & zero-limb clock-enable / DSP operand isolation.
+ *   Pass 3 : Critical-path (`ltp -noff`) carry-select decoupling, O(log W)
+ *            power-of-two symmetric range trees, sequential DFF reclamation
+ *            (`d_mag_q` folded into `sr_acc_q`, combinational `r2`/`op_mask`,
+ *            `pre_sat` + `sr_aux_q[63:0]` divider gating), Active Chart-Bound
+ *            Caching (`0` steady-state SRAM reads), and Shadow-SRAM `@swap` staging.
  */
 
 #include <inttypes.h>
@@ -21,10 +31,22 @@
 #include <string.h>
 
 #include "flow.h"
+#include "searu.h"
 
-#define MAX_CONE_NODES 16
-#define MAX_PREDS      6
-#define MAX_DSPS       8
+#define MAX_CONE_NODES  16
+#define MAX_PREDS       6
+#define MAX_DSPS        8
+#define NUM_SSA_OPS     33
+#define MAX_SCALAR_REQS 64
+#define MAX_PHYS_LANES  32
+
+typedef enum {
+    CONE_A    = 0,
+    CONE_B    = 1,
+    CONE_D    = 2,
+    CONE_C    = 3,
+    NUM_CONES = 4
+} cone_id_t;
 
 typedef enum {
     PHASE_PRE_LOGIC  = 0,
@@ -32,20 +54,113 @@ typedef enum {
     PHASE_POST_LOGIC = 2
 } node_phase_t;
 
+typedef enum {
+    EXPR_A0_UG_U = 0,
+    EXPR_A1_B1_X,
+    EXPR_A2_X_SQ,
+    EXPR_A3_B2_X,
+    EXPR_A4_B0_EFF,
+    EXPR_A5_B2XSQ_LO,
+    EXPR_A6_B2XSQ_HI,
+    EXPR_A7_G0_OP,
+    EXPR_A8_G1_OP,
+    EXPR_A9_JET_AU,
+    EXPR_A10_JET_MUX,
+    EXPR_B0_G1_LL,
+    EXPR_B1_G1_HL,
+    EXPR_B2_G1_HH,
+    EXPR_B3_G0R2_0,
+    EXPR_B4_G0R2_1,
+    EXPR_B5_G0R2_2,
+    EXPR_B6_G1_SQ,
+    EXPR_B7_G0_R2,
+    EXPR_B8_DISC_SUB,
+    EXPR_D0_CIT_SEL,
+    EXPR_D1_DIV_NORM,
+    EXPR_C0_DELTA_CAND,
+    EXPR_C1_D_SQ,
+    EXPR_C2_G1DC_LO,
+    EXPR_C3_G1DC_HI,
+    EXPR_C4_R2_DC,
+    EXPR_C5_R2DSQ_LO,
+    EXPR_C6_R2DSQ_HI,
+    EXPR_C7_G0_CAND,
+    EXPR_C8_LYAP_GUARD,
+    EXPR_C9_POST_ROUND,
+    EXPR_C10_KAN_COMMIT
+} ssa_expr_id_t;
+
+/* Pass-1 Declarative SSA Micro-Op IR Descriptor */
 typedef struct {
-    const char  *name;
-    node_phase_t phase;
-    int          delay_lvls;
-    int          reg_bits;
-    int          num_preds;
-    int          preds[MAX_PREDS];
+    cone_id_t     cone;
+    int           local_idx;
+    const char   *name;
+    node_phase_t  phase;
+    int           delay_lvls;
+    int           reg_bits;
+    int           num_preds;
+    int           preds[MAX_PREDS];
+    ssa_expr_id_t expr_id;
+} ssa_op_spec_t;
+
+static const ssa_op_spec_t k_ssa_op_specs[NUM_SSA_OPS] = {
+    /* Cone A: Exact 2^-49 Guard-Bit Residual G0 & 2^-32 Tangent G1 (11 ops) */
+    {CONE_A,  0, "a0_ug_u",       PHASE_DSP33,      17,  64, 0, {0},          EXPR_A0_UG_U},
+    {CONE_A,  1, "a1_b1_x",       PHASE_DSP33,      17,  64, 0, {0},          EXPR_A1_B1_X},
+    {CONE_A,  2, "a2_x_sq",       PHASE_DSP33,      17,  64, 0, {0},          EXPR_A2_X_SQ},
+    {CONE_A,  3, "a3_b2_x",       PHASE_DSP33,      17,  64, 0, {0},          EXPR_A3_B2_X},
+    {CONE_A,  4, "a4_b0_eff",     PHASE_POST_LOGIC, 10, 128, 1, {0},          EXPR_A4_B0_EFF},
+    {CONE_A,  5, "a5_b2xsq_lo",   PHASE_DSP33,      17,  66, 1, {2},          EXPR_A5_B2XSQ_LO},
+    {CONE_A,  6, "a6_b2xsq_hi",   PHASE_DSP33,      17,  66, 1, {2},          EXPR_A6_B2XSQ_HI},
+    {CONE_A,  7, "a7_g0_op",      PHASE_POST_LOGIC, 13, 128, 4, {1, 4, 5, 6}, EXPR_A7_G0_OP},
+    {CONE_A,  8, "a8_g1_op",      PHASE_POST_LOGIC,  8,  64, 1, {3},          EXPR_A8_G1_OP},
+    {CONE_A,  9, "a9_jet_au",     PHASE_POST_LOGIC, 11, 192, 1, {4},          EXPR_A9_JET_AU},
+    {CONE_A, 10, "a10_jet_mux",   PHASE_POST_LOGIC,  5,   0, 4, {4, 7, 8, 9}, EXPR_A10_JET_MUX},
+
+    /* Cone B: 128-Bit Multi-Limb Discriminant G1^2 - G0*R2 (9 ops) */
+    {CONE_B,  0, "b0_g1_ll",      PHASE_DSP33,      17,  66, 0, {0},          EXPR_B0_G1_LL},
+    {CONE_B,  1, "b1_g1_hl",      PHASE_DSP33,      17,  66, 0, {0},          EXPR_B1_G1_HL},
+    {CONE_B,  2, "b2_g1_hh",      PHASE_DSP33,      17,  66, 0, {0},          EXPR_B2_G1_HH},
+    {CONE_B,  3, "b3_g0r2_0",     PHASE_DSP33,      17,  66, 0, {0},          EXPR_B3_G0R2_0},
+    {CONE_B,  4, "b4_g0r2_1",     PHASE_DSP33,      17,  66, 0, {0},          EXPR_B4_G0R2_1},
+    {CONE_B,  5, "b5_g0r2_2",     PHASE_DSP33,      17,  66, 0, {0},          EXPR_B5_G0R2_2},
+    {CONE_B,  6, "b6_g1_sq",      PHASE_POST_LOGIC, 12, 128, 3, {0, 1, 2},    EXPR_B6_G1_SQ},
+    {CONE_B,  7, "b7_g0_r2",      PHASE_POST_LOGIC, 12, 128, 3, {3, 4, 5},    EXPR_B7_G0_R2},
+    {CONE_B,  8, "b8_disc_sub",   PHASE_POST_LOGIC, 11,   0, 2, {6, 7},       EXPR_B8_DISC_SUB},
+
+    /* Cone D: Gauge-Invariant Citardauq & Restoring Divider Normalization (2 ops) */
+    {CONE_D,  0, "d0_cit_sel",    PHASE_POST_LOGIC, 14, 194, 0, {0},          EXPR_D0_CIT_SEL},
+    {CONE_D,  1, "d1_div_norm",   PHASE_POST_LOGIC, 14,   0, 1, {0},          EXPR_D1_DIV_NORM},
+
+    /* Cone C: Coordinate Clamp, Exact 128-Bit Lyapunov Guard & Kan Commit (11 ops) */
+    {CONE_C,  0, "c0_delta_cand", PHASE_PRE_LOGIC,  13,  33, 0, {0},          EXPR_C0_DELTA_CAND},
+    {CONE_C,  1, "c1_d_sq",       PHASE_DSP33,      17,  64, 1, {0},          EXPR_C1_D_SQ},
+    {CONE_C,  2, "c2_g1dc_lo",    PHASE_DSP33,      17,  66, 1, {0},          EXPR_C2_G1DC_LO},
+    {CONE_C,  3, "c3_g1dc_hi",    PHASE_DSP33,      17,  66, 1, {0},          EXPR_C3_G1DC_HI},
+    {CONE_C,  4, "c4_r2_dc",      PHASE_DSP33,      17,  64, 1, {0},          EXPR_C4_R2_DC},
+    {CONE_C,  5, "c5_r2dsq_lo",   PHASE_DSP33,      17,  66, 1, {1},          EXPR_C5_R2DSQ_LO},
+    {CONE_C,  6, "c6_r2dsq_hi",   PHASE_DSP33,      17,  66, 1, {1},          EXPR_C6_R2DSQ_HI},
+    {CONE_C,  7, "c7_g0_cand",    PHASE_POST_LOGIC, 13, 128, 4, {2, 3, 5, 6}, EXPR_C7_G0_CAND},
+    {CONE_C,  8, "c8_lyap_guard", PHASE_POST_LOGIC, 14, 288, 3, {0, 4, 7},    EXPR_C8_LYAP_GUARD},
+    {CONE_C,  9, "c9_post_round", PHASE_POST_LOGIC, 13, 192, 1, {8},          EXPR_C9_POST_ROUND},
+    {CONE_C, 10, "c10_kan_commit",PHASE_POST_LOGIC,  7,   0, 2, {8, 9},       EXPR_C10_KAN_COMMIT},
+};
+
+typedef struct {
+    const char   *name;
+    node_phase_t  phase;
+    int           delay_lvls;
+    int           reg_bits;
+    int           num_preds;
+    int           preds[MAX_PREDS];
+    ssa_expr_id_t expr_id;
     /* Solved by FLOW 2-Jet lattice (`flow_step_atlas`) */
-    int          stage;
-    int          end_frac_q16;
-    int          dsp_slot;
-    bool         needs_reg;
-    uint32_t     flow_epochs;
-    uint16_t     final_chart;
+    int           stage;
+    int           end_frac_q16;
+    int           dsp_slot;
+    bool          needs_reg;
+    uint32_t      flow_epochs;
+    uint16_t      final_chart;
 } dag_node_t;
 
 typedef struct {
@@ -56,6 +171,26 @@ typedef struct {
     int         sweeps_taken;
     int         cut_reg_bits;
 } dag_cone_t;
+
+/* Pass-2 Global Live-Range Scalar Slice & Physical Shared Register Pool */
+typedef struct {
+    const char *tag;
+    int         birth_state;
+    int         last_read_state;
+    int         bit_width;        /* Exact active bits in {31, 33, 34, 35, 64, 66} */
+    const char *we_guard;         /* Fine-grained clock-enable predicate on write */
+    const char *val_expr;         /* Exact `bit_width`-wide unsigned RHS expression */
+    int         phys_lane;        /* Assigned physical lane [0 .. num_lanes-1] */
+} ssa_scalar_live_t;
+
+typedef struct {
+    ssa_scalar_live_t reqs[MAX_SCALAR_REQS];
+    int               num_reqs;
+    int               num_lanes;
+    int               lane_width[MAX_PHYS_LANES];
+    int               lane_writers[MAX_PHYS_LANES];
+    int               shared_cut_bits;
+} reg_alloc_t;
 
 /* Quantize Q16.16 coordinate upward to multiples of 1024 (`2^10`) so that
  * quadratic 2-Jet curvature `b2 = 8192 (2^13)` satisfies `(x_req^2 >> 20) << 33
@@ -68,20 +203,15 @@ static int64_t quantize_q16_up(int64_t v) {
 }
 
 static int64_t quadratic_drive_for_root(int64_t x_root_q16) {
-    /* Root of: -(u_in << 33) + (x << 33) + 8192 * x^2 == 0
-     * => u_in = x_root + ((x_root * x_root) >> 20) */
     int64_t sq = x_root_q16 * x_root_q16;
     return x_root_q16 + (sq >> 20U);
 }
 
 static void init_2jet_node_arena(flow_cell arena[2], bool pin_anchor) {
-    /* Chart 0: Stage-0 combinational packing basin (`x <= 1.0` cycle)
-     * Chart 1: Multi-cycle pipeline-cut basin (`x > 1.0` cycle), entered via
-     *          HoTT Schmitt hysteresis (`b_exit = 0.5`, `b_enter = 1.0`). */
     const uint64_t b0_c0[8] = {
         0ULL,
         (uint64_t)FLOW_Q16_ONE,
-        8192ULL, /* Non-zero positive 2-Jet curvature -> exercises Citardauq + isqrt! */
+        8192ULL,
         ((uint64_t)(uint32_t)(-32768) << 32U) | (uint64_t)(uint32_t)65536,
         ((uint64_t)(uint32_t)98304 << 32U) | (uint64_t)(uint32_t)FLOW_Q16_ONE,
         (0ULL << 24U) | (1ULL << 16U) | (uint64_t)(pin_anchor ? 0xFFFFU : 0x0001U),
@@ -103,8 +233,6 @@ static void init_2jet_node_arena(flow_cell arena[2], bool pin_anchor) {
 }
 
 static int solve_radix_unroll_2jet(int max_depth, uint32_t *out_epochs) {
-    /* Each chained `ele_rad2_step_atom` slice costs 13 gate levels + 5 mux overhead.
-     * Legal power-of-two unrolls: K_rad in {1, 2, 4}. */
     int target_k = 1;
     if (5 + 4 * 13 <= max_depth) {
         target_k = 4;
@@ -140,6 +268,38 @@ static int solve_radix_unroll_2jet(int max_depth, uint32_t *out_epochs) {
     return resolved_k;
 }
 
+static void build_cones_from_ssa_ir(dag_cone_t cones[NUM_CONES]) {
+    static const char *k_cone_names[NUM_CONES] = {
+        "CONE_A_RESIDUAL",
+        "CONE_B_DISC",
+        "CONE_D_CITARDAUQ",
+        "CONE_C_LYAP_COMMIT",
+    };
+    memset(cones, 0, sizeof(dag_cone_t) * NUM_CONES);
+    for (int c = 0; c < NUM_CONES; ++c) {
+        cones[c].cone_name = k_cone_names[c];
+    }
+    for (int op = 0; op < NUM_SSA_OPS; ++op) {
+        const ssa_op_spec_t *sp = &k_ssa_op_specs[op];
+        dag_cone_t          *cn = &cones[sp->cone];
+        if (sp->local_idx != cn->num_nodes) {
+            fprintf(stderr, "FATAL: SSA IR table index mismatch on %s\n", sp->name);
+            exit(1);
+        }
+        dag_node_t *nd = &cn->nodes[cn->num_nodes++];
+        memset(nd, 0, sizeof(*nd));
+        nd->name       = sp->name;
+        nd->phase      = sp->phase;
+        nd->delay_lvls = sp->delay_lvls;
+        nd->reg_bits   = sp->reg_bits;
+        nd->num_preds  = sp->num_preds;
+        nd->expr_id    = sp->expr_id;
+        for (int p = 0; p < sp->num_preds; ++p) {
+            nd->preds[p] = sp->preds[p];
+        }
+    }
+}
+
 static void solve_cone_with_flow_2jet(dag_cone_t *cone, int dsp_count, int max_depth) {
     flow_cell cells[MAX_CONE_NODES];
     flow_cell arenas[MAX_CONE_NODES][2];
@@ -168,7 +328,6 @@ static void solve_cone_with_flow_2jet(dag_cone_t *cone, int dsp_count, int max_d
                 dur_q16 = 1024;
             }
 
-            /* 1. Evaluate causal timing & max-depth pipeline-cut bounds from predecessors */
             int64_t req_x = 0;
             for (int p = 0; p < nd->num_preds; ++p) {
                 int         u      = nd->preds[p];
@@ -185,11 +344,6 @@ static void solve_cone_with_flow_2jet(dag_cone_t *cone, int dsp_count, int max_d
                 }
                 int64_t end_frac_u = frac_u + dur_u;
 
-                /* Can `(u -> nd)` chain combinationally inside clock stage `su`?
-                 * Forbidden if:
-                 *   (a) Both `u` and `nd` are 33x33 Booth DSP atoms (`DSP -> DSP`), or
-                 *   (b) `pu->phase > nd->phase` (violates PRE -> DSP -> POST stratification), or
-                 *   (c) Accumulated gate depth `end_frac_u + dur_q16 > 1.0` (`> max_depth`). */
                 bool can_chain = !(pu->phase == PHASE_DSP33 && nd->phase == PHASE_DSP33) &&
                                  (pu->phase <= nd->phase) &&
                                  ((end_frac_u + dur_q16) <= FLOW_Q16_ONE);
@@ -201,7 +355,6 @@ static void solve_cone_with_flow_2jet(dag_cone_t *cone, int dsp_count, int max_d
                 }
             }
 
-            /* 2. Enforce physical DSP33 contention capacity (`dsp_count`) per stage */
             int cand_stage = (int)(req_x / FLOW_Q16_ONE);
             if (nd->phase == PHASE_DSP33) {
                 while (cand_stage < 63 && dsp_occ[cand_stage] >= dsp_count) {
@@ -222,7 +375,6 @@ static void solve_cone_with_flow_2jet(dag_cone_t *cone, int dsp_count, int max_d
                 }
             }
 
-            /* 3. Advance node `i` via `flow_step_atlas` (`../FLOW/flow.h`) */
             int64_t   u_drive = quadratic_drive_for_root(req_x);
             flow_cell next_c;
             flow_step_atlas(next_c, cells[i], arenas[i], 1ULL, u_drive, 0x000FU);
@@ -250,14 +402,13 @@ static void solve_cone_with_flow_2jet(dag_cone_t *cone, int dsp_count, int max_d
         exit(1);
     }
 
-    /* Extract discrete stage schedule, verify 0 constraint violations, bind DSP slots */
     int stage_dsp_next[64];
     memset(stage_dsp_next, 0, sizeof(stage_dsp_next));
     int max_stage = 0;
 
     for (int i = 0; i < cone->num_nodes; ++i) {
-        dag_node_t *nd = &cone->nodes[i];
-        int64_t     xi = (int64_t)cells[i][3];
+        dag_node_t *nd    = &cone->nodes[i];
+        int64_t     xi    = (int64_t)cells[i][3];
         nd->stage         = (int)(xi / FLOW_Q16_ONE);
         nd->end_frac_q16  = (int)(xi % FLOW_Q16_ONE);
         nd->flow_epochs   = (uint32_t)(cells[i][6] >> 32U);
@@ -277,7 +428,6 @@ static void solve_cone_with_flow_2jet(dag_cone_t *cone, int dsp_count, int max_d
             nd->dsp_slot = -1;
         }
 
-        /* Verify causal precedence */
         for (int p = 0; p < nd->num_preds; ++p) {
             int u = nd->preds[p];
             if (cone->nodes[u].stage > nd->stage) {
@@ -291,7 +441,6 @@ static void solve_cone_with_flow_2jet(dag_cone_t *cone, int dsp_count, int max_d
         }
     }
 
-    /* Compact any empty stage gaps while preserving strict order */
     int used[64] = {0};
     for (int i = 0; i < cone->num_nodes; ++i) {
         used[cone->nodes[i].stage] = 1;
@@ -325,102 +474,987 @@ static void solve_cone_with_flow_2jet(dag_cone_t *cone, int dsp_count, int max_d
     cone->sweeps_taken = sweep;
 }
 
-static void add_node(dag_cone_t *c, const char *name, node_phase_t phase,
-                     int delay_lvls, int reg_bits, int np,
-                     int p0, int p1, int p2, int p3) {
-    int idx = c->num_nodes++;
-    dag_node_t *n = &c->nodes[idx];
-    memset(n, 0, sizeof(*n));
-    n->name       = name;
-    n->phase      = phase;
-    n->delay_lvls = delay_lvls;
-    n->reg_bits   = reg_bits;
-    n->num_preds  = np;
-    n->preds[0]   = p0;
-    n->preds[1]   = p1;
-    n->preds[2]   = p2;
-    n->preds[3]   = p3;
+/* ============================================================================
+ * Pass 2: Global FSM Live-Range Analysis & Chordal Interval-Graph Allocation
+ * ============================================================================ */
+
+static int max_consumer_stage(const dag_cone_t *cone, int src_idx) {
+    int max_s = cone->nodes[src_idx].stage;
+    for (int v = 0; v < cone->num_nodes; ++v) {
+        for (int p = 0; p < cone->nodes[v].num_preds; ++p) {
+            if (cone->nodes[v].preds[p] == src_idx && cone->nodes[v].stage > max_s) {
+                max_s = cone->nodes[v].stage;
+            }
+        }
+    }
+    return max_s;
 }
 
-static void build_flow_2jet_cones(dag_cone_t *cone_a, dag_cone_t *cone_b,
-                                  dag_cone_t *cone_d, dag_cone_t *cone_c) {
-    memset(cone_a, 0, sizeof(*cone_a));
-    cone_a->cone_name = "CONE_A_RESIDUAL";
-    /*  0 */ add_node(cone_a, "a0_ug_u",      PHASE_DSP33,      17,  64, 0, 0, 0, 0, 0);
-    /*  1 */ add_node(cone_a, "a1_b1_x",      PHASE_DSP33,      17,  64, 0, 0, 0, 0, 0);
-    /*  2 */ add_node(cone_a, "a2_x_sq",      PHASE_DSP33,      17,  64, 0, 0, 0, 0, 0);
-    /*  3 */ add_node(cone_a, "a3_b2_x",      PHASE_DSP33,      17,  64, 0, 0, 0, 0, 0);
-    /*  4 */ add_node(cone_a, "a4_b0_eff",    PHASE_POST_LOGIC, 10, 128, 1, 0, 0, 0, 0);
-    /*  5 */ add_node(cone_a, "a5_b2xsq_lo",  PHASE_DSP33,      17,  66, 1, 2, 0, 0, 0);
-    /*  6 */ add_node(cone_a, "a6_b2xsq_hi",  PHASE_DSP33,      17,  66, 1, 2, 0, 0, 0);
-    /*  7 */ add_node(cone_a, "a7_g0_op",     PHASE_POST_LOGIC, 13, 128, 4, 1, 4, 5, 6);
-    /*  8 */ add_node(cone_a, "a8_g1_op",     PHASE_POST_LOGIC,  8,  64, 1, 3, 0, 0, 0);
-    /*  9 */ add_node(cone_a, "a9_jet_au",    PHASE_POST_LOGIC, 11, 192, 1, 4, 0, 0, 0);
-    /* 10 */ add_node(cone_a, "a10_jet_mux",  PHASE_POST_LOGIC,  5,   0, 4, 4, 7, 8, 9);
-    /* Architectural outputs of Cone A (`b0_eff` from A4 is latched at end of Cone A if A4 < A10) */
-
-    memset(cone_b, 0, sizeof(*cone_b));
-    cone_b->cone_name = "CONE_B_DISC";
-    /*  0 */ add_node(cone_b, "b0_g1_ll",     PHASE_DSP33,      17,  66, 0, 0, 0, 0, 0);
-    /*  1 */ add_node(cone_b, "b1_g1_hl",     PHASE_DSP33,      17,  66, 0, 0, 0, 0, 0);
-    /*  2 */ add_node(cone_b, "b2_g1_hh",     PHASE_DSP33,      17,  66, 0, 0, 0, 0, 0);
-    /*  3 */ add_node(cone_b, "b3_g0r2_0",    PHASE_DSP33,      17,  66, 0, 0, 0, 0, 0);
-    /*  4 */ add_node(cone_b, "b4_g0r2_1",    PHASE_DSP33,      17,  66, 0, 0, 0, 0, 0);
-    /*  5 */ add_node(cone_b, "b5_g0r2_2",    PHASE_DSP33,      17,  66, 0, 0, 0, 0, 0);
-    /*  6 */ add_node(cone_b, "b6_g1_sq",     PHASE_POST_LOGIC, 12, 128, 3, 0, 1, 2, 0);
-    /*  7 */ add_node(cone_b, "b7_g0_r2",     PHASE_POST_LOGIC, 12, 128, 3, 3, 4, 5, 0);
-    /*  8 */ add_node(cone_b, "b8_disc_sub",  PHASE_POST_LOGIC, 11,   0, 2, 6, 7, 0, 0);
-
-    memset(cone_d, 0, sizeof(*cone_d));
-    cone_d->cone_name = "CONE_D_CITARDAUQ";
-    /*  0 */ add_node(cone_d, "d0_cit_sel",   PHASE_POST_LOGIC, 14, 194, 0, 0, 0, 0, 0);
-    /*  1 */ add_node(cone_d, "d1_div_norm",  PHASE_POST_LOGIC, 14,   0, 1, 0, 0, 0, 0);
-
-    memset(cone_c, 0, sizeof(*cone_c));
-    cone_c->cone_name = "CONE_C_LYAP_COMMIT";
-    /*  0 */ add_node(cone_c, "c0_delta_cand", PHASE_PRE_LOGIC,  13,  33, 0, 0, 0, 0, 0);
-    /*  1 */ add_node(cone_c, "c1_d_sq",       PHASE_DSP33,      17,  64, 1, 0, 0, 0, 0);
-    /*  2 */ add_node(cone_c, "c2_g1dc_lo",    PHASE_DSP33,      17,  66, 1, 0, 0, 0, 0);
-    /*  3 */ add_node(cone_c, "c3_g1dc_hi",    PHASE_DSP33,      17,  66, 1, 0, 0, 0, 0);
-    /*  4 */ add_node(cone_c, "c4_r2_dc",      PHASE_DSP33,      17,  64, 1, 0, 0, 0, 0);
-    /*  5 */ add_node(cone_c, "c5_r2dsq_lo",   PHASE_DSP33,      17,  66, 1, 1, 0, 0, 0);
-    /*  6 */ add_node(cone_c, "c6_r2dsq_hi",   PHASE_DSP33,      17,  66, 1, 1, 0, 0, 0);
-    /*  7 */ add_node(cone_c, "c7_g0_cand",    PHASE_POST_LOGIC, 13, 128, 4, 2, 3, 5, 6);
-    /*  8 */ add_node(cone_c, "c8_lyap_guard", PHASE_POST_LOGIC, 14, 288, 3, 0, 4, 7, 0);
-    /*  9 */ add_node(cone_c, "c9_post_round", PHASE_POST_LOGIC, 13, 192, 1, 8, 0, 0, 0);
-    /* 10 */ add_node(cone_c, "c10_kan_commit",PHASE_POST_LOGIC,  7,   0, 2, 8, 9, 0, 0);
+static int add_scalar_req(reg_alloc_t *ra, const char *tag, int birth, int last_read,
+                          int bit_width, const char *we_guard, const char *val_expr) {
+    if (birth >= last_read) {
+        return -1;
+    }
+    if (ra->num_reqs >= MAX_SCALAR_REQS) {
+        fprintf(stderr, "FATAL: scalar live-range table overflow!\n");
+        exit(1);
+    }
+    int idx = ra->num_reqs++;
+    ssa_scalar_live_t *r = &ra->reqs[idx];
+    r->tag             = tag;
+    r->birth_state     = birth;
+    r->last_read_state = last_read;
+    r->bit_width       = bit_width;
+    r->we_guard        = we_guard;
+    r->val_expr        = val_expr;
+    r->phys_lane       = -1;
+    return idx;
 }
+
+typedef struct {
+    int a0, a1, a2, a3, a5, a6, a7_lo, a7_hi, a8, a9_lo, a9_hi, a9_j1;
+    int b0, b1, b2, b3, b4, b5, b6_lo, b6_hi, b7_lo, b7_hi;
+    int d0_lo, d0_hi, d0_den;
+    int c0, c1, c2, c3, c4, c5, c6, c7_lo, c7_hi;
+    int c8_lo, c8_hi, c8_g1, c8_xpdt;
+    int c9_j0, c9_j1, c9_sub;
+} scalar_map_t;
+
+typedef struct {
+    uint32_t dsp_uniq_ops_init;
+    uint32_t dsp_uniq_ops_best;
+    uint32_t p1_iters;
+    uint32_t p1_epiphanies;
+    uint32_t p1_swans;
+    uint64_t p1_energy_init;
+    uint64_t p1_energy_best;
+    int      cut_bits_init;
+    int      cut_bits_best;
+    uint32_t lane_mux_bits_init;
+    uint32_t lane_mux_bits_best;
+    uint32_t p2_iters;
+    uint32_t p2_epiphanies;
+    uint32_t p2_swans;
+    uint64_t p2_energy_init;
+    uint64_t p2_energy_best;
+} searu_hls_stats_t;
 
 /* Helper: return SV identifier read by consumer node `dst` from producer `src`
- * within the same cone (`_c` if same stage, `_q` if across a pipeline cut). */
+ * within the same cone (`_c` if same stage, `_q` alias if across a pipeline cut). */
 static const char *ref_sig(const dag_cone_t *c, int src, int dst,
                            const char *comb_id, const char *reg_id) {
     return (c->nodes[src].stage == c->nodes[dst].stage) ? comb_id : reg_id;
 }
 
 typedef struct {
-    int cone_id; /* 0=A, 1=B, 2=C */
-    int node_idx;
-    int global_state;
+    int         cone_id; /* 0=A, 1=B, 2=C */
+    int         node_idx;
+    int         global_state;
+    const char *en_expr;
     const char *op_a_expr;
     const char *op_b_expr;
 } dsp_bind_t;
 
+typedef struct {
+    char op_a5_b[64];
+    char op_a6_b[64];
+    char op_c5_b[64];
+    char op_c6_b[64];
+    char op_c1_d[64];
+    char op_c2_d[64];
+    char op_c3_d[64];
+    char op_c4_d[64];
+} dsp_expr_scratch_t;
+
+static void build_dsp_binds(const dag_cone_t cones[NUM_CONES],
+                            int base_ca, int base_cb, int base_cc,
+                            dsp_expr_scratch_t *sc, dsp_bind_t binds[18]) {
+    const dag_cone_t *ca = &cones[CONE_A];
+    const dag_cone_t *cb = &cones[CONE_B];
+    const dag_cone_t *cc = &cones[CONE_C];
+
+    const char *x_sq_for_a5 = ref_sig(ca, 2, 5, "n_a2_x_sq_c", "n_a2_x_sq_q");
+    const char *x_sq_for_a6 = ref_sig(ca, 2, 6, "n_a2_x_sq_c", "n_a2_x_sq_q");
+    const char *dc_for_c1   = ref_sig(cc, 0, 1, "n_c0_dc_c",   "n_c0_dc_q");
+    const char *dc_for_c2   = ref_sig(cc, 0, 2, "n_c0_dc_c",   "n_c0_dc_q");
+    const char *dc_for_c3   = ref_sig(cc, 0, 3, "n_c0_dc_c",   "n_c0_dc_q");
+    const char *dc_for_c4   = ref_sig(cc, 0, 4, "n_c0_dc_c",   "n_c0_dc_q");
+    const char *dsq_for_c5  = ref_sig(cc, 1, 5, "n_c1_dsq_c",  "n_c1_dsq_q");
+    const char *dsq_for_c6  = ref_sig(cc, 1, 6, "n_c1_dsq_c",  "n_c1_dsq_q");
+
+    snprintf(sc->op_a5_b, sizeof(sc->op_a5_b), "{1'b0, %s[31:0]}", x_sq_for_a5);
+    snprintf(sc->op_a6_b, sizeof(sc->op_a6_b), "{1'b0, %s[63:32]}", x_sq_for_a6);
+    snprintf(sc->op_c5_b, sizeof(sc->op_c5_b), "{1'b0, %s[31:0]}", dsq_for_c5);
+    snprintf(sc->op_c6_b, sizeof(sc->op_c6_b), "{%s[63], %s[63:32]}", dsq_for_c6, dsq_for_c6);
+    snprintf(sc->op_c1_d, sizeof(sc->op_c1_d), "$unsigned(%s)", dc_for_c1);
+    snprintf(sc->op_c2_d, sizeof(sc->op_c2_d), "$unsigned(%s)", dc_for_c2);
+    snprintf(sc->op_c3_d, sizeof(sc->op_c3_d), "$unsigned(%s)", dc_for_c3);
+    snprintf(sc->op_c4_d, sizeof(sc->op_c4_d), "$unsigned(%s)", dc_for_c4);
+
+    const dsp_bind_t tmp[18] = {
+        {0, 0, base_ca + ca->nodes[0].stage, "1'b1",     "{u_gain_q[31], u_gain_q}", "{u_in_q[31], u_in_q}"},
+        {0, 1, base_ca + ca->nodes[1].stage, "1'b1",     "{b1_q[31], b1_q}",         "{x_in_clamped_c[31], x_in_clamped_c}"},
+        {0, 2, base_ca + ca->nodes[2].stage, "b2_nz_c",  "{x_in_clamped_c[31], x_in_clamped_c}", "{x_in_clamped_c[31], x_in_clamped_c}"},
+        {0, 3, base_ca + ca->nodes[3].stage, "1'b1",     "{b2_q[31], b2_q}",         "{x_in_clamped_c[31], x_in_clamped_c}"},
+        {0, 5, base_ca + ca->nodes[5].stage, "1'b1",     "{b2_q[31], b2_q}",         sc->op_a5_b},
+        {0, 6, base_ca + ca->nodes[6].stage, "1'b1",     "{b2_q[31], b2_q}",         sc->op_a6_b},
+
+        {1, 0, base_cb + cb->nodes[0].stage, "1'b1",     "{1'b0, g1_q[31:0]}",       "{1'b0, g1_q[31:0]}"},
+        {1, 1, base_cb + cb->nodes[1].stage, "1'b1",     "{g1_q[63], g1_q[63:32]}",  "{1'b0, g1_q[31:0]}"},
+        {1, 2, base_cb + cb->nodes[2].stage, "1'b1",     "{g1_q[63], g1_q[63:32]}",  "{g1_q[63], g1_q[63:32]}"},
+        {1, 3, base_cb + cb->nodes[3].stage, "1'b1",     "{1'b0, g0_q[31:0]}",       "{r2_q[31], r2_q}"},
+        {1, 4, base_cb + cb->nodes[4].stage, "1'b1",     "{1'b0, g0_q[63:32]}",      "{r2_q[31], r2_q}"},
+        {1, 5, base_cb + cb->nodes[5].stage, "1'b1",     "{g0_q[95], g0_q[95:64]}",  "{r2_q[31], r2_q}"},
+
+        {2, 1, base_cc + cc->nodes[1].stage, "r2_nz_c",  sc->op_c1_d,                sc->op_c1_d},
+        {2, 2, base_cc + cc->nodes[2].stage, "1'b1",     sc->op_c2_d,                "{1'b0, g1_q[31:0]}"},
+        {2, 3, base_cc + cc->nodes[3].stage, "1'b1",     sc->op_c3_d,                "{g1_q[63], g1_q[63:32]}"},
+        {2, 4, base_cc + cc->nodes[4].stage, "1'b1",     "{r2_q[31], r2_q}",         sc->op_c4_d},
+        {2, 5, base_cc + cc->nodes[5].stage, "1'b1",     "{r2_q[31], r2_q}",         sc->op_c5_b},
+        {2, 6, base_cc + cc->nodes[6].stage, "1'b1",     "{r2_q[31], r2_q}",         sc->op_c6_b},
+    };
+    memcpy(binds, tmp, sizeof(tmp));
+}
+
+static uint32_t count_unique_dsp_operands(const dag_cone_t cones[NUM_CONES],
+                                          int dsp_count, const dsp_bind_t binds[18]) {
+    const dag_cone_t *ca = &cones[CONE_A];
+    const dag_cone_t *cb = &cones[CONE_B];
+    const dag_cone_t *cc = &cones[CONE_C];
+    uint32_t total_uniq  = 0U;
+
+    for (int d = 0; d < dsp_count; ++d) {
+        const char *ua[18];
+        const char *ub[18];
+        int na = 0;
+        int nb = 0;
+        for (int b = 0; b < 18; ++b) {
+            const dag_cone_t *ci = (binds[b].cone_id == 0) ? ca : ((binds[b].cone_id == 1) ? cb : cc);
+            if (ci->nodes[binds[b].node_idx].dsp_slot != d) {
+                continue;
+            }
+            bool seen_a = false;
+            for (int k = 0; k < na; ++k) {
+                if (strcmp(ua[k], binds[b].op_a_expr) == 0) {
+                    seen_a = true;
+                    break;
+                }
+            }
+            if (!seen_a) {
+                ua[na++] = binds[b].op_a_expr;
+            }
+            bool seen_b = false;
+            for (int k = 0; k < nb; ++k) {
+                if (strcmp(ub[k], binds[b].op_b_expr) == 0) {
+                    seen_b = true;
+                    break;
+                }
+            }
+            if (!seen_b) {
+                ub[nb++] = binds[b].op_b_expr;
+            }
+        }
+        total_uniq += (uint32_t)(na + nb);
+    }
+    return total_uniq;
+}
+
+static uint32_t count_lane_extra_mux_bits(const reg_alloc_t *ra, int lane_uniq_out[MAX_PHYS_LANES]) {
+    uint32_t mux_bits = 0U;
+    for (int ln = 0; ln < ra->num_lanes; ++ln) {
+        int         u_w[MAX_SCALAR_REQS];
+        const char *u_expr[MAX_SCALAR_REQS];
+        int         num_u = 0;
+        for (int r = 0; r < ra->num_reqs; ++r) {
+            const ssa_scalar_live_t *rq = &ra->reqs[r];
+            if (rq->phys_lane != ln) {
+                continue;
+            }
+            bool seen = false;
+            for (int u = 0; u < num_u; ++u) {
+                if (u_w[u] == rq->bit_width && strcmp(u_expr[u], rq->val_expr) == 0) {
+                    seen = true;
+                    break;
+                }
+            }
+            if (!seen) {
+                u_w[num_u]    = rq->bit_width;
+                u_expr[num_u] = rq->val_expr;
+                ++num_u;
+            }
+        }
+        if (lane_uniq_out != NULL) {
+            lane_uniq_out[ln] = num_u;
+        }
+        if (num_u > 1) {
+            mux_bits += (uint32_t)(num_u - 1) * (uint32_t)ra->lane_width[ln];
+        }
+    }
+    return mux_bits;
+}
+
+static void populate_and_color_cut_registers_greedy(const dag_cone_t cones[NUM_CONES],
+                                                    int base_ca, int base_cb, int base_cd, int base_cc,
+                                                    reg_alloc_t *ra, scalar_map_t *smap) {
+    static char dsp_expr_buf[18][32];
+    memset(ra, 0, sizeof(*ra));
+    memset(smap, -1, sizeof(*smap));
+
+    const dag_cone_t *ca = &cones[CONE_A];
+    const dag_cone_t *cb = &cones[CONE_B];
+    const dag_cone_t *cd = &cones[CONE_D];
+    const dag_cone_t *cc = &cones[CONE_C];
+
+    snprintf(dsp_expr_buf[0],  sizeof(dsp_expr_buf[0]),  "dsp_prod_w[%d]", ca->nodes[0].dsp_slot);
+    snprintf(dsp_expr_buf[1],  sizeof(dsp_expr_buf[1]),  "dsp_prod_w[%d]", ca->nodes[1].dsp_slot);
+    snprintf(dsp_expr_buf[2],  sizeof(dsp_expr_buf[2]),  "dsp_prod_w[%d]", ca->nodes[2].dsp_slot);
+    snprintf(dsp_expr_buf[3],  sizeof(dsp_expr_buf[3]),  "dsp_prod_w[%d]", ca->nodes[3].dsp_slot);
+    snprintf(dsp_expr_buf[4],  sizeof(dsp_expr_buf[4]),  "dsp_prod_w[%d]", ca->nodes[5].dsp_slot);
+    snprintf(dsp_expr_buf[5],  sizeof(dsp_expr_buf[5]),  "dsp_prod_w[%d]", ca->nodes[6].dsp_slot);
+    snprintf(dsp_expr_buf[6],  sizeof(dsp_expr_buf[6]),  "dsp_prod_w[%d]", cb->nodes[0].dsp_slot);
+    snprintf(dsp_expr_buf[7],  sizeof(dsp_expr_buf[7]),  "dsp_prod_w[%d]", cb->nodes[1].dsp_slot);
+    snprintf(dsp_expr_buf[8],  sizeof(dsp_expr_buf[8]),  "dsp_prod_w[%d]", cb->nodes[2].dsp_slot);
+    snprintf(dsp_expr_buf[9],  sizeof(dsp_expr_buf[9]),  "dsp_prod_w[%d]", cb->nodes[3].dsp_slot);
+    snprintf(dsp_expr_buf[10], sizeof(dsp_expr_buf[10]), "dsp_prod_w[%d]", cb->nodes[4].dsp_slot);
+    snprintf(dsp_expr_buf[11], sizeof(dsp_expr_buf[11]), "dsp_prod_w[%d]", cb->nodes[5].dsp_slot);
+    snprintf(dsp_expr_buf[12], sizeof(dsp_expr_buf[12]), "dsp_prod_w[%d]", cc->nodes[1].dsp_slot);
+    snprintf(dsp_expr_buf[13], sizeof(dsp_expr_buf[13]), "dsp_prod_w[%d]", cc->nodes[2].dsp_slot);
+    snprintf(dsp_expr_buf[14], sizeof(dsp_expr_buf[14]), "dsp_prod_w[%d]", cc->nodes[3].dsp_slot);
+    snprintf(dsp_expr_buf[15], sizeof(dsp_expr_buf[15]), "dsp_prod_w[%d]", cc->nodes[4].dsp_slot);
+    snprintf(dsp_expr_buf[16], sizeof(dsp_expr_buf[16]), "dsp_prod_w[%d]", cc->nodes[5].dsp_slot);
+    snprintf(dsp_expr_buf[17], sizeof(dsp_expr_buf[17]), "dsp_prod_w[%d]", cc->nodes[6].dsp_slot);
+
+    /* Cone A scalar cut slices (`a4_b0_eff` is unified directly with `b0_eff64_q`).
+     * All DSP33 cuts bind directly to 66-bit `dsp_prod_w[slot]` so same-slot DSP cuts
+     * across Cones A/B/C share physical lanes with ZERO data-steering muxes, while
+     * zero-operand & regime clock-enables eliminate redundant lane thrashing! */
+    if (ca->nodes[0].needs_reg)
+        smap->a0 = add_scalar_req(ra, "a0_ug_u", base_ca + ca->nodes[0].stage,
+                                  base_ca + max_consumer_stage(ca, 0), 66, "1'b1", dsp_expr_buf[0]);
+    if (ca->nodes[1].needs_reg)
+        smap->a1 = add_scalar_req(ra, "a1_b1_x", base_ca + ca->nodes[1].stage,
+                                  base_ca + max_consumer_stage(ca, 1), 66, "1'b1", dsp_expr_buf[1]);
+    if (ca->nodes[2].needs_reg)
+        smap->a2 = add_scalar_req(ra, "a2_x_sq", base_ca + ca->nodes[2].stage,
+                                  base_ca + max_consumer_stage(ca, 2), 66, "1'b1", dsp_expr_buf[2]);
+    if (ca->nodes[3].needs_reg)
+        smap->a3 = add_scalar_req(ra, "a3_b2_x", base_ca + ca->nodes[3].stage,
+                                  base_ca + max_consumer_stage(ca, 3), 66, "1'b1", dsp_expr_buf[3]);
+    if (ca->nodes[5].needs_reg)
+        smap->a5 = add_scalar_req(ra, "a5_b2xsq_lo", base_ca + ca->nodes[5].stage,
+                                  base_ca + max_consumer_stage(ca, 5), 66, "1'b1", dsp_expr_buf[4]);
+    if (ca->nodes[6].needs_reg)
+        smap->a6 = add_scalar_req(ra, "a6_b2xsq_hi", base_ca + ca->nodes[6].stage,
+                                  base_ca + max_consumer_stage(ca, 6), 66, "1'b1", dsp_expr_buf[5]);
+    if (ca->nodes[7].needs_reg) {
+        int b = base_ca + ca->nodes[7].stage, r = base_ca + max_consumer_stage(ca, 7);
+        smap->a7_lo = add_scalar_req(ra, "a7_g0_op_lo", b, r, 64, "op_mask_q",
+                                     "$unsigned(n_a7_g0_op_c[63:0])");
+        smap->a7_hi = add_scalar_req(ra, "a7_g0_op_hi", b, r, 34, "op_mask_q",
+                                     "$unsigned(n_a7_g0_op_c[97:64])");
+    }
+    if (ca->nodes[8].needs_reg)
+        smap->a8 = add_scalar_req(ra, "a8_g1_op", base_ca + ca->nodes[8].stage,
+                                  base_ca + max_consumer_stage(ca, 8), 64, "op_mask_q",
+                                  "$unsigned(n_a8_g1_op_c)");
+    if (ca->nodes[9].needs_reg) {
+        int b = base_ca + ca->nodes[9].stage, r = base_ca + max_consumer_stage(ca, 9);
+        smap->a9_lo = add_scalar_req(ra, "a9_g0_au_lo", b, r, 64, "~op_mask_q",
+                                     "$unsigned(n_a9_g0_au_c[63:0])");
+        smap->a9_hi = add_scalar_req(ra, "a9_g0_au_hi", b, r, 31, "~op_mask_q",
+                                     "$unsigned(n_a9_g0_au_c[94:64])");
+        smap->a9_j1 = add_scalar_req(ra, "a9_j1_q32", b, r, 64, "~op_mask_q",
+                                     "$unsigned(n_a9_j1_q32_c)");
+    }
+
+    /* Cone B scalar cut slices */
+    if (cb->nodes[0].needs_reg)
+        smap->b0 = add_scalar_req(ra, "b0_g1_ll", base_cb + cb->nodes[0].stage,
+                                  base_cb + max_consumer_stage(cb, 0), 66, "1'b1", dsp_expr_buf[6]);
+    if (cb->nodes[1].needs_reg)
+        smap->b1 = add_scalar_req(ra, "b1_g1_hl", base_cb + cb->nodes[1].stage,
+                                  base_cb + max_consumer_stage(cb, 1), 66, "1'b1", dsp_expr_buf[7]);
+    if (cb->nodes[2].needs_reg)
+        smap->b2 = add_scalar_req(ra, "b2_g1_hh", base_cb + cb->nodes[2].stage,
+                                  base_cb + max_consumer_stage(cb, 2), 66, "1'b1", dsp_expr_buf[8]);
+    if (cb->nodes[3].needs_reg)
+        smap->b3 = add_scalar_req(ra, "b3_g0r2_0", base_cb + cb->nodes[3].stage,
+                                  base_cb + max_consumer_stage(cb, 3), 66, "1'b1", dsp_expr_buf[9]);
+    if (cb->nodes[4].needs_reg)
+        smap->b4 = add_scalar_req(ra, "b4_g0r2_1", base_cb + cb->nodes[4].stage,
+                                  base_cb + max_consumer_stage(cb, 4), 66, "1'b1", dsp_expr_buf[10]);
+    if (cb->nodes[5].needs_reg)
+        smap->b5 = add_scalar_req(ra, "b5_g0r2_2", base_cb + cb->nodes[5].stage,
+                                  base_cb + max_consumer_stage(cb, 5), 66, "1'b1", dsp_expr_buf[11]);
+    if (cb->nodes[6].needs_reg) {
+        int b = base_cb + cb->nodes[6].stage, r = base_cb + max_consumer_stage(cb, 6);
+        smap->b6_lo = add_scalar_req(ra, "b6_g1_sq_lo", b, r, 64, "1'b1",
+                                     "$unsigned(n_b6_g1_sq_c[63:0])");
+        smap->b6_hi = add_scalar_req(ra, "b6_g1_sq_hi", b, r, 64, "1'b1",
+                                     "$unsigned(n_b6_g1_sq_c[127:64])");
+    }
+    if (cb->nodes[7].needs_reg) {
+        int b = base_cb + cb->nodes[7].stage, r = base_cb + max_consumer_stage(cb, 7);
+        smap->b7_lo = add_scalar_req(ra, "b7_g0_r2_lo", b, r, 64, "1'b1",
+                                     "$unsigned(n_b7_g0_r2_c[63:0])");
+        smap->b7_hi = add_scalar_req(ra, "b7_g0_r2_hi", b, r, 64, "1'b1",
+                                     "$unsigned(n_b7_g0_r2_c[127:64])");
+    }
+
+    /* Cone D scalar cut slices (`99b` exact signed num + `66b` `{div_neg, div_den}`) */
+    if (cd->nodes[0].needs_reg) {
+        int b = base_cd + cd->nodes[0].stage, r = base_cd + max_consumer_stage(cd, 0);
+        smap->d0_lo  = add_scalar_req(ra, "d0_div_num_lo", b, r, 64, "1'b1",
+                                      "$unsigned(n_d0_div_num_c[63:0])");
+        smap->d0_hi  = add_scalar_req(ra, "d0_div_num_hi", b, r, 35, "1'b1",
+                                      "$unsigned(n_d0_div_num_c[98:64])");
+        smap->d0_den = add_scalar_req(ra, "d0_div_den_neg", b, r, 66, "1'b1",
+                                      "{n_d0_div_neg_c, n_d0_div_den_c}");
+    }
+
+    /* Cone C scalar cut slices (`ele_mul33_atom` already outputs 0 when `r2 == 0`) */
+    if (cc->nodes[0].needs_reg)
+        smap->c0 = add_scalar_req(ra, "c0_dc", base_cc + cc->nodes[0].stage,
+                                  base_cc + max_consumer_stage(cc, 0), 33, "1'b1",
+                                  "$unsigned(n_c0_dc_c)");
+    if (cc->nodes[1].needs_reg)
+        smap->c1 = add_scalar_req(ra, "c1_dsq", base_cc + cc->nodes[1].stage,
+                                  base_cc + max_consumer_stage(cc, 1), 66, "1'b1", dsp_expr_buf[12]);
+    if (cc->nodes[2].needs_reg)
+        smap->c2 = add_scalar_req(ra, "c2_g1dc_lo", base_cc + cc->nodes[2].stage,
+                                  base_cc + max_consumer_stage(cc, 2), 66, "1'b1", dsp_expr_buf[13]);
+    if (cc->nodes[3].needs_reg)
+        smap->c3 = add_scalar_req(ra, "c3_g1dc_hi", base_cc + cc->nodes[3].stage,
+                                  base_cc + max_consumer_stage(cc, 3), 66, "1'b1", dsp_expr_buf[14]);
+    if (cc->nodes[4].needs_reg)
+        smap->c4 = add_scalar_req(ra, "c4_r2_dc", base_cc + cc->nodes[4].stage,
+                                  base_cc + max_consumer_stage(cc, 4), 66, "1'b1", dsp_expr_buf[15]);
+    if (cc->nodes[5].needs_reg)
+        smap->c5 = add_scalar_req(ra, "c5_r2dsq_lo", base_cc + cc->nodes[5].stage,
+                                  base_cc + max_consumer_stage(cc, 5), 66, "1'b1", dsp_expr_buf[16]);
+    if (cc->nodes[6].needs_reg)
+        smap->c6 = add_scalar_req(ra, "c6_r2dsq_hi", base_cc + cc->nodes[6].stage,
+                                  base_cc + max_consumer_stage(cc, 6), 66, "1'b1", dsp_expr_buf[17]);
+    if (cc->nodes[7].needs_reg) {
+        int b = base_cc + cc->nodes[7].stage, r = base_cc + max_consumer_stage(cc, 7);
+        smap->c7_lo = add_scalar_req(ra, "c7_g0_cand_lo", b, r, 64, "1'b1",
+                                     "$unsigned(n_c7_g0_cand_c[63:0])");
+        smap->c7_hi = add_scalar_req(ra, "c7_g0_cand_hi", b, r, 35, "1'b1",
+                                     "$unsigned(n_c7_g0_cand_c[98:64])");
+    }
+    if (cc->nodes[8].needs_reg) {
+        int b     = base_cc + cc->nodes[8].stage;
+        int r_s9  = base_cc + cc->nodes[9].stage;
+        int r_s10 = base_cc + cc->nodes[10].stage;
+        smap->c8_lo   = add_scalar_req(ra, "c8_g0_post_lo", b, r_s10, 64, "1'b1",
+                                       "$unsigned(n_c8_g0_post_c[63:0])");
+        smap->c8_hi   = add_scalar_req(ra, "c8_g0_post_hi", b, r_s10, 35, "1'b1",
+                                       "$unsigned(n_c8_g0_post_c[98:64])");
+        smap->c8_g1   = add_scalar_req(ra, "c8_g1_post", b, r_s9, 64, "1'b1",
+                                       "$unsigned(n_c8_g1_post_c)");
+        smap->c8_xpdt = add_scalar_req(ra, "c8_xp_dt", b, r_s10, 64, "1'b1",
+                                       "{$unsigned(n_c8_xp_c), n_c8_dt_res_c[31:0]}");
+    }
+    if (cc->nodes[9].needs_reg) {
+        int b = base_cc + cc->nodes[9].stage, r = base_cc + cc->nodes[10].stage;
+        smap->c9_j0  = add_scalar_req(ra, "c9_j0_next", b, r, 64, "1'b1",
+                                      "n_c9_j0_next_c");
+        smap->c9_j1  = add_scalar_req(ra, "c9_j1_next", b, r, 64, "1'b1",
+                                      "n_c9_j1_next_c");
+        smap->c9_sub = add_scalar_req(ra, "c9_sub_next", b, r, 64, "1'b1",
+                                      "n_c9_sub_next_c");
+    }
+
+    /* Seed Chordal Interval-Graph Coloring (Linear Scan sorted by birth_state):
+     * Synchronous non-strict reuse `last_read_state <= birth_state`. */
+    int order[MAX_SCALAR_REQS];
+    for (int i = 0; i < ra->num_reqs; ++i) {
+        order[i] = i;
+    }
+    for (int i = 0; i < ra->num_reqs; ++i) {
+        for (int j = i + 1; j < ra->num_reqs; ++j) {
+            const ssa_scalar_live_t *ri = &ra->reqs[order[i]];
+            const ssa_scalar_live_t *rj = &ra->reqs[order[j]];
+            bool swap_ij = false;
+            if (rj->birth_state < ri->birth_state) {
+                swap_ij = true;
+            } else if (rj->birth_state == ri->birth_state && rj->bit_width > ri->bit_width) {
+                swap_ij = true;
+            } else if (rj->birth_state == ri->birth_state && rj->bit_width == ri->bit_width &&
+                       rj->last_read_state < ri->last_read_state) {
+                swap_ij = true;
+            }
+            if (swap_ij) {
+                int tmp  = order[i];
+                order[i] = order[j];
+                order[j] = tmp;
+            }
+        }
+    }
+
+    int lane_free_at[MAX_PHYS_LANES];
+    memset(lane_free_at, 0, sizeof(lane_free_at));
+
+    for (int k = 0; k < ra->num_reqs; ++k) {
+        ssa_scalar_live_t *r = &ra->reqs[order[k]];
+        int best_lane = -1;
+        for (int ln = 0; ln < ra->num_lanes; ++ln) {
+            if (lane_free_at[ln] > r->birth_state) {
+                continue;
+            }
+            bool same_expr = false;
+            for (int p = 0; p < k; ++p) {
+                const ssa_scalar_live_t *pr = &ra->reqs[order[p]];
+                if (pr->phys_lane == ln && pr->bit_width == r->bit_width &&
+                    strcmp(pr->val_expr, r->val_expr) == 0) {
+                    same_expr = true;
+                    break;
+                }
+            }
+            if (same_expr) {
+                best_lane = ln;
+                break;
+            }
+        }
+        if (best_lane < 0) {
+            for (int ln = 0; ln < ra->num_lanes; ++ln) {
+                if (lane_free_at[ln] > r->birth_state || ra->lane_width[ln] < r->bit_width) {
+                    continue;
+                }
+                const char *u0 = NULL;
+                int uniq = 0;
+                bool is_dsp0 = false;
+                for (int p = 0; p < k; ++p) {
+                    const ssa_scalar_live_t *pr = &ra->reqs[order[p]];
+                    if (pr->phys_lane != ln) continue;
+                    if (u0 == NULL) {
+                        u0 = pr->val_expr;
+                        uniq = 1;
+                        is_dsp0 = (strncmp(u0, "dsp_prod_w[", 11) == 0);
+                    } else if (strcmp(u0, pr->val_expr) != 0) {
+                        uniq++;
+                    }
+                }
+                if (!(uniq == 1 && is_dsp0)) {
+                    best_lane = ln;
+                    break;
+                }
+            }
+        }
+        if (best_lane < 0) {
+            for (int ln = 0; ln < ra->num_lanes; ++ln) {
+                if (lane_free_at[ln] <= r->birth_state && ra->lane_width[ln] >= r->bit_width) {
+                    best_lane = ln;
+                    break;
+                }
+            }
+        }
+        if (best_lane < 0) {
+            for (int ln = 0; ln < ra->num_lanes; ++ln) {
+                if (lane_free_at[ln] <= r->birth_state) {
+                    best_lane = ln;
+                    break;
+                }
+            }
+        }
+        if (best_lane < 0) {
+            if (ra->num_lanes >= MAX_PHYS_LANES) {
+                fprintf(stderr, "FATAL: physical lane pool overflow!\n");
+                exit(1);
+            }
+            best_lane = ra->num_lanes++;
+        }
+        r->phys_lane            = best_lane;
+        lane_free_at[best_lane] = r->last_read_state;
+        if (r->bit_width > ra->lane_width[best_lane]) {
+            ra->lane_width[best_lane] = r->bit_width;
+        }
+        ra->lane_writers[best_lane]++;
+    }
+
+    ra->shared_cut_bits = 0;
+    for (int ln = 0; ln < ra->num_lanes; ++ln) {
+        ra->shared_cut_bits += ra->lane_width[ln];
+    }
+}
+
+/* ============================================================================
+ * Pass 1B: `SEARU_SOLVE_INLINE` DSP Operand-Affinity & Cut-Mux Binding
+ * ============================================================================ */
+
+typedef struct {
+    int cone_idx;
+    int stage;
+    int num_ops;
+    int node_indices[MAX_DSPS];
+} dsp_stage_group_t;
+
+static inline void apply_dsp_group_permutations(dag_cone_t cones[NUM_CONES],
+                                                const dsp_stage_group_t *groups,
+                                                int num_groups,
+                                                int dsp_count,
+                                                const int *pair_p,
+                                                const int *pair_q,
+                                                int pairs_per_grp,
+                                                const uint64_t canvas[4]) {
+    for (int g = 0; g < num_groups; ++g) {
+        int slots[MAX_DSPS];
+        for (int d = 0; d < dsp_count; ++d) {
+            slots[d] = d;
+        }
+        for (int t = 0; t < pairs_per_grp; ++t) {
+            uint32_t v = (uint32_t)(g * pairs_per_grp + t);
+            if (((canvas[v >> 6U] >> (v & 63U)) & UINT64_C(1)) != UINT64_C(0)) {
+                int p    = pair_p[t];
+                int q    = pair_q[t];
+                int tmp  = slots[p];
+                slots[p] = slots[q];
+                slots[q] = tmp;
+            }
+        }
+        dag_cone_t *cn = &cones[groups[g].cone_idx];
+        for (int k = 0; k < groups[g].num_ops; ++k) {
+            cn->nodes[groups[g].node_indices[k]].dsp_slot = slots[k];
+        }
+    }
+}
+
+static inline uint64_t eval_p1_dsp_cand(dag_cone_t cones[NUM_CONES],
+                                        const dsp_stage_group_t *groups,
+                                        int num_groups,
+                                        int dsp_count,
+                                        const int *pair_p,
+                                        const int *pair_q,
+                                        int pairs_per_grp,
+                                        int base_ca, int base_cb, int base_cd, int base_cc,
+                                        const dsp_bind_t binds[18],
+                                        const uint64_t kan_pin[4],
+                                        const uint64_t cand[4],
+                                        uint64_t frust[4]) {
+    apply_dsp_group_permutations(cones, groups, num_groups, dsp_count,
+                                 pair_p, pair_q, pairs_per_grp, cand);
+
+    reg_alloc_t  ra_tmp;
+    scalar_map_t smap_tmp;
+    int          lane_uniq[MAX_PHYS_LANES];
+    memset(lane_uniq, 0, sizeof(lane_uniq));
+
+    populate_and_color_cut_registers_greedy(cones, base_ca, base_cb, base_cd, base_cc,
+                                            &ra_tmp, &smap_tmp);
+    uint32_t uniq_ops = count_unique_dsp_operands(cones, dsp_count, binds);
+    uint32_t mux_bits = count_lane_extra_mux_bits(&ra_tmp, lane_uniq);
+
+    /* Frustration compass: mark stage groups whose DSP ops either have an operand
+     * appearing on another DSP slot or feed a multi-writer shared cut lane. */
+    const dag_cone_t *ca = &cones[CONE_A];
+    const dag_cone_t *cb = &cones[CONE_B];
+    const dag_cone_t *cc = &cones[CONE_C];
+    for (int g = 0; g < num_groups; ++g) {
+        bool grp_frust = false;
+        int  c_idx     = groups[g].cone_idx;
+        int  bind_cid  = (c_idx == CONE_A) ? 0 : ((c_idx == CONE_B) ? 1 : 2);
+        for (int b = 0; b < 18 && !grp_frust; ++b) {
+            if (binds[b].cone_id != bind_cid) {
+                continue;
+            }
+            const dag_cone_t *ci = &cones[c_idx];
+            if (ci->nodes[binds[b].node_idx].stage != groups[g].stage) {
+                continue;
+            }
+            int sl_b = ci->nodes[binds[b].node_idx].dsp_slot;
+            for (int j = 0; j < 18; ++j) {
+                if (j == b) continue;
+                const dag_cone_t *cj = (binds[j].cone_id == 0) ? ca : ((binds[j].cone_id == 1) ? cb : cc);
+                int sl_j = cj->nodes[binds[j].node_idx].dsp_slot;
+                if (sl_j != sl_b &&
+                    (strcmp(binds[b].op_a_expr, binds[j].op_a_expr) == 0 ||
+                     strcmp(binds[b].op_b_expr, binds[j].op_b_expr) == 0)) {
+                    grp_frust = true;
+                    break;
+                }
+            }
+            if (!grp_frust && ci->nodes[binds[b].node_idx].needs_reg) {
+                for (int r = 0; r < ra_tmp.num_reqs; ++r) {
+                    if (ra_tmp.reqs[r].birth_state == binds[b].global_state &&
+                        lane_uniq[ra_tmp.reqs[r].phys_lane] > 1) {
+                        grp_frust = true;
+                        break;
+                    }
+                }
+            }
+        }
+        if (grp_frust) {
+            for (int t = 0; t < pairs_per_grp; ++t) {
+                uint32_t v = (uint32_t)(g * pairs_per_grp + t);
+                uint32_t w = v >> 6U;
+                frust[w] |= (UINT64_C(1) << (v & 63U)) & ~kan_pin[w];
+            }
+        }
+    }
+
+    return ((uint64_t)ra_tmp.shared_cut_bits * UINT64_C(16)) +
+           ((uint64_t)uniq_ops * UINT64_C(33)) +
+           (uint64_t)mux_bits;
+}
+
+static void optimize_dsp_slots_searu(dag_cone_t cones[NUM_CONES],
+                                     int dsp_count, int max_depth,
+                                     int base_ca, int base_cb, int base_cd, int base_cc,
+                                     searu_hls_stats_t *stats) {
+    dsp_expr_scratch_t sc;
+    dsp_bind_t         binds[18];
+    build_dsp_binds(cones, base_ca, base_cb, base_cc, &sc, binds);
+
+    reg_alloc_t  ra_init;
+    scalar_map_t smap_init;
+    populate_and_color_cut_registers_greedy(cones, base_ca, base_cb, base_cd, base_cc,
+                                            &ra_init, &smap_init);
+    stats->dsp_uniq_ops_init = count_unique_dsp_operands(cones, dsp_count, binds);
+    uint32_t init_mux        = count_lane_extra_mux_bits(&ra_init, NULL);
+    stats->p1_energy_init    = ((uint64_t)ra_init.shared_cut_bits * UINT64_C(16)) +
+                               ((uint64_t)stats->dsp_uniq_ops_init * UINT64_C(33)) +
+                               (uint64_t)init_mux;
+
+    if (dsp_count <= 1) {
+        stats->dsp_uniq_ops_best = stats->dsp_uniq_ops_init;
+        stats->p1_energy_best    = stats->p1_energy_init;
+        return;
+    }
+
+    int pair_p[32];
+    int pair_q[32];
+    int pairs_per_grp = 0;
+    for (int p = 0; p < dsp_count; ++p) {
+        for (int q = p + 1; q < dsp_count; ++q) {
+            pair_p[pairs_per_grp] = p;
+            pair_q[pairs_per_grp] = q;
+            ++pairs_per_grp;
+        }
+    }
+    for (int p = 0; p + 1 < dsp_count; ++p) {
+        pair_p[pairs_per_grp] = p;
+        pair_q[pairs_per_grp] = p + 1;
+        ++pairs_per_grp;
+    }
+
+    dsp_stage_group_t groups[24];
+    int               num_groups = 0;
+    const int         cone_order[3] = {CONE_A, CONE_B, CONE_C};
+    for (int ci = 0; ci < 3; ++ci) {
+        int               c_idx = cone_order[ci];
+        const dag_cone_t *cn    = &cones[c_idx];
+        for (int s = 0; s < cn->num_stages; ++s) {
+            if ((num_groups + 1) * pairs_per_grp > (int)SEARU_CANVAS_BITS || num_groups >= 24) {
+                break;
+            }
+            dsp_stage_group_t grp;
+            memset(&grp, 0, sizeof(grp));
+            grp.cone_idx = c_idx;
+            grp.stage    = s;
+            for (int n = 0; n < cn->num_nodes; ++n) {
+                if (cn->nodes[n].phase == PHASE_DSP33 && cn->nodes[n].stage == s) {
+                    grp.node_indices[grp.num_ops++] = n;
+                }
+            }
+            if (grp.num_ops > 0) {
+                groups[num_groups++] = grp;
+            }
+        }
+    }
+
+    uint64_t init_canvas[4] = {UINT64_C(0), UINT64_C(0), UINT64_C(0), UINT64_C(0)};
+    uint64_t kan_pin[4]     = {UINT64_C(0), UINT64_C(0), UINT64_C(0), UINT64_C(0)};
+
+    /* Kan-pin `b0_g1_ll -> slot 0` and `b4_g0r2_1 -> slot 1` so exact cross-limb
+     * verification anchors stay locked while remaining DSP slots permute freely. */
+    for (int g = 0; g < num_groups; ++g) {
+        if (groups[g].cone_idx != CONE_B) {
+            continue;
+        }
+        for (int k = 0; k < groups[g].num_ops; ++k) {
+            int nd_idx   = groups[g].node_indices[k];
+            int pin_slot = -1;
+            if (nd_idx == 0 && k == 0) {
+                pin_slot = 0;
+            } else if (nd_idx == 4 && k == 1 && dsp_count >= 2) {
+                pin_slot = 1;
+            }
+            if (pin_slot >= 0) {
+                for (int t = 0; t < pairs_per_grp; ++t) {
+                    if (pair_p[t] == pin_slot || pair_q[t] == pin_slot) {
+                        uint32_t v = (uint32_t)(g * pairs_per_grp + t);
+                        kan_pin[v >> 6U] |= UINT64_C(1) << (v & 63U);
+                    }
+                }
+            }
+        }
+    }
+
+    uint32_t     nvars = (uint32_t)(num_groups * pairs_per_grp);
+    uint64_t     seed  = UINT64_C(0x5EA20D59) ^ ((uint64_t)dsp_count << 16U) ^ (uint64_t)max_depth;
+    searu_result res;
+    SEARU_SOLVE_INLINE(&res, nvars, init_canvas, kan_pin, seed, 16384U, cand, frust, energy, {
+        energy = eval_p1_dsp_cand(cones, groups, num_groups, dsp_count,
+                                  pair_p, pair_q, pairs_per_grp,
+                                  base_ca, base_cb, base_cd, base_cc,
+                                  binds, kan_pin, cand, frust);
+    });
+
+    apply_dsp_group_permutations(cones, groups, num_groups, dsp_count,
+                                 pair_p, pair_q, pairs_per_grp, res.canvas);
+    stats->dsp_uniq_ops_best = count_unique_dsp_operands(cones, dsp_count, binds);
+    stats->p1_iters          = res.iterations_run;
+    stats->p1_epiphanies     = res.epiphanies;
+    stats->p1_swans          = res.black_swans;
+    stats->p1_energy_best    = res.best_energy;
+}
+
+/* ============================================================================
+ * Pass 2B: `SEARU_SOLVE_INLINE` Heterogeneous-Width + Mux-Affinity Allocation
+ * ============================================================================ */
+
+static inline uint32_t extract_req_lane_code(const uint64_t canvas[4],
+                                             int req_idx, int bits_per_req) {
+    uint32_t code = 0U;
+    for (int b = 0; b < bits_per_req; ++b) {
+        uint32_t v   = (uint32_t)(req_idx * bits_per_req + b);
+        uint32_t bit = (uint32_t)((canvas[v >> 6U] >> (v & 63U)) & UINT64_C(1));
+        code |= bit << (uint32_t)b;
+    }
+    return code;
+}
+
+static inline void set_req_frust_bits(uint64_t frust[4], int req_idx, int bits_per_req) {
+    for (int b = 0; b < bits_per_req; ++b) {
+        uint32_t v = (uint32_t)(req_idx * bits_per_req + b);
+        frust[v >> 6U] |= UINT64_C(1) << (v & 63U);
+    }
+}
+
+static inline uint64_t eval_p2_reg_cand(const reg_alloc_t *ra,
+                                        int pool_lanes,
+                                        int bits_per_req,
+                                        uint64_t overlap_penalty_floor,
+                                        const uint64_t cand[4],
+                                        uint64_t frust[4]) {
+    int  cand_lane[MAX_SCALAR_REQS];
+    bool req_ovf[MAX_SCALAR_REQS];
+    int  lane_max_w[MAX_PHYS_LANES];
+    int  lane_min_w[MAX_PHYS_LANES];
+    int  lane_num_u[MAX_PHYS_LANES];
+
+    memset(req_ovf, 0, sizeof(req_ovf));
+    for (int ln = 0; ln < pool_lanes; ++ln) {
+        lane_max_w[ln] = 0;
+        lane_min_w[ln] = 1024;
+        lane_num_u[ln] = 0;
+    }
+
+    for (int r = 0; r < ra->num_reqs; ++r) {
+        uint32_t code = extract_req_lane_code(cand, r, bits_per_req);
+        int      ln   = (int)(code % (uint32_t)pool_lanes);
+        cand_lane[r]  = ln;
+        int w         = ra->reqs[r].bit_width;
+        if (w > lane_max_w[ln]) lane_max_w[ln] = w;
+        if (w < lane_min_w[ln]) lane_min_w[ln] = w;
+    }
+
+    uint32_t overlaps = 0U;
+    for (int i = 0; i < ra->num_reqs; ++i) {
+        for (int j = i + 1; j < ra->num_reqs; ++j) {
+            if (cand_lane[i] == cand_lane[j]) {
+                bool disjoint = (ra->reqs[i].last_read_state <= ra->reqs[j].birth_state) ||
+                                (ra->reqs[j].last_read_state <= ra->reqs[i].birth_state);
+                if (!disjoint) {
+                    ++overlaps;
+                    req_ovf[i] = true;
+                    req_ovf[j] = true;
+                }
+            }
+        }
+    }
+
+    uint64_t total_lane_bits = UINT64_C(0);
+    uint64_t extra_mux_bits  = UINT64_C(0);
+    for (int ln = 0; ln < pool_lanes; ++ln) {
+        if (lane_max_w[ln] == 0) {
+            continue;
+        }
+        total_lane_bits += (uint64_t)lane_max_w[ln];
+        int         u_w[MAX_SCALAR_REQS];
+        const char *u_expr[MAX_SCALAR_REQS];
+        int         num_u = 0;
+        for (int r = 0; r < ra->num_reqs; ++r) {
+            if (cand_lane[r] != ln) continue;
+            bool seen = false;
+            for (int u = 0; u < num_u; ++u) {
+                if (u_w[u] == ra->reqs[r].bit_width &&
+                    strcmp(u_expr[u], ra->reqs[r].val_expr) == 0) {
+                    seen = true;
+                    break;
+                }
+            }
+            if (!seen) {
+                u_w[num_u]    = ra->reqs[r].bit_width;
+                u_expr[num_u] = ra->reqs[r].val_expr;
+                ++num_u;
+            }
+        }
+        lane_num_u[ln] = num_u;
+        if (num_u > 1) {
+            extra_mux_bits += (uint64_t)(num_u - 1) * (uint64_t)lane_max_w[ln];
+        }
+    }
+
+    if (overlaps > 0U) {
+        for (int r = 0; r < ra->num_reqs; ++r) {
+            if (req_ovf[r]) {
+                set_req_frust_bits(frust, r, bits_per_req);
+            }
+        }
+        return overlap_penalty_floor +
+               ((uint64_t)overlaps * UINT64_C(4096)) +
+               (total_lane_bits * UINT64_C(16)) +
+               extra_mux_bits;
+    }
+
+    for (int r = 0; r < ra->num_reqs; ++r) {
+        int ln = cand_lane[r];
+        if (lane_min_w[ln] < lane_max_w[ln] || lane_num_u[ln] > 1) {
+            set_req_frust_bits(frust, r, bits_per_req);
+        }
+    }
+    return (total_lane_bits * UINT64_C(16)) + extra_mux_bits;
+}
+
+static void allocate_shared_cut_registers(const dag_cone_t cones[NUM_CONES],
+                                          int dsp_count, int max_depth,
+                                          int base_ca, int base_cb, int base_cd, int base_cc,
+                                          reg_alloc_t *ra, scalar_map_t *smap,
+                                          searu_hls_stats_t *stats) {
+    populate_and_color_cut_registers_greedy(cones, base_ca, base_cb, base_cd, base_cc, ra, smap);
+
+    stats->cut_bits_init      = ra->shared_cut_bits;
+    stats->lane_mux_bits_init = count_lane_extra_mux_bits(ra, NULL);
+    stats->p2_energy_init     = ((uint64_t)ra->shared_cut_bits * UINT64_C(16)) +
+                                (uint64_t)stats->lane_mux_bits_init;
+    stats->p2_energy_best     = stats->p2_energy_init;
+
+    const int pool_lanes = ra->num_lanes;
+    if (ra->num_reqs > 0 && pool_lanes >= 2) {
+        int bits_per_req = 1;
+        while ((1 << bits_per_req) < pool_lanes) {
+            ++bits_per_req;
+        }
+        if (ra->num_reqs * bits_per_req <= (int)SEARU_CANVAS_BITS) {
+            uint64_t init_canvas[4] = {UINT64_C(0), UINT64_C(0), UINT64_C(0), UINT64_C(0)};
+            for (int r = 0; r < ra->num_reqs; ++r) {
+                uint32_t code = (uint32_t)ra->reqs[r].phys_lane;
+                for (int b = 0; b < bits_per_req; ++b) {
+                    if (((code >> (uint32_t)b) & 1U) != 0U) {
+                        uint32_t v = (uint32_t)(r * bits_per_req + b);
+                        init_canvas[v >> 6U] |= UINT64_C(1) << (v & 63U);
+                    }
+                }
+            }
+
+            uint64_t     overlap_floor = stats->p2_energy_init + UINT64_C(65536);
+            uint32_t     nvars         = (uint32_t)(ra->num_reqs * bits_per_req);
+            uint64_t     seed          = UINT64_C(0x5EA20C07) ^
+                                         ((uint64_t)dsp_count << 16U) ^
+                                         (uint64_t)max_depth;
+            searu_result res;
+            SEARU_SOLVE_INLINE(&res, nvars, init_canvas, NULL, seed, 16384U,
+                               cand, frust, energy, {
+                energy = eval_p2_reg_cand(ra, pool_lanes, bits_per_req,
+                                          overlap_floor, cand, frust);
+            });
+
+            /* Decode winning canvas and compact active physical lanes */
+            int raw_lane[MAX_SCALAR_REQS];
+            int lane_remap[MAX_PHYS_LANES];
+            memset(lane_remap, -1, sizeof(lane_remap));
+            int compact_lanes = 0;
+
+            for (int r = 0; r < ra->num_reqs; ++r) {
+                uint32_t code = extract_req_lane_code(res.canvas, r, bits_per_req);
+                raw_lane[r]   = (int)(code % (uint32_t)pool_lanes);
+            }
+            for (int ln = 0; ln < pool_lanes; ++ln) {
+                bool used = false;
+                for (int r = 0; r < ra->num_reqs; ++r) {
+                    if (raw_lane[r] == ln) {
+                        used = true;
+                        break;
+                    }
+                }
+                if (used) {
+                    lane_remap[ln] = compact_lanes++;
+                }
+            }
+
+            ra->num_lanes = compact_lanes;
+            memset(ra->lane_width, 0, sizeof(ra->lane_width));
+            memset(ra->lane_writers, 0, sizeof(ra->lane_writers));
+            for (int r = 0; r < ra->num_reqs; ++r) {
+                int cl                  = lane_remap[raw_lane[r]];
+                ra->reqs[r].phys_lane   = cl;
+                ra->lane_writers[cl]++;
+                if (ra->reqs[r].bit_width > ra->lane_width[cl]) {
+                    ra->lane_width[cl] = ra->reqs[r].bit_width;
+                }
+            }
+
+            stats->p2_iters       = res.iterations_run;
+            stats->p2_epiphanies  = res.epiphanies;
+            stats->p2_swans       = res.black_swans;
+            stats->p2_energy_best = res.best_energy;
+        }
+    }
+
+    /* Post-allocation O(N^2) formal disjointness proof across all assigned intervals */
+    for (int i = 0; i < ra->num_reqs; ++i) {
+        for (int j = i + 1; j < ra->num_reqs; ++j) {
+            const ssa_scalar_live_t *a = &ra->reqs[i];
+            const ssa_scalar_live_t *b = &ra->reqs[j];
+            if (a->phys_lane == b->phys_lane) {
+                bool disjoint = (a->last_read_state <= b->birth_state) ||
+                                (b->last_read_state <= a->birth_state);
+                if (!disjoint) {
+                    fprintf(stderr, "FATAL: live-range overlap on sh_lane%d: %s [%d,%d] vs %s [%d,%d]\n",
+                            a->phys_lane, a->tag, a->birth_state, a->last_read_state,
+                            b->tag, b->birth_state, b->last_read_state);
+                    exit(1);
+                }
+            }
+        }
+    }
+
+    ra->shared_cut_bits = 0;
+    for (int ln = 0; ln < ra->num_lanes; ++ln) {
+        ra->shared_cut_bits += ra->lane_width[ln];
+    }
+    stats->cut_bits_best      = ra->shared_cut_bits;
+    stats->lane_mux_bits_best = count_lane_extra_mux_bits(ra, NULL);
+}
+
+static void emit_lane_rhs(FILE *fp, int lane_w, int val_w, const char *val_expr) {
+    if (lane_w == val_w) {
+        fprintf(fp, "%s", val_expr);
+    } else {
+        fprintf(fp, "{%d'd0, %s}", lane_w - val_w, val_expr);
+    }
+}
+
 static void emit_sv(FILE *fp, int dsp_count, int max_depth, int k_rad, uint32_t rad_epochs,
-                    const dag_cone_t *ca, const dag_cone_t *cb,
-                    const dag_cone_t *cd, const dag_cone_t *cc) {
-    /* Assign sequential FSM states cleanly:
-     *   0                               : ST_IDLE
-     *   1 .. ca->num_stages             : ST_CA_0 .. ST_CA_{na-1}
-     *   base_cb .. base_cb + nb - 1     : ST_CB_0 .. ST_CB_{nb-1}
-     *   st_isqrt                        : ST_ISQRT_LOOP
-     *   base_cd .. base_cd + nd - 1     : ST_CD_0 .. ST_CD_{nd-1}
-     *   st_udiv                         : ST_UDIV_LOOP
-     *   base_cc .. base_cc + nc - 1     : ST_CC_0 .. ST_CC_{nc-1}
-     *     (Tickless `!active` fast path sets `fast_path_q=1` and jumps directly
-     *      from Cone A's final stage to `base_cc + cc->nodes[9].stage`, sharing
-     *      Cone C's rounding & Kan commit hardware with 0 duplicate gates.)
-     */
+                    const dag_cone_t cones[NUM_CONES],
+                    const reg_alloc_t *ra, const scalar_map_t *smap,
+                    const searu_hls_stats_t *hls) {
+    const dag_cone_t *ca = &cones[CONE_A];
+    const dag_cone_t *cb = &cones[CONE_B];
+    const dag_cone_t *cd = &cones[CONE_D];
+    const dag_cone_t *cc = &cones[CONE_C];
+
     const int st_idle   = 0;
     const int base_ca   = 1;
     const int base_cb   = base_ca + ca->num_stages;
@@ -440,19 +1474,22 @@ static void emit_sv(FILE *fp, int dsp_count, int max_depth, int k_rad, uint32_t 
         ++iter_w;
     }
 
-    const int quad_cycles = ca->num_stages + cb->num_stages + rad_iters +
-                            cd->num_stages + rad_iters + cc->num_stages;
-    const int lin_cycles  = ca->num_stages + cd->num_stages + rad_iters + cc->num_stages;
-    const int idle_cycles = ca->num_stages + (cc->num_stages - cc->nodes[9].stage);
-    const int total_cut_bits = ca->cut_reg_bits + cb->cut_reg_bits +
-                               cd->cut_reg_bits + cc->cut_reg_bits;
+    const int quad_cycles      = ca->num_stages + cb->num_stages + rad_iters +
+                                 cd->num_stages + rad_iters + cc->num_stages;
+    const int lin_cycles       = ca->num_stages + cd->num_stages + rad_iters + cc->num_stages;
+    const int idle_cycles      = ca->num_stages + (cc->num_stages - cc->nodes[9].stage);
+    const int virtual_cut_bits = ca->cut_reg_bits + cb->cut_reg_bits +
+                                 cd->cut_reg_bits + cc->cut_reg_bits;
+    const int shared_cut_bits  = ra->shared_cut_bits;
+    const int base_dff_bits    = st_w + iter_w + 1 + 64 + 98 + 64 + 1 + 1 + 64 + 64 + 128;
+    const int core_dff_bits    = base_dff_bits + shared_cut_bits;
 
     fprintf(fp, "// SPDX-License-Identifier: MIT\n");
-    fprintf(fp, "// AUTO-GENERATED BY `tools/ele_bootstrap.c` VIA `FLOW v%s` (`flow_step_atlas`)\n",
+    fprintf(fp, "// AUTO-GENERATED BY `tools/ele_bootstrap.c` VIA `SEARU x FLOW v%s` (`SEARU_SOLVE_INLINE` + `flow_step_atlas`)\n",
             FLOW_VERSION_STRING);
     fprintf(fp, "// DO NOT HAND-EDIT — Re-synthesize via `./build/ele_bootstrap`.\n");
     fprintf(fp, "//\n");
-    fprintf(fp, "// Physical Pareto Constraints & Converged FLOW 2-Jet Lattice Schedule:\n");
+    fprintf(fp, "// Symbiotic SEARU x FLOW 2-Jet HLS Schedule, DSP Operand Affinity & Register Sharing:\n");
     fprintf(fp, "//   * dsp_count (`ele_mul33_atom` instances) : %d\n", dsp_count);
     fprintf(fp, "//   * max_depth (target gate lvls / cycle)   : %d\n", max_depth);
     fprintf(fp, "//   * k_rad (`ele_rad2_step_atom` chain)     : %d (%d cyc/loop, %u FLOW epochs)\n",
@@ -461,7 +1498,11 @@ static void emit_sv(FILE *fp, int dsp_count, int max_depth, int k_rad, uint32_t 
             ca->num_stages, cb->num_stages, cd->num_stages, cc->num_stages, num_st);
     fprintf(fp, "//   * FLOW lattice sweeps (A/B/D/C)          : %d / %d / %d / %d (100%% CONVERGED)\n",
             ca->sweeps_taken, cb->sweeps_taken, cd->sweeps_taken, cc->sweeps_taken);
-    fprintf(fp, "//   * Inserted pipeline-cut DFF bits         : %d bits\n", total_cut_bits);
+    fprintf(fp, "//   * SEARU Pass-1 DSP operand fan-in        : %u -> %u unique 33b ops (%u iters, %u epiphanies)\n",
+            hls->dsp_uniq_ops_init, hls->dsp_uniq_ops_best, hls->p1_iters, hls->p1_epiphanies);
+    fprintf(fp, "//   * SEARU Pass-2 cut DFFs & lane mux bits  : %d -> %d cut bits (%d lanes), %u -> %u mux bits (%u iters, %u epiphanies)\n",
+            virtual_cut_bits, shared_cut_bits, ra->num_lanes,
+            hls->lane_mux_bits_init, hls->lane_mux_bits_best, hls->p2_iters, hls->p2_epiphanies);
     fprintf(fp, "//   * Step latency (quad / linear / idle)    : %d / %d / %d cycles\n",
             quad_cycles, lin_cycles, idle_cycles);
     fprintf(fp, "//   * Top-level physical pin count           : ele_flow_core=141, ele_flow_atlas_top=157 (<160)\n\n");
@@ -484,14 +1525,36 @@ static void emit_sv(FILE *fp, int dsp_count, int max_depth, int k_rad, uint32_t 
     fprintf(fp, "    input  logic [2:0]  rd_idx_i,\n");
     fprintf(fp, "    output logic [63:0] rd_data_o\n");
     fprintf(fp, ");\n");
-    /* Pure branchless combinational helpers matching `flow.h` */
+    fprintf(fp, "    /* verilator lint_off UNUSEDPARAM */\n");
+    fprintf(fp, "    localparam int PROFILE_DSP_COUNT = %d;\n", dsp_count);
+    fprintf(fp, "    localparam int PROFILE_MAX_DEPTH = %d;\n", max_depth);
+    fprintf(fp, "    localparam int VIRTUAL_CUT_BITS  = %d;\n", virtual_cut_bits);
+    fprintf(fp, "    localparam int SHARED_CUT_BITS   = %d;\n", shared_cut_bits);
+    fprintf(fp, "    localparam int CORE_DFF_BITS     = %d;\n", core_dff_bits);
+    fprintf(fp, "    /* verilator lint_on UNUSEDPARAM */\n\n");
+
+    /* O(log W) carry-free power-of-two symmetric range trees & helpers matching `flow.h` */
     fprintf(fp, "    function automatic logic signed [31:0] clamp_sym64_to_32(input logic [63:0] raw);\n");
-    fprintf(fp, "        logic signed [63:0] sv;\n");
+    fprintf(fp, "        logic ovf_pos, ovf_neg;\n");
     fprintf(fp, "        begin\n");
-    fprintf(fp, "            sv = $signed(raw);\n");
-    fprintf(fp, "            if (sv > 64'sh0000_0000_7FFF_FFFF)      clamp_sym64_to_32 = 32'sh7FFF_FFFF;\n");
-    fprintf(fp, "            else if (sv < -64'sh0000_0000_7FFF_FFFF) clamp_sym64_to_32 = -32'sh7FFF_FFFF;\n");
-    fprintf(fp, "            else                                    clamp_sym64_to_32 = raw[31:0];\n");
+    fprintf(fp, "            ovf_pos = (~raw[63]) & (|raw[62:31]);\n");
+    fprintf(fp, "            ovf_neg = raw[63] & ((~(&raw[62:31])) | (raw[30:0] == 31'd0));\n");
+    fprintf(fp, "            if (ovf_pos)      clamp_sym64_to_32 = 32'sh7FFF_FFFF;\n");
+    fprintf(fp, "            else if (ovf_neg) clamp_sym64_to_32 = -32'sh7FFF_FFFF;\n");
+    fprintf(fp, "            else              clamp_sym64_to_32 = $signed(raw[31:0]);\n");
+    fprintf(fp, "        end\n");
+    fprintf(fp, "    endfunction\n\n");
+
+    fprintf(fp, "    function automatic logic signed [31:0] clamp_sym34_to_32(input logic signed [33:0] v);\n");
+    fprintf(fp, "        logic [33:0] uv;\n");
+    fprintf(fp, "        logic        ovf_pos, ovf_neg;\n");
+    fprintf(fp, "        begin\n");
+    fprintf(fp, "            uv      = $unsigned(v);\n");
+    fprintf(fp, "            ovf_pos = (~uv[33]) & (|uv[32:31]);\n");
+    fprintf(fp, "            ovf_neg = uv[33] & ((~(&uv[32:31])) | (uv[30:0] == 31'd0));\n");
+    fprintf(fp, "            if (ovf_pos)      clamp_sym34_to_32 = 32'sh7FFF_FFFF;\n");
+    fprintf(fp, "            else if (ovf_neg) clamp_sym34_to_32 = -32'sh7FFF_FFFF;\n");
+    fprintf(fp, "            else              clamp_sym34_to_32 = $signed(uv[31:0]);\n");
     fprintf(fp, "        end\n");
     fprintf(fp, "    endfunction\n\n");
 
@@ -501,20 +1564,38 @@ static void emit_sv(FILE *fp, int dsp_count, int max_depth, int k_rad, uint32_t 
     fprintf(fp, "        end\n");
     fprintf(fp, "    endfunction\n\n");
 
-    fprintf(fp, "    function automatic logic signed [63:0] clamp_sym64(\n");
-    fprintf(fp, "        input logic signed [63:0] v,\n");
-    fprintf(fp, "        input logic signed [63:0] lim\n");
-    fprintf(fp, "    );\n");
+    fprintf(fp, "    function automatic logic signed [63:0] clamp_j0_sym64(input logic signed [63:0] v);\n");
+    fprintf(fp, "        logic [63:0] uv;\n");
+    fprintf(fp, "        logic        ovf_pos, ovf_neg;\n");
     fprintf(fp, "        begin\n");
-    fprintf(fp, "            if (v > lim)       clamp_sym64 = lim;\n");
-    fprintf(fp, "            else if (v < -lim) clamp_sym64 = -lim;\n");
-    fprintf(fp, "            else               clamp_sym64 = v;\n");
+    fprintf(fp, "            uv      = $unsigned(v);\n");
+    fprintf(fp, "            ovf_pos = (~uv[63]) & ((|uv[62:61]) | (uv[60] & (|uv[59:0])));\n");
+    fprintf(fp, "            ovf_neg = uv[63] & (~(&uv[62:60]));\n");
+    fprintf(fp, "            if (ovf_pos)      clamp_j0_sym64 = 64'sh1000_0000_0000_0000;\n");
+    fprintf(fp, "            else if (ovf_neg) clamp_j0_sym64 = -64'sh1000_0000_0000_0000;\n");
+    fprintf(fp, "            else              clamp_j0_sym64 = v;\n");
+    fprintf(fp, "        end\n");
+    fprintf(fp, "    endfunction\n\n");
+
+    fprintf(fp, "    function automatic logic signed [63:0] clamp_j1_sym64(input logic signed [63:0] v);\n");
+    fprintf(fp, "        logic [63:0] uv;\n");
+    fprintf(fp, "        logic        ovf_pos, ovf_neg;\n");
+    fprintf(fp, "        begin\n");
+    fprintf(fp, "            uv      = $unsigned(v);\n");
+    fprintf(fp, "            ovf_pos = (~uv[63]) & ((|uv[62:46]) | (uv[45] & (|uv[44:0])));\n");
+    fprintf(fp, "            ovf_neg = uv[63] & (~(&uv[62:45]));\n");
+    fprintf(fp, "            if (ovf_pos)      clamp_j1_sym64 = 64'sh0000_2000_0000_0000;\n");
+    fprintf(fp, "            else if (ovf_neg) clamp_j1_sym64 = -64'sh0000_2000_0000_0000;\n");
+    fprintf(fp, "            else              clamp_j1_sym64 = v;\n");
     fprintf(fp, "        end\n");
     fprintf(fp, "    endfunction\n\n");
 
     fprintf(fp, "    function automatic logic [127:0] abs128(input logic signed [127:0] v);\n");
+    fprintf(fp, "        logic [98:0] mag99;\n");
     fprintf(fp, "        begin\n");
-    fprintf(fp, "            abs128 = v[127] ? (128'd0 - $unsigned(v)) : $unsigned(v);\n");
+    fprintf(fp, "            if (&{1'b0, v[126:99]}) begin end\n");
+    fprintf(fp, "            mag99  = v[127] ? (99'd0 - $unsigned(v[98:0])) : $unsigned(v[98:0]);\n");
+    fprintf(fp, "            abs128 = {29'd0, mag99};\n");
     fprintf(fp, "        end\n");
     fprintf(fp, "    endfunction\n\n");
 
@@ -545,142 +1626,182 @@ static void emit_sv(FILE *fp, int dsp_count, int max_depth, int k_rad, uint32_t 
     fprintf(fp, "    logic [7:0]          next_lo_q, next_hi_q;\n");
     fprintf(fp, "    logic [15:0]         kan_lock_q, cap_mask16_q, mode_req_q;\n\n");
 
-    /* Cross-cone architectural registers */
-    fprintf(fp, "    logic                op_mask_q;\n");
+    /* Cross-cone architectural registers (`b0_eff64_q` is exact 64b; `g0_s98_q` is exact 98b Q49;
+     * `d_mag` is folded into `sr_acc_q`, and `op_mask`/`r2` are combinational invariants: -97 DFFs!) */
     fprintf(fp, "    logic                fast_path_q;\n");
-    fprintf(fp, "    logic signed [31:0]  x_clamped_q;\n");
-    fprintf(fp, "    logic signed [127:0] b0_eff_q;\n");
-    fprintf(fp, "    logic signed [127:0] g0_q;\n");
+    fprintf(fp, "    logic signed [63:0]  b0_eff64_q;\n");
+    fprintf(fp, "    logic signed [97:0]  g0_s98_q;\n");
+    fprintf(fp, "    wire  signed [127:0] g0_q = $signed({{30{g0_s98_q[97]}}, g0_s98_q});\n");
     fprintf(fp, "    logic signed [63:0]  g1_q;\n");
-    fprintf(fp, "    logic signed [31:0]  r2_q;\n");
-    fprintf(fp, "    logic [63:0]         d_mag_q;\n");
     fprintf(fp, "    logic                div_neg_q;\n");
     fprintf(fp, "    logic                pre_sat_q;\n");
     fprintf(fp, "    logic [63:0]         sr_rem_q;\n");
     fprintf(fp, "    logic [63:0]         sr_acc_q;\n");
     fprintf(fp, "    logic [127:0]        sr_aux_q;\n\n");
 
-    /* Emit combinational wires & FLOW-scheduled pipeline cut registers per node */
-    fprintf(fp, "    // --- Cone A Wires & FLOW Pipeline Cut Registers ---\n");
-    fprintf(fp, "    logic signed [63:0]  n_a0_ug_u_c%s;\n", ca->nodes[0].needs_reg ? ", n_a0_ug_u_q" : "");
-    fprintf(fp, "    logic signed [63:0]  n_a1_b1_x_c%s;\n", ca->nodes[1].needs_reg ? ", n_a1_b1_x_q" : "");
-    fprintf(fp, "    logic [63:0]         n_a2_x_sq_c%s;\n", ca->nodes[2].needs_reg ? ", n_a2_x_sq_q" : "");
-    fprintf(fp, "    logic signed [63:0]  n_a3_b2_x_c%s;\n", ca->nodes[3].needs_reg ? ", n_a3_b2_x_q" : "");
-    fprintf(fp, "    logic signed [127:0] n_a4_b0_eff_c%s;\n", ca->nodes[4].needs_reg ? ", n_a4_b0_eff_q" : "");
-    fprintf(fp, "    logic signed [65:0]  n_a5_b2xsq_lo_c%s;\n", ca->nodes[5].needs_reg ? ", n_a5_b2xsq_lo_q" : "");
-    fprintf(fp, "    logic signed [65:0]  n_a6_b2xsq_hi_c%s;\n", ca->nodes[6].needs_reg ? ", n_a6_b2xsq_hi_q" : "");
-    fprintf(fp, "    logic signed [127:0] n_a7_g0_op_c%s;\n", ca->nodes[7].needs_reg ? ", n_a7_g0_op_q" : "");
-    fprintf(fp, "    logic signed [63:0]  n_a8_g1_op_c%s;\n", ca->nodes[8].needs_reg ? ", n_a8_g1_op_q" : "");
-    fprintf(fp, "    logic signed [127:0] n_a9_g0_au_c%s;\n", ca->nodes[9].needs_reg ? ", n_a9_g0_au_q" : "");
-    fprintf(fp, "    logic signed [63:0]  n_a9_j1_q32_c%s;\n", ca->nodes[9].needs_reg ? ", n_a9_j1_q32_q" : "");
+    /* Pass-2 Shared Physical Pipeline-Cut Register Pool (`sh_lane*_q`) */
+    fprintf(fp, "    // --- Pass-2 Live-Range Shared Physical Pipeline-Cut Lanes (%d bits vs %d virtual) ---\n",
+            shared_cut_bits, virtual_cut_bits);
+    for (int ln = 0; ln < ra->num_lanes; ++ln) {
+        fprintf(fp, "    logic [%d:0]         sh_lane%d_q, sh_lane%d_d_c;\n",
+                ra->lane_width[ln] - 1, ln, ln);
+        fprintf(fp, "    logic                sh_lane%d_we_c;\n", ln);
+    }
+    fprintf(fp, "\n");
+
+    fprintf(fp, "    logic signed [31:0]  x_in_clamped_c;\n");
+    fprintf(fp, "    logic signed [31:0]  wr_clamped32_c;\n");
+    fprintf(fp, "    logic signed [31:0]  ex_c, en_c, dt_c;\n");
+    fprintf(fp, "    assign x_in_clamped_c = clamp_sym64_to_32(state_w_q[3]);\n");
+    fprintf(fp, "    assign wr_clamped32_c = clamp_sym64_to_32(wr_data_i);\n");
+    fprintf(fp, "    assign ex_c           = clamp_sym32(wr_data_i[63:32]);\n");
+    fprintf(fp, "    assign en_c           = clamp_sym32(wr_data_i[31:0]);\n");
+    fprintf(fp, "    assign dt_c           = ex_c;\n\n");
+
+    /* Regime DSP isolation predicates + reclaimed combinational invariants (`-97` DFFs) */
+    fprintf(fp, "    wire  signed [31:0]  j2_in_c      = clamp_sym64_to_32(state_w_q[2]);\n");
+    fprintf(fp, "    wire                 b1_nz_c      = (b1_q != 32'sd0);\n");
+    fprintf(fp, "    wire                 b2_nz_c      = (b2_q != 32'sd0);\n");
+    fprintf(fp, "    wire                 op_mask_q    = b1_nz_c | b2_nz_c;\n");
+    fprintf(fp, "    wire  signed [31:0]  r2_q         = op_mask_q ? b2_q : j2_in_c;\n");
+    fprintf(fp, "    wire                 r2_nz_c      = (r2_q != 32'sd0);\n");
+    fprintf(fp, "    wire         [63:0]  d_mag_w      = sr_acc_q;\n\n");
+
+    /* Combinational SSA node wires & zero-gate virtual read aliases onto `sh_lane*_q` */
+    fprintf(fp, "    // --- SSA Combinational Wires & Zero-Gate Shared-Lane Read Aliases ---\n");
+    if (!ca->nodes[0].needs_reg) fprintf(fp, "    logic signed [63:0]  n_a0_ug_u_c;\n");
+    if (!ca->nodes[1].needs_reg) fprintf(fp, "    logic signed [63:0]  n_a1_b1_x_c;\n");
+    if (!ca->nodes[2].needs_reg) fprintf(fp, "    logic [63:0]         n_a2_x_sq_c;\n");
+    if (!ca->nodes[3].needs_reg) fprintf(fp, "    logic signed [63:0]  n_a3_b2_x_c;\n");
+    fprintf(fp, "    logic signed [63:0]  n_a4_b0_eff64_c;\n");
+    if (!ca->nodes[5].needs_reg) fprintf(fp, "    logic signed [65:0]  n_a5_b2xsq_lo_c;\n");
+    if (!ca->nodes[6].needs_reg) fprintf(fp, "    logic signed [65:0]  n_a6_b2xsq_hi_c;\n");
+    fprintf(fp, "    logic signed [127:0] n_a7_g0_op_c;\n");
+    fprintf(fp, "    logic signed [63:0]  n_a8_g1_op_c;\n");
+    fprintf(fp, "    logic signed [127:0] n_a9_g0_au_c;\n");
+    fprintf(fp, "    logic signed [63:0]  n_a9_j1_q32_c;\n");
     fprintf(fp, "    logic                n_a10_op_mask_c, n_a10_active_c, n_a10_has_r2_c;\n");
     fprintf(fp, "    logic signed [127:0] n_a10_g0_c;\n");
     fprintf(fp, "    logic signed [63:0]  n_a10_g1_c;\n");
-    fprintf(fp, "    logic signed [31:0]  n_a10_r2_c;\n\n");
 
-    fprintf(fp, "    // --- Cone B Wires & FLOW Pipeline Cut Registers ---\n");
-    fprintf(fp, "    logic signed [65:0]  n_b0_g1_ll_c%s;\n", cb->nodes[0].needs_reg ? ", n_b0_g1_ll_q" : "");
-    fprintf(fp, "    logic signed [65:0]  n_b1_g1_hl_c%s;\n", cb->nodes[1].needs_reg ? ", n_b1_g1_hl_q" : "");
-    fprintf(fp, "    logic signed [65:0]  n_b2_g1_hh_c%s;\n", cb->nodes[2].needs_reg ? ", n_b2_g1_hh_q" : "");
-    fprintf(fp, "    logic signed [65:0]  n_b3_g0r2_0_c%s;\n", cb->nodes[3].needs_reg ? ", n_b3_g0r2_0_q" : "");
-    fprintf(fp, "    logic signed [65:0]  n_b4_g0r2_1_c%s;\n", cb->nodes[4].needs_reg ? ", n_b4_g0r2_1_q" : "");
-    fprintf(fp, "    logic signed [65:0]  n_b5_g0r2_2_c%s;\n", cb->nodes[5].needs_reg ? ", n_b5_g0r2_2_q" : "");
-    fprintf(fp, "    logic signed [127:0] n_b6_g1_sq_c%s;\n", cb->nodes[6].needs_reg ? ", n_b6_g1_sq_q" : "");
-    fprintf(fp, "    logic signed [127:0] n_b7_g0_r2_c%s;\n", cb->nodes[7].needs_reg ? ", n_b7_g0_r2_q" : "");
-    fprintf(fp, "    logic signed [127:0] n_b8_disc_c;\n");
-    fprintf(fp, "    logic                n_b8_pos_nz_c;\n\n");
+    if (smap->a0 >= 0) fprintf(fp, "    wire  signed [63:0]  n_a0_ug_u_q     = $signed(sh_lane%d_q[63:0]);\n", ra->reqs[smap->a0].phys_lane);
+    if (smap->a1 >= 0) fprintf(fp, "    wire  signed [63:0]  n_a1_b1_x_q     = $signed(sh_lane%d_q[63:0]);\n", ra->reqs[smap->a1].phys_lane);
+    if (smap->a2 >= 0) fprintf(fp, "    wire         [63:0]  n_a2_x_sq_q     = sh_lane%d_q[63:0];\n", ra->reqs[smap->a2].phys_lane);
+    if (smap->a3 >= 0) fprintf(fp, "    wire  signed [63:0]  n_a3_b2_x_q     = $signed(sh_lane%d_q[63:0]);\n", ra->reqs[smap->a3].phys_lane);
+    if (smap->a5 >= 0) fprintf(fp, "    wire  signed [65:0]  n_a5_b2xsq_lo_q = $signed(sh_lane%d_q[65:0]);\n", ra->reqs[smap->a5].phys_lane);
+    if (smap->a6 >= 0) fprintf(fp, "    wire  signed [65:0]  n_a6_b2xsq_hi_q = $signed(sh_lane%d_q[65:0]);\n", ra->reqs[smap->a6].phys_lane);
+    if (smap->a7_lo >= 0)
+        fprintf(fp, "    wire  signed [127:0] n_a7_g0_op_q    = $signed({{30{sh_lane%d_q[33]}}, sh_lane%d_q[33:0], sh_lane%d_q[63:0]});\n",
+                ra->reqs[smap->a7_hi].phys_lane, ra->reqs[smap->a7_hi].phys_lane, ra->reqs[smap->a7_lo].phys_lane);
+    if (smap->a8 >= 0) fprintf(fp, "    wire  signed [63:0]  n_a8_g1_op_q    = $signed(sh_lane%d_q[63:0]);\n", ra->reqs[smap->a8].phys_lane);
+    if (smap->a9_lo >= 0) {
+        fprintf(fp, "    wire  signed [127:0] n_a9_g0_au_q    = $signed({{33{sh_lane%d_q[30]}}, sh_lane%d_q[30:0], sh_lane%d_q[63:0]});\n",
+                ra->reqs[smap->a9_hi].phys_lane, ra->reqs[smap->a9_hi].phys_lane, ra->reqs[smap->a9_lo].phys_lane);
+        fprintf(fp, "    wire  signed [63:0]  n_a9_j1_q32_q   = $signed(sh_lane%d_q[63:0]);\n",
+                ra->reqs[smap->a9_j1].phys_lane);
+    }
 
-    fprintf(fp, "    // --- Cone D Wires & FLOW Pipeline Cut Registers ---\n");
-    fprintf(fp, "    logic signed [127:0] n_d0_div_num_c%s;\n", cd->nodes[0].needs_reg ? ", n_d0_div_num_q" : "");
-    fprintf(fp, "    logic        [64:0]  n_d0_div_den_c%s;\n", cd->nodes[0].needs_reg ? ", n_d0_div_den_q" : "");
-    fprintf(fp, "    logic                n_d0_div_neg_c%s;\n", cd->nodes[0].needs_reg ? ", n_d0_div_neg_q" : "");
+    if (!cb->nodes[0].needs_reg) fprintf(fp, "    logic signed [65:0]  n_b0_g1_ll_c;\n");
+    if (!cb->nodes[1].needs_reg) fprintf(fp, "    logic signed [65:0]  n_b1_g1_hl_c;\n");
+    if (!cb->nodes[2].needs_reg) fprintf(fp, "    logic signed [65:0]  n_b2_g1_hh_c;\n");
+    if (!cb->nodes[3].needs_reg) fprintf(fp, "    logic signed [65:0]  n_b3_g0r2_0_c;\n");
+    if (!cb->nodes[4].needs_reg) fprintf(fp, "    logic signed [65:0]  n_b4_g0r2_1_c;\n");
+    if (!cb->nodes[5].needs_reg) fprintf(fp, "    logic signed [65:0]  n_b5_g0r2_2_c;\n");
+    fprintf(fp, "    logic signed [127:0] n_b6_g1_sq_c, n_b7_g0_r2_c, n_b8_disc_c;\n");
+    fprintf(fp, "    logic                n_b8_pos_nz_c;\n");
+    if (smap->b0 >= 0) fprintf(fp, "    wire  signed [65:0]  n_b0_g1_ll_q  = $signed(sh_lane%d_q[65:0]);\n", ra->reqs[smap->b0].phys_lane);
+    if (smap->b1 >= 0) fprintf(fp, "    wire  signed [65:0]  n_b1_g1_hl_q  = $signed(sh_lane%d_q[65:0]);\n", ra->reqs[smap->b1].phys_lane);
+    if (smap->b2 >= 0) fprintf(fp, "    wire  signed [65:0]  n_b2_g1_hh_q  = $signed(sh_lane%d_q[65:0]);\n", ra->reqs[smap->b2].phys_lane);
+    if (smap->b3 >= 0) fprintf(fp, "    wire  signed [65:0]  n_b3_g0r2_0_q = $signed(sh_lane%d_q[65:0]);\n", ra->reqs[smap->b3].phys_lane);
+    if (smap->b4 >= 0) fprintf(fp, "    wire  signed [65:0]  n_b4_g0r2_1_q = $signed(sh_lane%d_q[65:0]);\n", ra->reqs[smap->b4].phys_lane);
+    if (smap->b5 >= 0) fprintf(fp, "    wire  signed [65:0]  n_b5_g0r2_2_q = $signed(sh_lane%d_q[65:0]);\n", ra->reqs[smap->b5].phys_lane);
+    if (smap->b6_lo >= 0)
+        fprintf(fp, "    wire  signed [127:0] n_b6_g1_sq_q  = $signed({sh_lane%d_q[63:0], sh_lane%d_q[63:0]});\n",
+                ra->reqs[smap->b6_hi].phys_lane, ra->reqs[smap->b6_lo].phys_lane);
+    if (smap->b7_lo >= 0)
+        fprintf(fp, "    wire  signed [127:0] n_b7_g0_r2_q  = $signed({sh_lane%d_q[63:0], sh_lane%d_q[63:0]});\n",
+                ra->reqs[smap->b7_hi].phys_lane, ra->reqs[smap->b7_lo].phys_lane);
+
+    fprintf(fp, "    logic signed [127:0] n_d0_div_num_c;\n");
+    fprintf(fp, "    logic        [64:0]  n_d0_div_den_c;\n");
+    fprintf(fp, "    logic                n_d0_div_neg_c;\n");
     fprintf(fp, "    logic [63:0]         n_d1_safe_den_c, n_d1_init_rem_c, n_d1_init_quot_c;\n");
-    fprintf(fp, "    logic                n_d1_pre_sat_c;\n\n");
+    fprintf(fp, "    logic                n_d1_pre_sat_c;\n");
+    if (smap->d0_lo >= 0) {
+        fprintf(fp, "    wire  signed [127:0] n_d0_div_num_q = $signed({{29{sh_lane%d_q[34]}}, sh_lane%d_q[34:0], sh_lane%d_q[63:0]});\n",
+                ra->reqs[smap->d0_hi].phys_lane, ra->reqs[smap->d0_hi].phys_lane, ra->reqs[smap->d0_lo].phys_lane);
+        fprintf(fp, "    wire         [64:0]  n_d0_div_den_q = sh_lane%d_q[64:0];\n",
+                ra->reqs[smap->d0_den].phys_lane);
+        fprintf(fp, "    wire                 n_d0_div_neg_q = sh_lane%d_q[65];\n",
+                ra->reqs[smap->d0_den].phys_lane);
+    }
 
-    fprintf(fp, "    // --- Cone C Wires & FLOW Pipeline Cut Registers ---\n");
-    fprintf(fp, "    logic signed [32:0]  n_c0_dc_c%s;\n", cc->nodes[0].needs_reg ? ", n_c0_dc_q" : "");
-    fprintf(fp, "    logic signed [63:0]  n_c1_dsq_c%s;\n", cc->nodes[1].needs_reg ? ", n_c1_dsq_q" : "");
-    fprintf(fp, "    logic signed [65:0]  n_c2_g1dc_lo_c%s;\n", cc->nodes[2].needs_reg ? ", n_c2_g1dc_lo_q" : "");
-    fprintf(fp, "    logic signed [65:0]  n_c3_g1dc_hi_c%s;\n", cc->nodes[3].needs_reg ? ", n_c3_g1dc_hi_q" : "");
-    fprintf(fp, "    logic signed [63:0]  n_c4_r2_dc_c%s;\n", cc->nodes[4].needs_reg ? ", n_c4_r2_dc_q" : "");
-    fprintf(fp, "    logic signed [65:0]  n_c5_r2dsq_lo_c%s;\n", cc->nodes[5].needs_reg ? ", n_c5_r2dsq_lo_q" : "");
-    fprintf(fp, "    logic signed [65:0]  n_c6_r2dsq_hi_c%s;\n", cc->nodes[6].needs_reg ? ", n_c6_r2dsq_hi_q" : "");
-    fprintf(fp, "    logic signed [127:0] n_c7_g0_cand_c%s;\n", cc->nodes[7].needs_reg ? ", n_c7_g0_cand_q" : "");
-    fprintf(fp, "    logic signed [127:0] n_c8_g0_post_c%s;\n", cc->nodes[8].needs_reg ? ", n_c8_g0_post_q" : "");
-    fprintf(fp, "    logic signed [63:0]  n_c8_g1_post_c%s;\n", cc->nodes[8].needs_reg ? ", n_c8_g1_post_q" : "");
-    fprintf(fp, "    logic signed [31:0]  n_c8_xp_c%s;\n", cc->nodes[8].needs_reg ? ", n_c8_xp_q" : "");
-    fprintf(fp, "    logic [63:0]         n_c8_dt_res_c%s;\n", cc->nodes[8].needs_reg ? ", n_c8_dt_res_q" : "");
-    fprintf(fp, "    logic [63:0]         n_c9_j0_next_c%s;\n", cc->nodes[9].needs_reg ? ", n_c9_j0_next_q" : "");
-    fprintf(fp, "    logic [63:0]         n_c9_j1_next_c%s;\n", cc->nodes[9].needs_reg ? ", n_c9_j1_next_q" : "");
-    fprintf(fp, "    logic [63:0]         n_c9_sub_next_c%s;\n", cc->nodes[9].needs_reg ? ", n_c9_sub_next_q" : "");
+    fprintf(fp, "    logic signed [32:0]  n_c0_dc_c;\n");
+    if (!cc->nodes[1].needs_reg) fprintf(fp, "    logic signed [63:0]  n_c1_dsq_c;\n");
+    if (!cc->nodes[4].needs_reg) fprintf(fp, "    logic signed [63:0]  n_c4_r2_dc_c;\n");
+    if (!cc->nodes[2].needs_reg) fprintf(fp, "    logic signed [65:0]  n_c2_g1dc_lo_c;\n");
+    if (!cc->nodes[3].needs_reg) fprintf(fp, "    logic signed [65:0]  n_c3_g1dc_hi_c;\n");
+    if (!cc->nodes[5].needs_reg) fprintf(fp, "    logic signed [65:0]  n_c5_r2dsq_lo_c;\n");
+    if (!cc->nodes[6].needs_reg) fprintf(fp, "    logic signed [65:0]  n_c6_r2dsq_hi_c;\n");
+    fprintf(fp, "    logic signed [127:0] n_c7_g0_cand_c, n_c8_g0_post_c;\n");
+    fprintf(fp, "    logic signed [63:0]  n_c8_g1_post_c;\n");
+    fprintf(fp, "    logic signed [31:0]  n_c8_xp_c;\n");
+    fprintf(fp, "    logic [63:0]         n_c8_dt_res_c, n_c9_j0_next_c, n_c9_j1_next_c, n_c9_sub_next_c;\n");
     fprintf(fp, "    logic [15:0]         n_c10_chart_next_c, n_c10_mode_proj_c;\n");
-    fprintf(fp, "    logic                n_c10_conv_c;\n\n");
+    fprintf(fp, "    logic                n_c10_conv_c;\n");
 
-    /* Phase 0 (`PRE_LOGIC`): `C0_STEP_CLAMP` */
+    if (smap->c0 >= 0) fprintf(fp, "    wire  signed [32:0]  n_c0_dc_q       = $signed(sh_lane%d_q[32:0]);\n", ra->reqs[smap->c0].phys_lane);
+    if (smap->c1 >= 0) fprintf(fp, "    wire  signed [63:0]  n_c1_dsq_q      = $signed(sh_lane%d_q[63:0]);\n", ra->reqs[smap->c1].phys_lane);
+    if (smap->c2 >= 0) fprintf(fp, "    wire  signed [65:0]  n_c2_g1dc_lo_q  = $signed(sh_lane%d_q[65:0]);\n", ra->reqs[smap->c2].phys_lane);
+    if (smap->c3 >= 0) fprintf(fp, "    wire  signed [65:0]  n_c3_g1dc_hi_q  = $signed(sh_lane%d_q[65:0]);\n", ra->reqs[smap->c3].phys_lane);
+    if (smap->c4 >= 0) fprintf(fp, "    wire  signed [63:0]  n_c4_r2_dc_q    = $signed(sh_lane%d_q[63:0]);\n", ra->reqs[smap->c4].phys_lane);
+    if (smap->c5 >= 0) fprintf(fp, "    wire  signed [65:0]  n_c5_r2dsq_lo_q = $signed(sh_lane%d_q[65:0]);\n", ra->reqs[smap->c5].phys_lane);
+    if (smap->c6 >= 0) fprintf(fp, "    wire  signed [65:0]  n_c6_r2dsq_hi_q = $signed(sh_lane%d_q[65:0]);\n", ra->reqs[smap->c6].phys_lane);
+    if (smap->c7_lo >= 0)
+        fprintf(fp, "    wire  signed [127:0] n_c7_g0_cand_q  = $signed({{29{sh_lane%d_q[34]}}, sh_lane%d_q[34:0], sh_lane%d_q[63:0]});\n",
+                ra->reqs[smap->c7_hi].phys_lane, ra->reqs[smap->c7_hi].phys_lane, ra->reqs[smap->c7_lo].phys_lane);
+    if (smap->c8_lo >= 0) {
+        fprintf(fp, "    wire  signed [127:0] n_c8_g0_post_q  = fast_path_q ? g0_q           : $signed({{29{sh_lane%d_q[34]}}, sh_lane%d_q[34:0], sh_lane%d_q[63:0]});\n",
+                ra->reqs[smap->c8_hi].phys_lane, ra->reqs[smap->c8_hi].phys_lane, ra->reqs[smap->c8_lo].phys_lane);
+        fprintf(fp, "    wire  signed [63:0]  n_c8_g1_post_q  = fast_path_q ? g1_q           : $signed(sh_lane%d_q[63:0]);\n",
+                ra->reqs[smap->c8_g1].phys_lane);
+        fprintf(fp, "    wire  signed [31:0]  n_c8_xp_q       = fast_path_q ? x_in_clamped_c : $signed(sh_lane%d_q[63:32]);\n",
+                ra->reqs[smap->c8_xpdt].phys_lane);
+        fprintf(fp, "    wire         [63:0]  n_c8_dt_res_q   = fast_path_q ? 64'd0          : {32'd0, sh_lane%d_q[31:0]};\n",
+                ra->reqs[smap->c8_xpdt].phys_lane);
+    }
+    if (smap->c9_j0 >= 0) {
+        fprintf(fp, "    wire         [63:0]  n_c9_j0_next_q  = sh_lane%d_q[63:0];\n", ra->reqs[smap->c9_j0].phys_lane);
+        fprintf(fp, "    wire         [63:0]  n_c9_j1_next_q  = sh_lane%d_q[63:0];\n", ra->reqs[smap->c9_j1].phys_lane);
+        fprintf(fp, "    wire         [63:0]  n_c9_sub_next_q = sh_lane%d_q[63:0];\n", ra->reqs[smap->c9_sub].phys_lane);
+    }
+    fprintf(fp, "\n");
+
+    /* Phase 0 (`PRE_LOGIC`): Carry-Select Increment + Single-Path Clamp (`c0_delta_cand`) */
     fprintf(fp, "    // =========================================================================\n");
-    fprintf(fp, "    // Phase 0 (`PRE_LOGIC`): Post-Divide Step Rounding & Coordinate Delta\n");
+    fprintf(fp, "    // Phase 0 (`PRE_LOGIC`): Speculative Carry-Select Step Clamp (`c0_delta_cand`)\n");
     fprintf(fp, "    // =========================================================================\n");
-    fprintf(fp, "    logic signed [31:0] x_in_clamped_c;\n");
-    fprintf(fp, "    assign x_in_clamped_c = clamp_sym64_to_32(state_w_q[3]);\n\n");
     fprintf(fp, "    always_comb begin\n");
-    fprintf(fp, "        logic        round_up;\n");
-    fprintf(fp, "        logic [63:0] cap64;\n");
-    fprintf(fp, "        logic        over_cap;\n");
-    fprintf(fp, "        logic [63:0] mag;\n");
-    fprintf(fp, "        logic signed [63:0] raw_step;\n");
-    fprintf(fp, "        logic signed [31:0] xp_cand;\n");
+    fprintf(fp, "        logic               round_up;\n");
+    fprintf(fp, "        logic        [63:0] cap64;\n");
+    fprintf(fp, "        logic               over_cap;\n");
+    fprintf(fp, "        logic        [31:0] mag_r1, mag32;\n");
+    fprintf(fp, "        logic signed [33:0] step34;\n");
+    fprintf(fp, "        logic signed [31:0] xp32;\n");
     fprintf(fp, "        round_up  = (~pre_sat_q) & (sr_rem_q > ((sr_aux_q[63:0] - 64'd1) >> 1));\n");
     fprintf(fp, "        cap64     = {32'd0, $unsigned(dt_max_q)};\n");
     fprintf(fp, "        over_cap  = pre_sat_q | (sr_acc_q >= cap64);\n");
-    fprintf(fp, "        mag       = over_cap ? cap64 : (sr_acc_q + {63'd0, round_up});\n");
-    fprintf(fp, "        raw_step  = div_neg_q ? $signed(64'd0 - mag) : $signed(mag);\n");
-    fprintf(fp, "        xp_cand   = clamp_sym64_to_32($unsigned($signed({{32{x_clamped_q[31]}}, x_clamped_q}) + raw_step));\n");
-    fprintf(fp, "        n_c0_dc_c = $signed({xp_cand[31], xp_cand}) - $signed({x_clamped_q[31], x_clamped_q});\n");
+    fprintf(fp, "        mag_r1    = sr_acc_q[31:0] + 32'd1;\n");
+    fprintf(fp, "        mag32     = over_cap ? $unsigned(dt_max_q) : (round_up ? mag_r1 : sr_acc_q[31:0]);\n");
+    fprintf(fp, "        step34    = div_neg_q ? -$signed({2'b00, mag32}) : $signed({2'b00, mag32});\n");
+    fprintf(fp, "        xp32      = clamp_sym34_to_32($signed({{2{x_in_clamped_c[31]}}, x_in_clamped_c}) + step34);\n");
+    fprintf(fp, "        n_c0_dc_c = $signed({xp32[31], xp32}) - $signed({x_in_clamped_c[31], x_in_clamped_c});\n");
     fprintf(fp, "    end\n\n");
 
     /* Phase 1 (`DSP33`): Instantiate `dsp_count` `ele_mul33_atom` units and drive muxes */
-    const char *x_sq_for_a5  = ref_sig(ca, 2, 5, "n_a2_x_sq_c",  "n_a2_x_sq_q");
-    const char *x_sq_for_a6  = ref_sig(ca, 2, 6, "n_a2_x_sq_c",  "n_a2_x_sq_q");
-    const char *dc_for_c1    = ref_sig(cc, 0, 1, "n_c0_dc_c",    "n_c0_dc_q");
-    const char *dc_for_c2    = ref_sig(cc, 0, 2, "n_c0_dc_c",    "n_c0_dc_q");
-    const char *dc_for_c3    = ref_sig(cc, 0, 3, "n_c0_dc_c",    "n_c0_dc_q");
-    const char *dc_for_c4    = ref_sig(cc, 0, 4, "n_c0_dc_c",    "n_c0_dc_q");
-    const char *dsq_for_c5   = ref_sig(cc, 1, 5, "n_c1_dsq_c",   "n_c1_dsq_q");
-    const char *dsq_for_c6   = ref_sig(cc, 1, 6, "n_c1_dsq_c",   "n_c1_dsq_q");
-
-    char op_a5_b[64], op_a6_b[64], op_c5_b[64], op_c6_b[64];
-    char op_c1_d[64], op_c2_d[64], op_c3_d[64], op_c4_d[64];
-    snprintf(op_a5_b, sizeof(op_a5_b), "{1'b0, %s[31:0]}", x_sq_for_a5);
-    snprintf(op_a6_b, sizeof(op_a6_b), "{1'b0, %s[63:32]}", x_sq_for_a6);
-    snprintf(op_c5_b, sizeof(op_c5_b), "{1'b0, %s[31:0]}", dsq_for_c5);
-    snprintf(op_c6_b, sizeof(op_c6_b), "{%s[63], %s[63:32]}", dsq_for_c6, dsq_for_c6);
-    snprintf(op_c1_d, sizeof(op_c1_d), "$unsigned(%s)", dc_for_c1);
-    snprintf(op_c2_d, sizeof(op_c2_d), "$unsigned(%s)", dc_for_c2);
-    snprintf(op_c3_d, sizeof(op_c3_d), "$unsigned(%s)", dc_for_c3);
-    snprintf(op_c4_d, sizeof(op_c4_d), "$unsigned(%s)", dc_for_c4);
-
-    const dsp_bind_t binds[18] = {
-        {0, 0, base_ca + ca->nodes[0].stage, "{u_gain_q[31], u_gain_q}", "{u_in_q[31], u_in_q}"},
-        {0, 1, base_ca + ca->nodes[1].stage, "{b1_q[31], b1_q}",         "{x_in_clamped_c[31], x_in_clamped_c}"},
-        {0, 2, base_ca + ca->nodes[2].stage, "{x_in_clamped_c[31], x_in_clamped_c}", "{x_in_clamped_c[31], x_in_clamped_c}"},
-        {0, 3, base_ca + ca->nodes[3].stage, "{b2_q[31], b2_q}",         "{x_in_clamped_c[31], x_in_clamped_c}"},
-        {0, 5, base_ca + ca->nodes[5].stage, "{b2_q[31], b2_q}",         op_a5_b},
-        {0, 6, base_ca + ca->nodes[6].stage, "{b2_q[31], b2_q}",         op_a6_b},
-
-        {1, 0, base_cb + cb->nodes[0].stage, "{1'b0, g1_q[31:0]}",       "{1'b0, g1_q[31:0]}"},
-        {1, 1, base_cb + cb->nodes[1].stage, "{g1_q[63], g1_q[63:32]}",  "{1'b0, g1_q[31:0]}"},
-        {1, 2, base_cb + cb->nodes[2].stage, "{g1_q[63], g1_q[63:32]}",  "{g1_q[63], g1_q[63:32]}"},
-        {1, 3, base_cb + cb->nodes[3].stage, "{1'b0, g0_q[31:0]}",       "{r2_q[31], r2_q}"},
-        {1, 4, base_cb + cb->nodes[4].stage, "{1'b0, g0_q[63:32]}",      "{r2_q[31], r2_q}"},
-        {1, 5, base_cb + cb->nodes[5].stage, "{g0_q[95], g0_q[95:64]}",  "{r2_q[31], r2_q}"},
-
-        {2, 1, base_cc + cc->nodes[1].stage, op_c1_d,                    op_c1_d},
-        {2, 2, base_cc + cc->nodes[2].stage, "{1'b0, g1_q[31:0]}",       op_c2_d},
-        {2, 3, base_cc + cc->nodes[3].stage, "{g1_q[63], g1_q[63:32]}",  op_c3_d},
-        {2, 4, base_cc + cc->nodes[4].stage, "{r2_q[31], r2_q}",         op_c4_d},
-        {2, 5, base_cc + cc->nodes[5].stage, "{r2_q[31], r2_q}",         op_c5_b},
-        {2, 6, base_cc + cc->nodes[6].stage, "{r2_q[31], r2_q}",         op_c6_b},
-    };
+    dsp_expr_scratch_t dsp_sc;
+    dsp_bind_t         binds[18];
+    build_dsp_binds(cones, base_ca, base_cb, base_cc, &dsp_sc, binds);
 
     fprintf(fp, "    // =========================================================================\n");
     fprintf(fp, "    // Phase 1 (`DSP33`): %d Operand-Isolated `ele_mul33_atom` DSP Slices\n", dsp_count);
@@ -692,8 +1813,26 @@ static void emit_sv(FILE *fp, int dsp_count, int max_depth, int k_rad, uint32_t 
 
     fprintf(fp, "    always_comb begin\n");
     fprintf(fp, "        dsp_en_c = %d'd0;\n", dsp_count);
-    fprintf(fp, "        dsp_a_c  = %d'd0;\n", dsp_count * 33);
-    fprintf(fp, "        dsp_b_c  = %d'd0;\n", dsp_count * 33);
+    for (int d = 0; d < dsp_count; ++d) {
+        const char *best_a = "33'd0";
+        const char *best_b = "33'd0";
+        int best_ca = 0, best_cb = 0;
+        for (int i = 0; i < 18; ++i) {
+            const dag_cone_t *ci = (binds[i].cone_id == 0) ? ca : ((binds[i].cone_id == 1) ? cb : cc);
+            if (ci->nodes[binds[i].node_idx].dsp_slot != d) continue;
+            int cnt_a = 0, cnt_b = 0;
+            for (int j = 0; j < 18; ++j) {
+                const dag_cone_t *cj = (binds[j].cone_id == 0) ? ca : ((binds[j].cone_id == 1) ? cb : cc);
+                if (cj->nodes[binds[j].node_idx].dsp_slot != d) continue;
+                if (strcmp(binds[i].op_a_expr, binds[j].op_a_expr) == 0) cnt_a++;
+                if (strcmp(binds[i].op_b_expr, binds[j].op_b_expr) == 0) cnt_b++;
+            }
+            if (cnt_a > best_ca) { best_ca = cnt_a; best_a = binds[i].op_a_expr; }
+            if (cnt_b > best_cb) { best_cb = cnt_b; best_b = binds[i].op_b_expr; }
+        }
+        fprintf(fp, "        dsp_a_c[%d] = %s;\n", d, best_a);
+        fprintf(fp, "        dsp_b_c[%d] = %s;\n", d, best_b);
+    }
     fprintf(fp, "        case (st_q)\n");
     for (int s = 1; s < num_st; ++s) {
         bool any = false;
@@ -713,11 +1852,7 @@ static void emit_sv(FILE *fp, int dsp_count, int max_depth, int k_rad, uint32_t 
             }
             const dag_cone_t *cone = (binds[b].cone_id == 0) ? ca : ((binds[b].cone_id == 1) ? cb : cc);
             int slot = cone->nodes[binds[b].node_idx].dsp_slot;
-            if (binds[b].cone_id == 2) {
-                fprintf(fp, "                dsp_en_c[%d] = ~fast_path_q;\n", slot);
-            } else {
-                fprintf(fp, "                dsp_en_c[%d] = 1'b1;\n", slot);
-            }
+            fprintf(fp, "                dsp_en_c[%d] = %s;\n", slot, binds[b].en_expr);
             fprintf(fp, "                dsp_a_c[%d]  = %s;\n", slot, binds[b].op_a_expr);
             fprintf(fp, "                dsp_b_c[%d]  = %s;\n", slot, binds[b].op_b_expr);
         }
@@ -744,27 +1879,27 @@ static void emit_sv(FILE *fp, int dsp_count, int max_depth, int k_rad, uint32_t 
     fprintf(fp, "        end\n");
     fprintf(fp, "    endgenerate\n\n");
 
-    /* Route DSP outputs to their corresponding node `_c` wires */
-    fprintf(fp, "    assign n_a0_ug_u_c     = $signed(dsp_prod_w[%d][63:0]);\n", ca->nodes[0].dsp_slot);
-    fprintf(fp, "    assign n_a1_b1_x_c     = $signed(dsp_prod_w[%d][63:0]);\n", ca->nodes[1].dsp_slot);
-    fprintf(fp, "    assign n_a2_x_sq_c     = dsp_prod_w[%d][63:0];\n", ca->nodes[2].dsp_slot);
-    fprintf(fp, "    assign n_a3_b2_x_c     = $signed(dsp_prod_w[%d][63:0]);\n", ca->nodes[3].dsp_slot);
-    fprintf(fp, "    assign n_a5_b2xsq_lo_c = $signed(dsp_prod_w[%d]);\n", ca->nodes[5].dsp_slot);
-    fprintf(fp, "    assign n_a6_b2xsq_hi_c = $signed(dsp_prod_w[%d]);\n", ca->nodes[6].dsp_slot);
+    if (!ca->nodes[0].needs_reg) fprintf(fp, "    assign n_a0_ug_u_c     = $signed(dsp_prod_w[%d][63:0]);\n", ca->nodes[0].dsp_slot);
+    if (!ca->nodes[1].needs_reg) fprintf(fp, "    assign n_a1_b1_x_c     = $signed(dsp_prod_w[%d][63:0]);\n", ca->nodes[1].dsp_slot);
+    if (!ca->nodes[2].needs_reg) fprintf(fp, "    assign n_a2_x_sq_c     = dsp_prod_w[%d][63:0];\n", ca->nodes[2].dsp_slot);
+    if (!ca->nodes[3].needs_reg) fprintf(fp, "    assign n_a3_b2_x_c     = $signed(dsp_prod_w[%d][63:0]);\n", ca->nodes[3].dsp_slot);
+    if (!ca->nodes[5].needs_reg) fprintf(fp, "    assign n_a5_b2xsq_lo_c = $signed(dsp_prod_w[%d]);\n", ca->nodes[5].dsp_slot);
+    if (!ca->nodes[6].needs_reg) fprintf(fp, "    assign n_a6_b2xsq_hi_c = $signed(dsp_prod_w[%d]);\n", ca->nodes[6].dsp_slot);
 
-    fprintf(fp, "    assign n_b0_g1_ll_c    = $signed(dsp_prod_w[%d]);\n", cb->nodes[0].dsp_slot);
-    fprintf(fp, "    assign n_b1_g1_hl_c    = $signed(dsp_prod_w[%d]);\n", cb->nodes[1].dsp_slot);
-    fprintf(fp, "    assign n_b2_g1_hh_c    = $signed(dsp_prod_w[%d]);\n", cb->nodes[2].dsp_slot);
-    fprintf(fp, "    assign n_b3_g0r2_0_c   = $signed(dsp_prod_w[%d]);\n", cb->nodes[3].dsp_slot);
-    fprintf(fp, "    assign n_b4_g0r2_1_c   = $signed(dsp_prod_w[%d]);\n", cb->nodes[4].dsp_slot);
-    fprintf(fp, "    assign n_b5_g0r2_2_c   = $signed(dsp_prod_w[%d]);\n", cb->nodes[5].dsp_slot);
+    if (!cb->nodes[0].needs_reg) fprintf(fp, "    assign n_b0_g1_ll_c    = $signed(dsp_prod_w[%d]);\n", cb->nodes[0].dsp_slot);
+    if (!cb->nodes[1].needs_reg) fprintf(fp, "    assign n_b1_g1_hl_c    = $signed(dsp_prod_w[%d]);\n", cb->nodes[1].dsp_slot);
+    if (!cb->nodes[2].needs_reg) fprintf(fp, "    assign n_b2_g1_hh_c    = $signed(dsp_prod_w[%d]);\n", cb->nodes[2].dsp_slot);
+    if (!cb->nodes[3].needs_reg) fprintf(fp, "    assign n_b3_g0r2_0_c   = $signed(dsp_prod_w[%d]);\n", cb->nodes[3].dsp_slot);
+    if (!cb->nodes[4].needs_reg) fprintf(fp, "    assign n_b4_g0r2_1_c   = $signed(dsp_prod_w[%d]);\n", cb->nodes[4].dsp_slot);
+    if (!cb->nodes[5].needs_reg) fprintf(fp, "    assign n_b5_g0r2_2_c   = $signed(dsp_prod_w[%d]);\n", cb->nodes[5].dsp_slot);
 
-    fprintf(fp, "    assign n_c1_dsq_c      = $signed(dsp_prod_w[%d][63:0]);\n", cc->nodes[1].dsp_slot);
-    fprintf(fp, "    assign n_c2_g1dc_lo_c  = $signed(dsp_prod_w[%d]);\n", cc->nodes[2].dsp_slot);
-    fprintf(fp, "    assign n_c3_g1dc_hi_c  = $signed(dsp_prod_w[%d]);\n", cc->nodes[3].dsp_slot);
-    fprintf(fp, "    assign n_c4_r2_dc_c    = $signed(dsp_prod_w[%d][63:0]);\n", cc->nodes[4].dsp_slot);
-    fprintf(fp, "    assign n_c5_r2dsq_lo_c = $signed(dsp_prod_w[%d]);\n", cc->nodes[5].dsp_slot);
-    fprintf(fp, "    assign n_c6_r2dsq_hi_c = $signed(dsp_prod_w[%d]);\n\n", cc->nodes[6].dsp_slot);
+    if (!cc->nodes[1].needs_reg) fprintf(fp, "    assign n_c1_dsq_c      = $signed(dsp_prod_w[%d][63:0]);\n", cc->nodes[1].dsp_slot);
+    if (!cc->nodes[2].needs_reg) fprintf(fp, "    assign n_c2_g1dc_lo_c  = $signed(dsp_prod_w[%d]);\n", cc->nodes[2].dsp_slot);
+    if (!cc->nodes[3].needs_reg) fprintf(fp, "    assign n_c3_g1dc_hi_c  = $signed(dsp_prod_w[%d]);\n", cc->nodes[3].dsp_slot);
+    if (!cc->nodes[4].needs_reg) fprintf(fp, "    assign n_c4_r2_dc_c    = $signed(dsp_prod_w[%d][63:0]);\n", cc->nodes[4].dsp_slot);
+    if (!cc->nodes[5].needs_reg) fprintf(fp, "    assign n_c5_r2dsq_lo_c = $signed(dsp_prod_w[%d]);\n", cc->nodes[5].dsp_slot);
+    if (!cc->nodes[6].needs_reg) fprintf(fp, "    assign n_c6_r2dsq_hi_c = $signed(dsp_prod_w[%d]);\n", cc->nodes[6].dsp_slot);
+    fprintf(fp, "\n");
 
     /* Instantiate `k_rad` chained `ele_rad2_step_atom` slices */
     fprintf(fp, "    // =========================================================================\n");
@@ -797,103 +1932,107 @@ static void emit_sv(FILE *fp, int dsp_count, int max_depth, int k_rad, uint32_t 
     fprintf(fp, "        end\n");
     fprintf(fp, "    endgenerate\n\n");
 
-    /* Phase 2 (`POST_LOGIC`): Topological combinational logic for Cones A, B, D, C + Fast Commit */
+    /* Phase 2 (`POST_LOGIC`): Topological combinational logic for Cones A, B, D, C */
     fprintf(fp, "    // =========================================================================\n");
     fprintf(fp, "    // Phase 2 (`POST_LOGIC`): Topological Cone Combinators\n");
     fprintf(fp, "    // =========================================================================\n");
     fprintf(fp, "    always_comb begin\n");
     fprintf(fp, "        logic signed [63:0]  j0_in, j1_in;\n");
-    fprintf(fp, "        logic signed [31:0]  j2_in;\n");
     fprintf(fp, "        logic                sub_valid;\n");
     fprintf(fp, "        logic [32:0]         j0_sub_in;\n");
     fprintf(fp, "        logic [15:0]         j1_sub_in;\n");
-    fprintf(fp, "        logic signed [127:0] j0_q49, b2_xsq128;\n");
+    fprintf(fp, "        logic signed [66:0]  b2_xsq_hi67, g1_dc_hi67, r2_dsq_hi67;\n");
+    fprintf(fp, "        logic signed [64:0]  b0_b1_q32;\n");
+    fprintf(fp, "        logic signed [80:0]  g0_op_hi81;\n");
+    fprintf(fp, "        logic signed [77:0]  g0_au_hi78;\n");
+    fprintf(fp, "        logic signed [95:0]  b7_hi96;\n");
+    fprintf(fp, "        logic signed [97:0]  push_hi98;\n");
+    fprintf(fp, "        logic signed [98:0]  cand_s99;\n");
+    fprintf(fp, "        logic        [96:0]  j0_au_next97;\n");
+    fprintf(fp, "        logic signed [94:0]  j0_q49;\n");
+    fprintf(fp, "        logic signed [127:0] b2_xsq128;\n");
     fprintf(fp, "        logic                d_neg;\n");
     fprintf(fp, "        logic signed [63:0]  signed_d;\n");
     fprintf(fp, "        logic signed [65:0]  q_cit66, div_den66;\n");
+    fprintf(fp, "        logic signed [98:0]  neg_g0_s99;\n");
     fprintf(fp, "        logic signed [127:0] neg_g0;\n");
     fprintf(fp, "        logic                has_r2, real_roots;\n");
     fprintf(fp, "        logic [127:0]        anum128;\n");
     fprintf(fp, "        logic [63:0]         aden64;\n");
     fprintf(fp, "        logic                den_zero;\n");
-        fprintf(fp, "        logic signed [127:0] g1_dc128, r2_dsq128, push_q49, j0_au_next;\n");
-        fprintf(fp, "        logic                lyap_ok;\n");
-        fprintf(fp, "        logic signed [32:0]  delta_act;\n");
-        fprintf(fp, "        logic signed [63:0]  j0_op_out, j1_op_out, j0_au_out, j1_au_out;\n");
-        fprintf(fp, "        logic [15:0]         raw_chart;\n\n");
+    fprintf(fp, "        logic signed [127:0] g1_dc128, r2_dsq128;\n");
+    fprintf(fp, "        logic                lyap_ok;\n");
+    fprintf(fp, "        logic signed [32:0]  delta_act;\n");
+    fprintf(fp, "        logic [32:0]         delta_mag33;\n");
+    fprintf(fp, "        logic signed [63:0]  j0_op_out, j1_op_out, j0_au_out, j1_au_out;\n");
+    fprintf(fp, "        logic [15:0]         raw_chart;\n\n");
 
-    /* Cone A POST_LOGIC */
+    /* Cone A POST_LOGIC (`b0_eff` computed in exact 64b `(b0<<16) - ug_u`, zero-carry low limbs) */
+    const char *a5_a7      = ref_sig(ca, 5, 7, "n_a5_b2xsq_lo_c", "n_a5_b2xsq_lo_q");
+    const char *a6_a7      = ref_sig(ca, 6, 7, "n_a6_b2xsq_hi_c", "n_a6_b2xsq_hi_q");
+    const char *b0e_a7     = ref_sig(ca, 4, 7, "n_a4_b0_eff64_c", "b0_eff64_q");
+    const char *b1x_a7     = ref_sig(ca, 1, 7, "n_a1_b1_x_c",     "n_a1_b1_x_q");
+    const char *b0e_a9     = ref_sig(ca, 4, 9, "n_a4_b0_eff64_c", "b0_eff64_q");
     fprintf(fp, "        // Cone A (`A4`, `A7`, `A8`, `A9`, `A10`)\n");
-    fprintf(fp, "        n_a4_b0_eff_c = ($signed({{96{b0_q[31]}}, b0_q}) <<< 33) -\n");
-    fprintf(fp, "                        ($signed({{64{%s[63]}}, %s}) <<< 17);\n",
-            ref_sig(ca, 0, 4, "n_a0_ug_u_c", "n_a0_ug_u_q"),
+    fprintf(fp, "        n_a4_b0_eff64_c = $signed({{16{b0_q[31]}}, b0_q, 16'd0}) - %s;\n",
             ref_sig(ca, 0, 4, "n_a0_ug_u_c", "n_a0_ug_u_q"));
-    fprintf(fp, "        b2_xsq128     = ($signed({{62{%s[65]}}, %s}) <<< 32) +\n",
-            ref_sig(ca, 6, 7, "n_a6_b2xsq_hi_c", "n_a6_b2xsq_hi_q"),
-            ref_sig(ca, 6, 7, "n_a6_b2xsq_hi_c", "n_a6_b2xsq_hi_q"));
-    fprintf(fp, "                        $signed({{62{%s[65]}}, %s});\n",
-            ref_sig(ca, 5, 7, "n_a5_b2xsq_lo_c", "n_a5_b2xsq_lo_q"),
-            ref_sig(ca, 5, 7, "n_a5_b2xsq_lo_c", "n_a5_b2xsq_lo_q"));
-    fprintf(fp, "        n_a7_g0_op_c  = %s + ($signed({{64{%s[63]}}, %s}) <<< 17) + b2_xsq128;\n",
-            ref_sig(ca, 4, 7, "n_a4_b0_eff_c", "n_a4_b0_eff_q"),
-            ref_sig(ca, 1, 7, "n_a1_b1_x_c", "n_a1_b1_x_q"),
-            ref_sig(ca, 1, 7, "n_a1_b1_x_c", "n_a1_b1_x_q"));
-    fprintf(fp, "        n_a8_g1_op_c  = ($signed({{32{b1_q[31]}}, b1_q}) <<< 16) + %s;\n",
+    fprintf(fp, "        b2_xsq_hi67     = $signed({%s[65], %s}) + $signed({{33{%s[65]}}, %s[65:32]});\n",
+            a6_a7, a6_a7, a5_a7, a5_a7);
+    fprintf(fp, "        b2_xsq128       = $signed({{29{b2_xsq_hi67[66]}}, b2_xsq_hi67, %s[31:0]});\n", a5_a7);
+    fprintf(fp, "        b0_b1_q32       = $signed({%s[63], %s}) + $signed({%s[63], %s});\n",
+            b0e_a7, b0e_a7, b1x_a7, b1x_a7);
+    fprintf(fp, "        g0_op_hi81      = $signed(b2_xsq128[97:17]) + $signed({{16{b0_b1_q32[64]}}, b0_b1_q32});\n");
+    fprintf(fp, "        n_a7_g0_op_c    = $signed({{30{g0_op_hi81[80]}}, g0_op_hi81, b2_xsq128[16:0]});\n");
+    fprintf(fp, "        n_a8_g1_op_c    = $signed({{16{b1_q[31]}}, b1_q, 16'd0}) + %s;\n",
             ref_sig(ca, 3, 8, "n_a3_b2_x_c", "n_a3_b2_x_q"));
-    fprintf(fp, "        j0_in         = clamp_sym64($signed(state_w_q[0]), 64'sh1000_0000_0000_0000);\n");
-    fprintf(fp, "        j1_in         = clamp_sym64($signed(state_w_q[1]), 64'sh0000_2000_0000_0000);\n");
-    fprintf(fp, "        j2_in         = clamp_sym64_to_32(state_w_q[2]);\n");
+    fprintf(fp, "        j0_in           = clamp_j0_sym64($signed(state_w_q[0]));\n");
+    fprintf(fp, "        j1_in           = clamp_j1_sym64($signed(state_w_q[1]));\n");
     fprintf(fp, "        sub_valid     = ($signed(state_w_q[0]) == j0_in) & ($signed(state_w_q[1]) == j1_in);\n");
-    fprintf(fp, "        j0_sub_in     = sub_valid ? state_w_q[7][32:0]  : 33'd0;\n");
-    fprintf(fp, "        j1_sub_in     = sub_valid ? state_w_q[7][63:48] : 16'd0;\n");
-    fprintf(fp, "        j0_q49        = ($signed({{64{j0_in[63]}}, j0_in}) <<< 33) + $signed({95'd0, j0_sub_in});\n");
-    fprintf(fp, "        n_a9_j1_q32_c = (j1_in <<< 16) + $signed({48'd0, j1_sub_in});\n");
-    fprintf(fp, "        n_a9_g0_au_c  = j0_q49 - %s;\n",
-            ref_sig(ca, 4, 9, "n_a4_b0_eff_c", "n_a4_b0_eff_q"));
-    fprintf(fp, "        n_a10_op_mask_c = (b1_q != 32'sd0) | (b2_q != 32'sd0);\n");
+    fprintf(fp, "        j0_sub_in       = sub_valid ? state_w_q[7][32:0]  : 33'd0;\n");
+    fprintf(fp, "        j1_sub_in       = sub_valid ? state_w_q[7][63:48] : 16'd0;\n");
+    fprintf(fp, "        j0_q49          = $signed({j0_in[61:0], j0_sub_in});\n");
+    fprintf(fp, "        n_a9_j1_q32_c   = $signed({j1_in[47:0], j1_sub_in});\n");
+    fprintf(fp, "        g0_au_hi78      = $signed(j0_q49[94:17]) - $signed({{14{%s[63]}}, %s});\n",
+            b0e_a9, b0e_a9);
+    fprintf(fp, "        n_a9_g0_au_c    = $signed({{33{g0_au_hi78[77]}}, g0_au_hi78, j0_q49[16:0]});\n");
+    fprintf(fp, "        n_a10_op_mask_c = op_mask_q;\n");
     fprintf(fp, "        n_a10_g0_c      = n_a10_op_mask_c ? %s : %s;\n",
             ref_sig(ca, 7, 10, "n_a7_g0_op_c", "n_a7_g0_op_q"),
             ref_sig(ca, 9, 10, "n_a9_g0_au_c", "n_a9_g0_au_q"));
     fprintf(fp, "        n_a10_g1_c      = n_a10_op_mask_c ? %s : %s;\n",
             ref_sig(ca, 8, 10, "n_a8_g1_op_c", "n_a8_g1_op_q"),
             ref_sig(ca, 9, 10, "n_a9_j1_q32_c", "n_a9_j1_q32_q"));
-    fprintf(fp, "        n_a10_r2_c      = n_a10_op_mask_c ? b2_q : j2_in;\n");
-    fprintf(fp, "        n_a10_has_r2_c  = (n_a10_r2_c != 32'sd0);\n");
+    fprintf(fp, "        n_a10_has_r2_c  = r2_nz_c;\n");
     fprintf(fp, "        n_a10_active_c  = (n_a10_g0_c != 128'sd0) & ((n_a10_g1_c != 64'sd0) | n_a10_has_r2_c);\n\n");
 
-    /* Cone B POST_LOGIC */
+    /* Cone B POST_LOGIC (`ll < 2^64` folds `(hh <<< 64) + ll` to `{hh[63:0], ll[63:0]}`) */
+    const char *b0_b6 = ref_sig(cb, 0, 6, "n_b0_g1_ll_c",  "n_b0_g1_ll_q");
+    const char *b1_b6 = ref_sig(cb, 1, 6, "n_b1_g1_hl_c",  "n_b1_g1_hl_q");
+    const char *b2_b6 = ref_sig(cb, 2, 6, "n_b2_g1_hh_c",  "n_b2_g1_hh_q");
+    const char *b3_b7 = ref_sig(cb, 3, 7, "n_b3_g0r2_0_c", "n_b3_g0r2_0_q");
+    const char *b4_b7 = ref_sig(cb, 4, 7, "n_b4_g0r2_1_c", "n_b4_g0r2_1_q");
+    const char *b5_b7 = ref_sig(cb, 5, 7, "n_b5_g0r2_2_c", "n_b5_g0r2_2_q");
     fprintf(fp, "        // Cone B (`B6`, `B7`, `B8`)\n");
-    fprintf(fp, "        n_b6_g1_sq_c  = ($signed({{62{%s[65]}}, %s}) <<< 64) +\n",
-            ref_sig(cb, 2, 6, "n_b2_g1_hh_c", "n_b2_g1_hh_q"),
-            ref_sig(cb, 2, 6, "n_b2_g1_hh_c", "n_b2_g1_hh_q"));
-    fprintf(fp, "                        ($signed({{62{%s[65]}}, %s}) <<< 33) +\n",
-            ref_sig(cb, 1, 6, "n_b1_g1_hl_c", "n_b1_g1_hl_q"),
-            ref_sig(cb, 1, 6, "n_b1_g1_hl_c", "n_b1_g1_hl_q"));
-    fprintf(fp, "                        $signed({{62{%s[65]}}, %s});\n",
-            ref_sig(cb, 0, 6, "n_b0_g1_ll_c", "n_b0_g1_ll_q"),
-            ref_sig(cb, 0, 6, "n_b0_g1_ll_c", "n_b0_g1_ll_q"));
-    fprintf(fp, "        n_b7_g0_r2_c  = ($signed({{62{%s[65]}}, %s}) <<< 64) +\n",
-            ref_sig(cb, 5, 7, "n_b5_g0r2_2_c", "n_b5_g0r2_2_q"),
-            ref_sig(cb, 5, 7, "n_b5_g0r2_2_c", "n_b5_g0r2_2_q"));
-    fprintf(fp, "                        ($signed({{62{%s[65]}}, %s}) <<< 32) +\n",
-            ref_sig(cb, 4, 7, "n_b4_g0r2_1_c", "n_b4_g0r2_1_q"),
-            ref_sig(cb, 4, 7, "n_b4_g0r2_1_c", "n_b4_g0r2_1_q"));
-    fprintf(fp, "                        $signed({{62{%s[65]}}, %s});\n",
-            ref_sig(cb, 3, 7, "n_b3_g0r2_0_c", "n_b3_g0r2_0_q"),
-            ref_sig(cb, 3, 7, "n_b3_g0r2_0_c", "n_b3_g0r2_0_q"));
+    fprintf(fp, "        n_b6_g1_sq_c  = ($signed({{62{%s[65]}}, %s}) <<< 33) +\n", b1_b6, b1_b6);
+    fprintf(fp, "                        $signed({%s[63:0], %s[63:0]});\n", b2_b6, b0_b6);
+    fprintf(fp, "        b7_hi96       = $signed({%s[63:0], 32'd0}) +\n", b5_b7);
+    fprintf(fp, "                        $signed({{30{%s[65]}}, %s}) +\n", b4_b7, b4_b7);
+    fprintf(fp, "                        $signed({{62{%s[65]}}, %s[65:32]});\n", b3_b7, b3_b7);
+    fprintf(fp, "        n_b7_g0_r2_c  = $signed({b7_hi96, %s[31:0]});\n", b3_b7);
     fprintf(fp, "        n_b8_disc_c   = %s - %s;\n",
             ref_sig(cb, 6, 8, "n_b6_g1_sq_c", "n_b6_g1_sq_q"),
             ref_sig(cb, 7, 8, "n_b7_g0_r2_c", "n_b7_g0_r2_q"));
     fprintf(fp, "        n_b8_pos_nz_c = (~n_b8_disc_c[127]) & (n_b8_disc_c != 128'sd0);\n\n");
 
-    /* Cone D POST_LOGIC (`real_roots` tracked cleanly via `d_mag_q` / `real_roots_q`) */
+    /* Cone D POST_LOGIC (`d_mag_w` aliases `sr_acc_q`, saving 64 dedicated DFFs!) */
     fprintf(fp, "        // Cone D (`D0`, `D1`)\n");
-    fprintf(fp, "        has_r2           = (r2_q != 32'sd0);\n");
-    fprintf(fp, "        real_roots       = ~d_mag_q[63];\n");
+    fprintf(fp, "        has_r2           = r2_nz_c;\n");
+    fprintf(fp, "        real_roots       = ~d_mag_w[63];\n");
     fprintf(fp, "        d_neg            = (g1_q < 64'sd0) | ((g1_q == 64'sd0) & (r2_q < 32'sd0));\n");
-    fprintf(fp, "        signed_d         = d_neg ? $signed(64'd0 - {1'b0, d_mag_q[62:0]}) : $signed({1'b0, d_mag_q[62:0]});\n");
+    fprintf(fp, "        signed_d         = d_neg ? $signed(64'd0 - {1'b0, d_mag_w[62:0]}) : $signed({1'b0, d_mag_w[62:0]});\n");
     fprintf(fp, "        q_cit66          = $signed({{2{g1_q[63]}}, g1_q}) + $signed({{2{signed_d[63]}}, signed_d});\n");
-    fprintf(fp, "        neg_g0           = 128'sd0 - g0_q;\n");
+    fprintf(fp, "        neg_g0_s99       = 99'sd0 - $signed({g0_s98_q[97], g0_s98_q});\n");
+    fprintf(fp, "        neg_g0           = $signed({{29{neg_g0_s99[98]}}, neg_g0_s99});\n");
     fprintf(fp, "        n_d0_div_num_c   = (has_r2 & (~real_roots)) ? (128'sd0 - $signed({{64{g1_q[63]}}, g1_q})) : neg_g0;\n");
     fprintf(fp, "        div_den66        = has_r2 ? (real_roots ? q_cit66 : $signed({{34{r2_q[31]}}, r2_q}))\n");
     fprintf(fp, "                                  : ($signed({{2{g1_q[63]}}, g1_q}) <<< 1);\n");
@@ -912,28 +2051,27 @@ static void emit_sv(FILE *fp, int dsp_count, int max_depth, int k_rad, uint32_t 
     fprintf(fp, "        n_d1_init_quot_c = anum128[63:0];\n\n");
 
     /* Cone C POST_LOGIC (`C7`, `C8`, `C9`, `C10`) */
+    const char *c2_c7 = ref_sig(cc, 2, 7, "n_c2_g1dc_lo_c",  "n_c2_g1dc_lo_q");
+    const char *c3_c7 = ref_sig(cc, 3, 7, "n_c3_g1dc_hi_c",  "n_c3_g1dc_hi_q");
+    const char *c5_c7 = ref_sig(cc, 5, 7, "n_c5_r2dsq_lo_c", "n_c5_r2dsq_lo_q");
+    const char *c6_c7 = ref_sig(cc, 6, 7, "n_c6_r2dsq_hi_c", "n_c6_r2dsq_hi_q");
     fprintf(fp, "        // Cone C (`C7`, `C8`, `C9`, `C10`)\n");
-    fprintf(fp, "        g1_dc128        = ($signed({{62{%s[65]}}, %s}) <<< 32) +\n",
-            ref_sig(cc, 3, 7, "n_c3_g1dc_hi_c", "n_c3_g1dc_hi_q"),
-            ref_sig(cc, 3, 7, "n_c3_g1dc_hi_c", "n_c3_g1dc_hi_q"));
-    fprintf(fp, "                          $signed({{62{%s[65]}}, %s});\n",
-            ref_sig(cc, 2, 7, "n_c2_g1dc_lo_c", "n_c2_g1dc_lo_q"),
-            ref_sig(cc, 2, 7, "n_c2_g1dc_lo_c", "n_c2_g1dc_lo_q"));
-    fprintf(fp, "        r2_dsq128       = ($signed({{62{%s[65]}}, %s}) <<< 32) +\n",
-            ref_sig(cc, 6, 7, "n_c6_r2dsq_hi_c", "n_c6_r2dsq_hi_q"),
-            ref_sig(cc, 6, 7, "n_c6_r2dsq_hi_c", "n_c6_r2dsq_hi_q"));
-    fprintf(fp, "                          $signed({{62{%s[65]}}, %s});\n",
-            ref_sig(cc, 5, 7, "n_c5_r2dsq_lo_c", "n_c5_r2dsq_lo_q"),
-            ref_sig(cc, 5, 7, "n_c5_r2dsq_lo_c", "n_c5_r2dsq_lo_q"));
-    fprintf(fp, "        push_q49        = (g1_dc128 <<< 1) + r2_dsq128;\n");
-    fprintf(fp, "        n_c7_g0_cand_c  = g0_q + push_q49;\n");
+    fprintf(fp, "        g1_dc_hi67      = $signed({%s[65], %s}) + $signed({{33{%s[65]}}, %s[65:32]});\n",
+            c3_c7, c3_c7, c2_c7, c2_c7);
+    fprintf(fp, "        g1_dc128        = $signed({{29{g1_dc_hi67[66]}}, g1_dc_hi67, %s[31:0]});\n", c2_c7);
+    fprintf(fp, "        r2_dsq_hi67     = $signed({%s[65], %s}) + $signed({{33{%s[65]}}, %s[65:32]});\n",
+            c6_c7, c6_c7, c5_c7, c5_c7);
+    fprintf(fp, "        r2_dsq128       = $signed({{29{r2_dsq_hi67[66]}}, r2_dsq_hi67, %s[31:0]});\n", c5_c7);
+    fprintf(fp, "        push_hi98       = $signed({g1_dc128[96:0], 1'b0}) + $signed(r2_dsq128[97:0]);\n");
+    fprintf(fp, "        cand_s99        = $signed({g0_s98_q[97], g0_s98_q}) + $signed({push_hi98[97], push_hi98});\n");
+    fprintf(fp, "        n_c7_g0_cand_c  = $signed({{29{cand_s99[98]}}, cand_s99});\n");
     fprintf(fp, "        lyap_ok         = (~fast_path_q) & (abs128(%s) <= abs128(g0_q));\n",
             ref_sig(cc, 7, 8, "n_c7_g0_cand_c", "n_c7_g0_cand_q"));
     fprintf(fp, "        delta_act       = lyap_ok ? %s : 33'sd0;\n",
             ref_sig(cc, 0, 8, "n_c0_dc_c", "n_c0_dc_q"));
-    fprintf(fp, "        n_c8_xp_c       = $signed(x_clamped_q + delta_act[31:0]);\n");
-    fprintf(fp, "        n_c8_dt_res_c   = delta_act[32] ? (64'd0 - {{31{delta_act[32]}}, $unsigned(delta_act)})\n");
-    fprintf(fp, "                                        : {31'd0, $unsigned(delta_act)};\n");
+    fprintf(fp, "        n_c8_xp_c       = $signed(x_in_clamped_c + delta_act[31:0]);\n");
+    fprintf(fp, "        delta_mag33     = delta_act[32] ? (33'd0 - $unsigned(delta_act)) : $unsigned(delta_act);\n");
+    fprintf(fp, "        n_c8_dt_res_c   = {31'd0, delta_mag33};\n");
     fprintf(fp, "        n_c8_g0_post_c  = lyap_ok ? %s : g0_q;\n",
             ref_sig(cc, 7, 8, "n_c7_g0_cand_c", "n_c7_g0_cand_q"));
     fprintf(fp, "        n_c8_g1_post_c  = g1_q + (lyap_ok ? %s : 64'sd0);\n",
@@ -943,13 +2081,14 @@ static void emit_sv(FILE *fp, int dsp_count, int max_depth, int k_rad, uint32_t 
     const char *g1p_c9 = ref_sig(cc, 8, 9, "n_c8_g1_post_c", "n_c8_g1_post_q");
     fprintf(fp, "        j0_op_out       = sym_shr128_33(%s);\n", g0p_c9);
     fprintf(fp, "        j1_op_out       = sym_shr64_16(%s);\n", g1p_c9);
-    fprintf(fp, "        j0_au_next      = %s + b0_eff_q;\n", g0p_c9);
-    fprintf(fp, "        j0_au_out       = clamp_sym64($signed(j0_au_next[96:33]), 64'sh1000_0000_0000_0000);\n");
-    fprintf(fp, "        j1_au_out       = clamp_sym64($signed({{16{%s[63]}}, %s[63:16]}), 64'sh0000_2000_0000_0000);\n",
+    fprintf(fp, "        j0_au_next97    = {$unsigned(%s[96:17]) + {{16{b0_eff64_q[63]}}, $unsigned(b0_eff64_q)}, %s[16:0]};\n",
+            g0p_c9, g0p_c9);
+    fprintf(fp, "        j0_au_out       = clamp_j0_sym64($signed(j0_au_next97[96:33]));\n");
+    fprintf(fp, "        j1_au_out       = clamp_j1_sym64($signed({{16{%s[63]}}, %s[63:16]}));\n",
             g1p_c9, g1p_c9);
     fprintf(fp, "        n_c9_j0_next_c  = $unsigned(op_mask_q ? j0_op_out : j0_au_out);\n");
     fprintf(fp, "        n_c9_j1_next_c  = $unsigned(op_mask_q ? j1_op_out : j1_au_out);\n");
-    fprintf(fp, "        n_c9_sub_next_c = op_mask_q ? 64'd0 : {%s[15:0], 15'd0, j0_au_next[32:0]};\n", g1p_c9);
+    fprintf(fp, "        n_c9_sub_next_c = op_mask_q ? 64'd0 : {%s[15:0], 15'd0, j0_au_next97[32:0]};\n", g1p_c9);
 
     const char *xp_c10  = ref_sig(cc, 8, 10, "n_c8_xp_c",      "n_c8_xp_q");
     const char *g0p_c10 = ref_sig(cc, 8, 10, "n_c8_g0_post_c", "n_c8_g0_post_q");
@@ -958,7 +2097,92 @@ static void emit_sv(FILE *fp, int dsp_count, int max_depth, int k_rad, uint32_t 
     fprintf(fp, "        n_c10_chart_next_c = raw_chart & cap_mask16_q;\n");
     fprintf(fp, "        n_c10_mode_proj_c  = (mode_req_q & (~kan_lock_q)) | (state_w_q[5][15:0] & kan_lock_q);\n");
     fprintf(fp, "        n_c10_conv_c       = (abs128(%s) <= 128'h0000_0000_0000_0000_0000_0008_0000_0000);\n", g0p_c10);
-    fprintf(fp, "        if (&{1'b0, j0_au_next[127:97]}) begin end\n");
+    fprintf(fp, "        if (&{1'b0, j0_in[63:62], %s[65:64], %s[65:64], %s[65:64], b2_xsq128[127:98], g1_dc128[127:97], r2_dsq128[127:98], n_a7_g0_op_c[127:98], n_a9_g0_au_c[127:95], n_a10_g0_c[127:98], n_d0_div_num_c[126:99], n_c7_g0_cand_c[127:99], n_c8_g0_post_c[127:99], delta_mag33[32], n_c8_dt_res_c[63:32]}) begin end\n",
+            b0_b6, b2_b6, b5_b7);
+    fprintf(fp, "    end\n\n");
+
+    /* Pass-2 Shared Physical Lane Write-Enable & Deduplicated Data Steering Muxes */
+    fprintf(fp, "    // =========================================================================\n");
+    fprintf(fp, "    // Pass-2 Clock-Enabled Shared Physical Cut Register Steering (`0` idle flips)\n");
+    fprintf(fp, "    // =========================================================================\n");
+    fprintf(fp, "    always_comb begin\n");
+    for (int ln = 0; ln < ra->num_lanes; ++ln) {
+        fprintf(fp, "        sh_lane%d_we_c = 1'b0;\n", ln);
+    }
+    fprintf(fp, "        case (st_q)\n");
+    for (int s = 1; s < num_st; ++s) {
+        bool any_wr = false;
+        for (int r = 0; r < ra->num_reqs; ++r) {
+            if (ra->reqs[r].birth_state == s) {
+                any_wr = true;
+                break;
+            }
+        }
+        if (!any_wr) {
+            continue;
+        }
+        fprintf(fp, "            %d'd%d: begin\n", st_w, s);
+        for (int r = 0; r < ra->num_reqs; ++r) {
+            const ssa_scalar_live_t *rq = &ra->reqs[r];
+            if (rq->birth_state != s) {
+                continue;
+            }
+            fprintf(fp, "                // %s [%d -> %d] -> sh_lane%d\n",
+                    rq->tag, rq->birth_state, rq->last_read_state, rq->phys_lane);
+            fprintf(fp, "                sh_lane%d_we_c = %s;\n",
+                    rq->phys_lane, rq->we_guard);
+        }
+        fprintf(fp, "            end\n");
+    }
+    fprintf(fp, "            default: begin end\n");
+    fprintf(fp, "        endcase\n");
+    for (int ln = 0; ln < ra->num_lanes; ++ln) {
+        int         lw = ra->lane_width[ln];
+        int         u_w[MAX_SCALAR_REQS];
+        const char *u_expr[MAX_SCALAR_REQS];
+        int         num_u = 0;
+        for (int r = 0; r < ra->num_reqs; ++r) {
+            const ssa_scalar_live_t *rq = &ra->reqs[r];
+            if (rq->phys_lane != ln) continue;
+            bool seen = false;
+            for (int u = 0; u < num_u; ++u) {
+                if (u_w[u] == rq->bit_width && strcmp(u_expr[u], rq->val_expr) == 0) {
+                    seen = true;
+                    break;
+                }
+            }
+            if (!seen) {
+                u_w[num_u]    = rq->bit_width;
+                u_expr[num_u] = rq->val_expr;
+                num_u++;
+            }
+        }
+        if (num_u == 1) {
+            fprintf(fp, "        sh_lane%d_d_c = ", ln);
+            emit_lane_rhs(fp, lw, u_w[0], u_expr[0]);
+            fprintf(fp, ";\n");
+        } else {
+            for (int u = 0; u < num_u - 1; ++u) {
+                fprintf(fp, "        %sif (", (u == 0) ? "" : "else ");
+                bool first_st = true;
+                for (int r = 0; r < ra->num_reqs; ++r) {
+                    const ssa_scalar_live_t *rq = &ra->reqs[r];
+                    if (rq->phys_lane == ln && rq->bit_width == u_w[u] &&
+                        strcmp(rq->val_expr, u_expr[u]) == 0) {
+                        if (!first_st) fprintf(fp, " || ");
+                        fprintf(fp, "(st_q == %d'd%d)", st_w, rq->birth_state);
+                        first_st = false;
+                    }
+                }
+                fprintf(fp, ") sh_lane%d_d_c = ", ln);
+                emit_lane_rhs(fp, lw, u_w[u], u_expr[u]);
+                fprintf(fp, ";\n");
+            }
+            fprintf(fp, "        else sh_lane%d_d_c = ", ln);
+            emit_lane_rhs(fp, lw, u_w[num_u - 1], u_expr[num_u - 1]);
+            fprintf(fp, ";\n");
+        }
+    }
     fprintf(fp, "    end\n\n");
 
     /* Sequential FSM & Pipeline Register Transitions */
@@ -984,92 +2208,48 @@ static void emit_sv(FILE *fp, int dsp_count, int max_depth, int k_rad, uint32_t 
     fprintf(fp, "            kan_lock_q   <= 16'd0;\n");
     fprintf(fp, "            cap_mask16_q <= 16'hFFFF;\n");
     fprintf(fp, "            mode_req_q   <= 16'd0;\n");
-    fprintf(fp, "            op_mask_q    <= 1'b0;\n");
     fprintf(fp, "            fast_path_q  <= 1'b0;\n");
-    fprintf(fp, "            x_clamped_q  <= 32'sd0;\n");
-    fprintf(fp, "            b0_eff_q     <= 128'sd0;\n");
-    fprintf(fp, "            g0_q         <= 128'sd0;\n");
+    fprintf(fp, "            b0_eff64_q   <= 64'sd0;\n");
+    fprintf(fp, "            g0_s98_q     <= 98'sd0;\n");
     fprintf(fp, "            g1_q         <= 64'sd0;\n");
-    fprintf(fp, "            r2_q         <= 32'sd0;\n");
-    fprintf(fp, "            d_mag_q      <= 64'd0;\n");
     fprintf(fp, "            div_neg_q    <= 1'b0;\n");
     fprintf(fp, "            pre_sat_q    <= 1'b0;\n");
     fprintf(fp, "            sr_rem_q     <= 64'd0;\n");
     fprintf(fp, "            sr_acc_q     <= 64'd0;\n");
     fprintf(fp, "            sr_aux_q     <= 128'd0;\n");
-
-    if (ca->nodes[0].needs_reg) fprintf(fp, "            n_a0_ug_u_q      <= 64'sd0;\n");
-    if (ca->nodes[1].needs_reg) fprintf(fp, "            n_a1_b1_x_q      <= 64'sd0;\n");
-    if (ca->nodes[2].needs_reg) fprintf(fp, "            n_a2_x_sq_q      <= 64'd0;\n");
-    if (ca->nodes[3].needs_reg) fprintf(fp, "            n_a3_b2_x_q      <= 64'sd0;\n");
-    if (ca->nodes[4].needs_reg) fprintf(fp, "            n_a4_b0_eff_q    <= 128'sd0;\n");
-    if (ca->nodes[5].needs_reg) fprintf(fp, "            n_a5_b2xsq_lo_q  <= 66'sd0;\n");
-    if (ca->nodes[6].needs_reg) fprintf(fp, "            n_a6_b2xsq_hi_q  <= 66'sd0;\n");
-    if (ca->nodes[7].needs_reg) fprintf(fp, "            n_a7_g0_op_q     <= 128'sd0;\n");
-    if (ca->nodes[8].needs_reg) fprintf(fp, "            n_a8_g1_op_q     <= 64'sd0;\n");
-    if (ca->nodes[9].needs_reg) {
-        fprintf(fp, "            n_a9_g0_au_q     <= 128'sd0;\n");
-        fprintf(fp, "            n_a9_j1_q32_q    <= 64'sd0;\n");
+    for (int ln = 0; ln < ra->num_lanes; ++ln) {
+        fprintf(fp, "            sh_lane%d_q   <= %d'd0;\n", ln, ra->lane_width[ln]);
     }
-    if (cb->nodes[0].needs_reg) fprintf(fp, "            n_b0_g1_ll_q     <= 66'sd0;\n");
-    if (cb->nodes[1].needs_reg) fprintf(fp, "            n_b1_g1_hl_q     <= 66'sd0;\n");
-    if (cb->nodes[2].needs_reg) fprintf(fp, "            n_b2_g1_hh_q     <= 66'sd0;\n");
-    if (cb->nodes[3].needs_reg) fprintf(fp, "            n_b3_g0r2_0_q    <= 66'sd0;\n");
-    if (cb->nodes[4].needs_reg) fprintf(fp, "            n_b4_g0r2_1_q    <= 66'sd0;\n");
-    if (cb->nodes[5].needs_reg) fprintf(fp, "            n_b5_g0r2_2_q    <= 66'sd0;\n");
-    if (cb->nodes[6].needs_reg) fprintf(fp, "            n_b6_g1_sq_q     <= 128'sd0;\n");
-    if (cb->nodes[7].needs_reg) fprintf(fp, "            n_b7_g0_r2_q     <= 128'sd0;\n");
-    if (cd->nodes[0].needs_reg) {
-        fprintf(fp, "            n_d0_div_num_q   <= 128'sd0;\n");
-        fprintf(fp, "            n_d0_div_den_q   <= 65'd0;\n");
-        fprintf(fp, "            n_d0_div_neg_q   <= 1'b0;\n");
-    }
-    if (cc->nodes[0].needs_reg) fprintf(fp, "            n_c0_dc_q        <= 33'sd0;\n");
-    if (cc->nodes[1].needs_reg) fprintf(fp, "            n_c1_dsq_q       <= 64'sd0;\n");
-    if (cc->nodes[2].needs_reg) fprintf(fp, "            n_c2_g1dc_lo_q   <= 66'sd0;\n");
-    if (cc->nodes[3].needs_reg) fprintf(fp, "            n_c3_g1dc_hi_q   <= 66'sd0;\n");
-    if (cc->nodes[4].needs_reg) fprintf(fp, "            n_c4_r2_dc_q     <= 64'sd0;\n");
-    if (cc->nodes[5].needs_reg) fprintf(fp, "            n_c5_r2dsq_lo_q  <= 66'sd0;\n");
-    if (cc->nodes[6].needs_reg) fprintf(fp, "            n_c6_r2dsq_hi_q  <= 66'sd0;\n");
-    if (cc->nodes[7].needs_reg) fprintf(fp, "            n_c7_g0_cand_q   <= 128'sd0;\n");
-    if (cc->nodes[8].needs_reg) {
-        fprintf(fp, "            n_c8_g0_post_q   <= 128'sd0;\n");
-        fprintf(fp, "            n_c8_g1_post_q   <= 64'sd0;\n");
-        fprintf(fp, "            n_c8_xp_q        <= 32'sd0;\n");
-        fprintf(fp, "            n_c8_dt_res_q    <= 64'd0;\n");
-    }
-    if (cc->nodes[9].needs_reg) {
-        fprintf(fp, "            n_c9_j0_next_q   <= 64'd0;\n");
-        fprintf(fp, "            n_c9_j1_next_q   <= 64'd0;\n");
-        fprintf(fp, "            n_c9_sub_next_q  <= 64'd0;\n");
-    }
-
     fprintf(fp, "        end else begin\n");
+    for (int ln = 0; ln < ra->num_lanes; ++ln) {
+        fprintf(fp, "            if (sh_lane%d_we_c) sh_lane%d_q <= sh_lane%d_d_c;\n", ln, ln, ln);
+    }
     fprintf(fp, "            done_q <= 1'b0;\n");
     fprintf(fp, "            case (st_q)\n");
 
-    /* ST_IDLE (0): 64-bit streaming ingress */
+    /* ST_IDLE (0): 64-bit streaming ingress (constant-index word enables kill 512b barrel shifter) */
     fprintf(fp, "                %d'd%d: begin\n", st_w, st_idle);
     fprintf(fp, "                    if (wr_valid_i) begin\n");
     fprintf(fp, "                        case (wr_kind_i)\n");
-    fprintf(fp, "                            2'd0: state_w_q[wr_idx_i] <= wr_data_i;\n");
+    fprintf(fp, "                            2'd0: begin\n");
+    fprintf(fp, "                                case (wr_idx_i)\n");
+    for (int wi = 0; wi < 8; ++wi) {
+        fprintf(fp, "                                    3'd%d: state_w_q[%d] <= wr_data_i;\n", wi, wi);
+    }
+    fprintf(fp, "                                endcase\n");
+    fprintf(fp, "                            end\n");
     fprintf(fp, "                            2'd1: begin\n");
     fprintf(fp, "                                case (wr_idx_i)\n");
-    fprintf(fp, "                                    3'd0: b0_q <= clamp_sym64_to_32(wr_data_i);\n");
-    fprintf(fp, "                                    3'd1: b1_q <= clamp_sym64_to_32(wr_data_i);\n");
-    fprintf(fp, "                                    3'd2: b2_q <= clamp_sym64_to_32(wr_data_i);\n");
+    fprintf(fp, "                                    3'd0: b0_q <= wr_clamped32_c;\n");
+    fprintf(fp, "                                    3'd1: b1_q <= wr_clamped32_c;\n");
+    fprintf(fp, "                                    3'd2: b2_q <= wr_clamped32_c;\n");
     fprintf(fp, "                                    3'd3: begin\n");
-    fprintf(fp, "                                        logic signed [31:0] ex_c, en_c;\n");
-    fprintf(fp, "                                        ex_c      = clamp_sym32(wr_data_i[63:32]);\n");
-    fprintf(fp, "                                        en_c      = clamp_sym32(wr_data_i[31:0]);\n");
     fprintf(fp, "                                        b_exit_q  <= ex_c;\n");
     fprintf(fp, "                                        b_enter_q <= (en_c < ex_c) ? ex_c : en_c;\n");
     fprintf(fp, "                                    end\n");
     fprintf(fp, "                                    3'd4: begin\n");
-    fprintf(fp, "                                        logic signed [31:0] dt_c;\n");
-    fprintf(fp, "                                        dt_c     = clamp_sym32(wr_data_i[63:32]);\n");
     fprintf(fp, "                                        dt_max_q <= (dt_c < 32'sd1) ? 32'sd1 : dt_c;\n");
-    fprintf(fp, "                                        u_gain_q <= clamp_sym32(wr_data_i[31:0]);\n");
+    fprintf(fp, "                                        u_gain_q <= en_c;\n");
     fprintf(fp, "                                    end\n");
     fprintf(fp, "                                    3'd5: begin\n");
     fprintf(fp, "                                        next_lo_q  <= wr_data_i[31:24];\n");
@@ -1084,8 +2264,7 @@ static void emit_sv(FILE *fp, int dsp_count, int max_depth, int k_rad, uint32_t 
     fprintf(fp, "                                    cap_mask16_q <= wr_data_i[15:0];\n");
     fprintf(fp, "                                    mode_req_q   <= wr_data_i[31:16];\n");
     fprintf(fp, "                                end else if (wr_idx_i == 3'd1) begin\n");
-    fprintf(fp, "                                    u_in_q      <= clamp_sym64_to_32(wr_data_i);\n");
-    fprintf(fp, "                                    x_clamped_q <= x_in_clamped_c;\n");
+    fprintf(fp, "                                    u_in_q      <= wr_clamped32_c;\n");
     fprintf(fp, "                                    fast_path_q <= 1'b0;\n");
     fprintf(fp, "                                    st_q        <= %d'd%d;\n", st_w, base_ca);
     fprintf(fp, "                                end\n");
@@ -1096,84 +2275,40 @@ static void emit_sv(FILE *fp, int dsp_count, int max_depth, int k_rad, uint32_t 
     fprintf(fp, "                end\n");
 
     /* Cone A Stages */
-    static const char *ca_lhs[10] = {
-        "n_a0_ug_u_q     <= n_a0_ug_u_c;",
-        "n_a1_b1_x_q     <= n_a1_b1_x_c;",
-        "n_a2_x_sq_q     <= n_a2_x_sq_c;",
-        "n_a3_b2_x_q     <= n_a3_b2_x_c;",
-        "n_a4_b0_eff_q   <= n_a4_b0_eff_c;",
-        "n_a5_b2xsq_lo_q <= n_a5_b2xsq_lo_c;",
-        "n_a6_b2xsq_hi_q <= n_a6_b2xsq_hi_c;",
-        "n_a7_g0_op_q    <= n_a7_g0_op_c;",
-        "n_a8_g1_op_q    <= n_a8_g1_op_c;",
-        "n_a9_g0_au_q    <= n_a9_g0_au_c;\n                    n_a9_j1_q32_q   <= n_a9_j1_q32_c;",
-    };
     for (int s = 0; s < ca->num_stages; ++s) {
         fprintf(fp, "                %d'd%d: begin\n", st_w, base_ca + s);
-        for (int n = 0; n < 10; ++n) {
-            if (ca->nodes[n].stage == s && ca->nodes[n].needs_reg) {
-                fprintf(fp, "                    %s\n", ca_lhs[n]);
-            }
-        }
         if (s == ca->nodes[4].stage) {
-            fprintf(fp, "                    b0_eff_q <= n_a4_b0_eff_c;\n");
+            fprintf(fp, "                    b0_eff64_q <= n_a4_b0_eff64_c;\n");
         }
         if (s < ca->num_stages - 1) {
             fprintf(fp, "                    st_q <= %d'd%d;\n", st_w, base_ca + s + 1);
         } else {
-            fprintf(fp, "                    op_mask_q <= n_a10_op_mask_c;\n");
-            fprintf(fp, "                    g0_q      <= n_a10_g0_c;\n");
-            fprintf(fp, "                    g1_q      <= n_a10_g1_c;\n");
-            fprintf(fp, "                    r2_q      <= n_a10_r2_c;\n");
+            fprintf(fp, "                    g0_s98_q <= n_a10_g0_c[97:0];\n");
+            fprintf(fp, "                    g1_q     <= n_a10_g1_c;\n");
             fprintf(fp, "                    if (!n_a10_active_c) begin\n");
             fprintf(fp, "                        fast_path_q <= 1'b1;\n");
-            if (cc->nodes[8].needs_reg) {
-                fprintf(fp, "                        n_c8_g0_post_q <= n_a10_g0_c;\n");
-                fprintf(fp, "                        n_c8_g1_post_q <= n_a10_g1_c;\n");
-                fprintf(fp, "                        n_c8_xp_q      <= x_clamped_q;\n");
-                fprintf(fp, "                        n_c8_dt_res_q  <= 64'd0;\n");
-            }
             fprintf(fp, "                        st_q        <= %d'd%d;\n", st_w, base_cc + cc->nodes[9].stage);
             fprintf(fp, "                    end else if (!n_a10_has_r2_c) begin\n");
-            fprintf(fp, "                        d_mag_q <= 64'd0;\n");
-            fprintf(fp, "                        st_q    <= %d'd%d;\n", st_w, base_cd);
+            fprintf(fp, "                        st_q        <= %d'd%d;\n", st_w, base_cd);
             fprintf(fp, "                    end else begin\n");
-            fprintf(fp, "                        st_q <= %d'd%d;\n", st_w, base_cb);
+            fprintf(fp, "                        st_q        <= %d'd%d;\n", st_w, base_cb);
             fprintf(fp, "                    end\n");
         }
         fprintf(fp, "                end\n");
     }
 
-    /* Cone B Stages (`Discriminant`)
-     * Note on `d_mag_q[63]`: Since `disc < 2^126`, `isqrt(disc) < 2^63` (`bit 63 == 0` for all real roots!).
-     * Encoding `d_mag_q = 64'h8000_0000_0000_0000` when `disc < 0` carries `!real_roots` in bit 63
-     * with ZERO extra flip-flops! */
-    static const char *cb_lhs[8] = {
-        "n_b0_g1_ll_q  <= n_b0_g1_ll_c;",
-        "n_b1_g1_hl_q  <= n_b1_g1_hl_c;",
-        "n_b2_g1_hh_q  <= n_b2_g1_hh_c;",
-        "n_b3_g0r2_0_q <= n_b3_g0r2_0_c;",
-        "n_b4_g0r2_1_q <= n_b4_g0r2_1_c;",
-        "n_b5_g0r2_2_q <= n_b5_g0r2_2_c;",
-        "n_b6_g1_sq_q  <= n_b6_g1_sq_c;",
-        "n_b7_g0_r2_q  <= n_b7_g0_r2_c;",
-    };
+    /* Cone B Stages (`Discriminant`) */
     for (int s = 0; s < cb->num_stages; ++s) {
         fprintf(fp, "                %d'd%d: begin\n", st_w, base_cb + s);
-        for (int n = 0; n < 8; ++n) {
-            if (cb->nodes[n].stage == s && cb->nodes[n].needs_reg) {
-                fprintf(fp, "                    %s\n", cb_lhs[n]);
-            }
-        }
         if (s < cb->num_stages - 1) {
             fprintf(fp, "                    st_q <= %d'd%d;\n", st_w, base_cb + s + 1);
         } else {
             fprintf(fp, "                    if (n_b8_disc_c[127]) begin\n");
-            fprintf(fp, "                        d_mag_q <= 64'h8000_0000_0000_0000;\n");
-            fprintf(fp, "                        st_q    <= %d'd%d;\n", st_w, base_cd);
+            fprintf(fp, "                        sr_acc_q <= 64'h8000_0000_0000_0000;\n");
+            fprintf(fp, "                        st_q     <= %d'd%d;\n", st_w, base_cd);
             fprintf(fp, "                    end else if (!n_b8_pos_nz_c) begin\n");
-            fprintf(fp, "                        d_mag_q <= 64'd0;\n");
-            fprintf(fp, "                        st_q    <= %d'd%d;\n", st_w, base_cd);
+            fprintf(fp, "                        sr_acc_q <= 64'd0;\n");
+            fprintf(fp, "                        st_q     <= %d'd%d;\n", st_w, base_cd);
             fprintf(fp, "                    end else begin\n");
             fprintf(fp, "                        sr_rem_q <= 64'd0;\n");
             fprintf(fp, "                        sr_acc_q <= 64'd0;\n");
@@ -1185,42 +2320,37 @@ static void emit_sv(FILE *fp, int dsp_count, int max_depth, int k_rad, uint32_t 
         fprintf(fp, "                end\n");
     }
 
-    /* ST_ISQRT_LOOP */
+    /* ST_ISQRT_LOOP (`d_mag` rounded directly into `sr_acc_q` on final iteration!) */
     fprintf(fp, "                %d'd%d: begin\n", st_w, st_isqrt);
     fprintf(fp, "                    sr_rem_q <= rad2_rem_w[%d];\n", k_rad);
-    fprintf(fp, "                    sr_acc_q <= rad2_acc_w[%d];\n", k_rad);
     fprintf(fp, "                    sr_aux_q <= rad2_aux_w[%d];\n", k_rad);
     fprintf(fp, "                    if (iter_q == %d'd0) begin\n", iter_w);
-    fprintf(fp, "                        d_mag_q <= rad2_acc_w[%d] + {63'd0, (rad2_rem_w[%d] > rad2_acc_w[%d])};\n",
+    fprintf(fp, "                        sr_acc_q <= rad2_acc_w[%d] + {63'd0, (rad2_rem_w[%d] > rad2_acc_w[%d])};\n",
             k_rad, k_rad, k_rad);
-    fprintf(fp, "                        st_q    <= %d'd%d;\n", st_w, base_cd);
+    fprintf(fp, "                        st_q     <= %d'd%d;\n", st_w, base_cd);
     fprintf(fp, "                    end else begin\n");
-    fprintf(fp, "                        iter_q <= iter_q - %d'd1;\n", iter_w);
+    fprintf(fp, "                        sr_acc_q <= rad2_acc_w[%d];\n", k_rad);
+    fprintf(fp, "                        iter_q   <= iter_q - %d'd1;\n", iter_w);
     fprintf(fp, "                    end\n");
     fprintf(fp, "                end\n");
 
-    /* Cone D Stages (`Citardauq & Divider Normalization`) */
+    /* Cone D Stages (`Citardauq & Divider Normalization`: `pre_sat` & `sr_aux_q[63:0]` clock-gated!) */
     for (int s = 0; s < cd->num_stages; ++s) {
         fprintf(fp, "                %d'd%d: begin\n", st_w, base_cd + s);
-        if (cd->nodes[0].stage == s && cd->nodes[0].needs_reg) {
-            fprintf(fp, "                    n_d0_div_num_q <= n_d0_div_num_c;\n");
-            fprintf(fp, "                    n_d0_div_den_q <= n_d0_div_den_c;\n");
-            fprintf(fp, "                    n_d0_div_neg_q <= n_d0_div_neg_c;\n");
-        }
         if (s < cd->num_stages - 1) {
             fprintf(fp, "                    st_q <= %d'd%d;\n", st_w, base_cd + s + 1);
         } else {
             const char *dneg_src = ref_sig(cd, 0, 1, "n_d0_div_neg_c", "n_d0_div_neg_q");
             fprintf(fp, "                    div_neg_q <= %s;\n", dneg_src);
             fprintf(fp, "                    pre_sat_q <= n_d1_pre_sat_c;\n");
-            fprintf(fp, "                    sr_rem_q  <= n_d1_init_rem_c;\n");
-            fprintf(fp, "                    sr_acc_q  <= n_d1_init_quot_c;\n");
-            fprintf(fp, "                    sr_aux_q  <= {64'd0, n_d1_safe_den_c};\n");
             fprintf(fp, "                    if (n_d1_pre_sat_c) begin\n");
-            fprintf(fp, "                        st_q   <= %d'd%d;\n", st_w, base_cc);
+            fprintf(fp, "                        st_q           <= %d'd%d;\n", st_w, base_cc);
             fprintf(fp, "                    end else begin\n");
-            fprintf(fp, "                        iter_q <= %d'd%d;\n", iter_w, rad_iters - 1);
-            fprintf(fp, "                        st_q   <= %d'd%d;\n", st_w, st_udiv);
+            fprintf(fp, "                        sr_rem_q       <= n_d1_init_rem_c;\n");
+            fprintf(fp, "                        sr_acc_q       <= n_d1_init_quot_c;\n");
+            fprintf(fp, "                        sr_aux_q[63:0] <= n_d1_safe_den_c;\n");
+            fprintf(fp, "                        iter_q         <= %d'd%d;\n", iter_w, rad_iters - 1);
+            fprintf(fp, "                        st_q           <= %d'd%d;\n", st_w, st_udiv);
             fprintf(fp, "                    end\n");
         }
         fprintf(fp, "                end\n");
@@ -1240,33 +2370,6 @@ static void emit_sv(FILE *fp, int dsp_count, int max_depth, int k_rad, uint32_t 
     /* Cone C Stages (`Post-Div, Lyapunov, Rounding & Kan Commit`) */
     for (int s = 0; s < cc->num_stages; ++s) {
         fprintf(fp, "                %d'd%d: begin\n", st_w, base_cc + s);
-        if (cc->nodes[0].stage == s && cc->nodes[0].needs_reg)
-            fprintf(fp, "                    n_c0_dc_q       <= n_c0_dc_c;\n");
-        if (cc->nodes[1].stage == s && cc->nodes[1].needs_reg)
-            fprintf(fp, "                    n_c1_dsq_q      <= n_c1_dsq_c;\n");
-        if (cc->nodes[2].stage == s && cc->nodes[2].needs_reg)
-            fprintf(fp, "                    n_c2_g1dc_lo_q  <= n_c2_g1dc_lo_c;\n");
-        if (cc->nodes[3].stage == s && cc->nodes[3].needs_reg)
-            fprintf(fp, "                    n_c3_g1dc_hi_q  <= n_c3_g1dc_hi_c;\n");
-        if (cc->nodes[4].stage == s && cc->nodes[4].needs_reg)
-            fprintf(fp, "                    n_c4_r2_dc_q    <= n_c4_r2_dc_c;\n");
-        if (cc->nodes[5].stage == s && cc->nodes[5].needs_reg)
-            fprintf(fp, "                    n_c5_r2dsq_lo_q <= n_c5_r2dsq_lo_c;\n");
-        if (cc->nodes[6].stage == s && cc->nodes[6].needs_reg)
-            fprintf(fp, "                    n_c6_r2dsq_hi_q <= n_c6_r2dsq_hi_c;\n");
-        if (cc->nodes[7].stage == s && cc->nodes[7].needs_reg)
-            fprintf(fp, "                    n_c7_g0_cand_q  <= n_c7_g0_cand_c;\n");
-        if (cc->nodes[8].stage == s && cc->nodes[8].needs_reg) {
-            fprintf(fp, "                    n_c8_g0_post_q  <= n_c8_g0_post_c;\n");
-            fprintf(fp, "                    n_c8_g1_post_q  <= n_c8_g1_post_c;\n");
-            fprintf(fp, "                    n_c8_xp_q       <= n_c8_xp_c;\n");
-            fprintf(fp, "                    n_c8_dt_res_q   <= n_c8_dt_res_c;\n");
-        }
-        if (cc->nodes[9].stage == s && cc->nodes[9].needs_reg) {
-            fprintf(fp, "                    n_c9_j0_next_q  <= n_c9_j0_next_c;\n");
-            fprintf(fp, "                    n_c9_j1_next_q  <= n_c9_j1_next_c;\n");
-            fprintf(fp, "                    n_c9_sub_next_q <= n_c9_sub_next_c;\n");
-        }
         if (s < cc->num_stages - 1) {
             fprintf(fp, "                    st_q <= %d'd%d;\n", st_w, base_cc + s + 1);
         } else {
@@ -1303,53 +2406,20 @@ static void emit_sv(FILE *fp, int dsp_count, int max_depth, int k_rad, uint32_t 
     fprintf(fp, "    assign done_o    = done_q;\n");
     fprintf(fp, "    assign rd_data_o = state_w_q[rd_idx_i];\n\n");
 
-    /* Internal Datapath DFF Toggle Snapshot for Wind-Tunnel Energy Telemetry */
-    const int base_dff_bits = st_w + iter_w + 1 + 1 + 128 + 64 + 32 + 64 + 1 + 1 + 64 + 64 + 128;
-    const int snap_bits     = base_dff_bits + total_cut_bits;
-    const int pad_bits      = 4096 - snap_bits;
+    /* Internal Datapath DFF Toggle Snapshot (`ONLY` true physical registers!) */
+    const int pad_bits = 4096 - core_dff_bits;
     fprintf(fp, "`ifndef SYNTHESIS\n");
-    fprintf(fp, "    /* verilator lint_off UNUSEDPARAM */\n");
     fprintf(fp, "    /* verilator lint_off UNUSEDSIGNAL */\n");
-    fprintf(fp, "    localparam int PROFILE_DSP_COUNT = %d;\n", dsp_count);
-    fprintf(fp, "    localparam int PROFILE_MAX_DEPTH = %d;\n", max_depth);
-    fprintf(fp, "    localparam int CORE_DFF_BITS     = %d;\n", snap_bits);
     fprintf(fp, "    logic [4095:0] sim_dff_snap_w;\n");
     fprintf(fp, "    assign sim_dff_snap_w = {\n");
     fprintf(fp, "        %d'd0,\n", pad_bits);
-    fprintf(fp, "        st_q, iter_q, op_mask_q, fast_path_q, g0_q, g1_q, r2_q, d_mag_q,\n");
-    fprintf(fp, "        div_neg_q, pre_sat_q, sr_rem_q, sr_acc_q, sr_aux_q");
-    if (ca->nodes[0].needs_reg) fprintf(fp, ",\n        n_a0_ug_u_q");
-    if (ca->nodes[1].needs_reg) fprintf(fp, ",\n        n_a1_b1_x_q");
-    if (ca->nodes[2].needs_reg) fprintf(fp, ",\n        n_a2_x_sq_q");
-    if (ca->nodes[3].needs_reg) fprintf(fp, ",\n        n_a3_b2_x_q");
-    if (ca->nodes[4].needs_reg) fprintf(fp, ",\n        n_a4_b0_eff_q");
-    if (ca->nodes[5].needs_reg) fprintf(fp, ",\n        n_a5_b2xsq_lo_q");
-    if (ca->nodes[6].needs_reg) fprintf(fp, ",\n        n_a6_b2xsq_hi_q");
-    if (ca->nodes[7].needs_reg) fprintf(fp, ",\n        n_a7_g0_op_q");
-    if (ca->nodes[8].needs_reg) fprintf(fp, ",\n        n_a8_g1_op_q");
-    if (ca->nodes[9].needs_reg) fprintf(fp, ",\n        n_a9_g0_au_q, n_a9_j1_q32_q");
-    if (cb->nodes[0].needs_reg) fprintf(fp, ",\n        n_b0_g1_ll_q");
-    if (cb->nodes[1].needs_reg) fprintf(fp, ",\n        n_b1_g1_hl_q");
-    if (cb->nodes[2].needs_reg) fprintf(fp, ",\n        n_b2_g1_hh_q");
-    if (cb->nodes[3].needs_reg) fprintf(fp, ",\n        n_b3_g0r2_0_q");
-    if (cb->nodes[4].needs_reg) fprintf(fp, ",\n        n_b4_g0r2_1_q");
-    if (cb->nodes[5].needs_reg) fprintf(fp, ",\n        n_b5_g0r2_2_q");
-    if (cb->nodes[6].needs_reg) fprintf(fp, ",\n        n_b6_g1_sq_q");
-    if (cb->nodes[7].needs_reg) fprintf(fp, ",\n        n_b7_g0_r2_q");
-    if (cd->nodes[0].needs_reg) fprintf(fp, ",\n        n_d0_div_num_q, n_d0_div_den_q, n_d0_div_neg_q");
-    if (cc->nodes[0].needs_reg) fprintf(fp, ",\n        n_c0_dc_q");
-    if (cc->nodes[1].needs_reg) fprintf(fp, ",\n        n_c1_dsq_q");
-    if (cc->nodes[2].needs_reg) fprintf(fp, ",\n        n_c2_g1dc_lo_q");
-    if (cc->nodes[3].needs_reg) fprintf(fp, ",\n        n_c3_g1dc_hi_q");
-    if (cc->nodes[4].needs_reg) fprintf(fp, ",\n        n_c4_r2_dc_q");
-    if (cc->nodes[5].needs_reg) fprintf(fp, ",\n        n_c5_r2dsq_lo_q");
-    if (cc->nodes[6].needs_reg) fprintf(fp, ",\n        n_c6_r2dsq_hi_q");
-    if (cc->nodes[7].needs_reg) fprintf(fp, ",\n        n_c7_g0_cand_q");
-    if (cc->nodes[8].needs_reg) fprintf(fp, ",\n        n_c8_g0_post_q, n_c8_g1_post_q, n_c8_xp_q, n_c8_dt_res_q");
-    if (cc->nodes[9].needs_reg) fprintf(fp, ",\n        n_c9_j0_next_q, n_c9_j1_next_q, n_c9_sub_next_q");
+    fprintf(fp, "        st_q, iter_q, fast_path_q, b0_eff64_q,\n");
+    fprintf(fp, "        g0_s98_q, g1_q, div_neg_q, pre_sat_q, sr_rem_q, sr_acc_q, sr_aux_q");
+    for (int ln = 0; ln < ra->num_lanes; ++ln) {
+        fprintf(fp, ",\n        sh_lane%d_q", ln);
+    }
     fprintf(fp, "\n    };\n");
     fprintf(fp, "    /* verilator lint_on UNUSEDSIGNAL */\n");
-    fprintf(fp, "    /* verilator lint_on UNUSEDPARAM */\n");
     fprintf(fp, "`endif\n\n");
 
     /* Formal SAT assertions for `ele_flow_core` */
@@ -1407,6 +2477,9 @@ static void emit_sv(FILE *fp, int dsp_count, int max_depth, int k_rad, uint32_t 
     for (int d = 0; d < dsp_count; ++d) {
         fprintf(fp, "            assert (dsp_en_c[%d] == 1'b0);\n", d);
     }
+    for (int ln = 0; ln < ra->num_lanes; ++ln) {
+        fprintf(fp, "            assert (sh_lane%d_we_c == 1'b0);\n", ln);
+    }
     fprintf(fp, "            assert (rad2_en_c == 1'b0);\n");
     fprintf(fp, "        end\n");
     fprintf(fp, "        if (f_past_valid_q && f_past_rst_n_q && rst_n) begin\n");
@@ -1444,7 +2517,7 @@ static void emit_sv(FILE *fp, int dsp_count, int max_depth, int k_rad, uint32_t 
     fprintf(fp, "endmodule\n\n");
 
     /* ======================================================================
-     * MODULE 2: `ele_flow_atlas_top` (157 physical pins, `ele_sram_1rw64` Arena)
+     * MODULE 2: `ele_flow_atlas_top` (157 physical pins, Shadow-SRAM `@swap`)
      * ====================================================================== */
     fprintf(fp, "module ele_flow_atlas_top #(\n");
     fprintf(fp, "    parameter int MAX_CHARTS = 16\n");
@@ -1462,10 +2535,15 @@ static void emit_sv(FILE *fp, int dsp_count, int max_depth, int k_rad, uint32_t 
     fprintf(fp, "    output logic        swap_accepted_o,\n");
     fprintf(fp, "    output logic [63:0] rd_data_o\n");
     fprintf(fp, ");\n");
-    fprintf(fp, "    localparam int SLOT_W     = (MAX_CHARTS <= 2) ? 1 : $clog2(MAX_CHARTS);\n");
-    fprintf(fp, "    localparam int SRAM_DEPTH = MAX_CHARTS * 8;\n");
-    fprintf(fp, "    localparam int SRAM_AW    = $clog2(SRAM_DEPTH);\n");
-    fprintf(fp, "    localparam logic [15:0] HW_MASK16 = 16'(MAX_CHARTS - 1);\n\n");
+    fprintf(fp, "    /* verilator lint_off UNUSEDPARAM */\n");
+    fprintf(fp, "    localparam int SLOT_W             = (MAX_CHARTS <= 2) ? 1 : $clog2(MAX_CHARTS);\n");
+    fprintf(fp, "    localparam int SRAM_DEPTH         = (MAX_CHARTS * 2) * 8;\n");
+    fprintf(fp, "    localparam int SRAM_AW            = $clog2(SRAM_DEPTH);\n");
+    fprintf(fp, "    localparam int SWAP_COMMIT_CYCLES = 14;\n");
+    fprintf(fp, "    localparam logic [SLOT_W:0] SHADOW_SLOT = {1'b1, {SLOT_W{1'b0}}};\n");
+    fprintf(fp, "    localparam logic [15:0]     HW_MASK16   = 16'(MAX_CHARTS - 1);\n");
+    fprintf(fp, "    /* verilator lint_on UNUSEDPARAM */\n\n");
+
     fprintf(fp, "    // 64-bit Bus Command Opcodes\n");
     fprintf(fp, "    localparam logic [2:0] CMD_NOP         = 3'd0;\n");
     fprintf(fp, "    localparam logic [2:0] CMD_LOAD_STATE  = 3'd1;\n");
@@ -1474,6 +2552,7 @@ static void emit_sv(FILE *fp, int dsp_count, int max_depth, int k_rad, uint32_t 
     fprintf(fp, "    localparam logic [2:0] CMD_STAGE_CAND  = 3'd4;\n");
     fprintf(fp, "    localparam logic [2:0] CMD_STEP        = 3'd5;\n");
     fprintf(fp, "    localparam logic [2:0] CMD_SWAP        = 3'd6;\n\n");
+
     fprintf(fp, "    localparam logic [2:0] TOP_IDLE        = 3'd0;\n");
     fprintf(fp, "    localparam logic [2:0] TOP_FETCH_BOUND = 3'd1;\n");
     fprintf(fp, "    localparam logic [2:0] TOP_START_CORE  = 3'd2;\n");
@@ -1481,21 +2560,39 @@ static void emit_sv(FILE *fp, int dsp_count, int max_depth, int k_rad, uint32_t 
     fprintf(fp, "    localparam logic [2:0] TOP_SWAP_CHK    = 3'd4;\n");
     fprintf(fp, "    localparam logic [2:0] TOP_SWAP_COMMIT = 3'd5;\n\n");
 
-    fprintf(fp, "    logic [2:0]            top_st_q;\n");
-    fprintf(fp, "    logic [2:0]            beat_q;\n");
-    fprintf(fp, "    logic [15:0]           cap_mask_q;\n");
-    fprintf(fp, "    logic [MAX_CHARTS-1:0] slot_valid_q;\n");
-    fprintf(fp, "    logic [SLOT_W-1:0]     act_slot_q;\n");
-    fprintf(fp, "    logic [15:0]           mode_hold_q;\n");
-    fprintf(fp, "    logic [63:0]           u_ext_hold_q;\n");
-    fprintf(fp, "    logic [5:0][63:0]      cand_buf_q;\n");
-    fprintf(fp, "    logic [SLOT_W-1:0]     swap_slot_q;\n");
-    fprintf(fp, "    logic [31:0]           swap_epoch_q;\n");
-    fprintf(fp, "    logic                  step_done_q;\n");
-    fprintf(fp, "    logic                  swap_done_q;\n");
-    fprintf(fp, "    logic                  swap_acc_q;\n\n");
+    /* Symmetric 64->32 Q16.16 clamp for `u_ext` (`-32` wrapper DFFs!) */
+    fprintf(fp, "    function automatic logic signed [31:0] clamp_top64_to_32(input logic [63:0] raw);\n");
+    fprintf(fp, "        logic ovf_pos, ovf_neg;\n");
+    fprintf(fp, "        begin\n");
+    fprintf(fp, "            ovf_pos = (~raw[63]) & (|raw[62:31]);\n");
+    fprintf(fp, "            ovf_neg = raw[63] & ((~(&raw[62:31])) | (raw[30:0] == 31'd0));\n");
+    fprintf(fp, "            if (ovf_pos)      clamp_top64_to_32 = 32'sh7FFF_FFFF;\n");
+    fprintf(fp, "            else if (ovf_neg) clamp_top64_to_32 = -32'sh7FFF_FFFF;\n");
+    fprintf(fp, "            else              clamp_top64_to_32 = $signed(raw[31:0]);\n");
+    fprintf(fp, "        end\n");
+    fprintf(fp, "    endfunction\n\n");
 
-    /* SRAM interface wires */
+    /* Compact 24-bit candidate firewall metadata + Active Chart-Bound Cache (`0` steady-state SRAM reads!) */
+    fprintf(fp, "    logic [2:0]             top_st_q;\n");
+    fprintf(fp, "    logic [3:0]             sub_beat_q;\n");
+    fprintf(fp, "    logic [15:0]            cap_mask_q;\n");
+    fprintf(fp, "    logic [MAX_CHARTS-1:0]  slot_valid_q;\n");
+    fprintf(fp, "    logic [SLOT_W-1:0]      act_slot_q;\n");
+    fprintf(fp, "    logic                   bound_cache_valid_q;\n");
+    fprintf(fp, "    logic [SLOT_W-1:0]      bound_cache_slot_q;\n");
+    fprintf(fp, "    logic signed [31:0]     u_ext_hold32_q;\n");
+    fprintf(fp, "    logic [5:0]             cand_staged_mask_q;\n");
+    fprintf(fp, "    logic                   cand_b_ok_q;\n");
+    fprintf(fp, "    logic                   cand_dt_ok_q;\n");
+    fprintf(fp, "    logic [7:0]             cand_next_lo_q;\n");
+    fprintf(fp, "    logic [7:0]             cand_next_hi_q;\n");
+    fprintf(fp, "    logic [SLOT_W-1:0]      swap_slot_q;\n");
+    fprintf(fp, "    logic [31:0]            swap_epoch_q;\n");
+    fprintf(fp, "    logic                   step_done_q;\n");
+    fprintf(fp, "    logic                   swap_done_q;\n");
+    fprintf(fp, "    logic                   swap_acc_q;\n\n");
+
+    /* Unified 1RW 64-bit Chart + Shadow-Staging SRAM (`$mem_v2`, 0 loose DFFs) */
     fprintf(fp, "    logic                  sram_ce_c;\n");
     fprintf(fp, "    logic                  sram_we_c;\n");
     fprintf(fp, "    logic [SRAM_AW-1:0]    sram_addr_c;\n");
@@ -1537,29 +2634,33 @@ static void emit_sv(FILE *fp, int dsp_count, int max_depth, int k_rad, uint32_t 
     fprintf(fp, "        .rd_data_o  (core_rd_data_w)\n");
     fprintf(fp, "    );\n\n");
 
-    /* Firewall check combinational signals */
+    /* 24-bit Metadata Firewall Check (`1`-cycle zero-SRAM-write reject) */
     fprintf(fp, "    logic [31:0] swap_cur_ep_c;\n");
     fprintf(fp, "    logic        swap_fw_ok_c;\n");
+    fprintf(fp, "    logic [7:0]  cand_staged_pad_c;\n");
+    fprintf(fp, "    assign cand_staged_pad_c = {2'b00, cand_staged_mask_q};\n");
     fprintf(fp, "    always_comb begin\n");
     fprintf(fp, "        swap_cur_ep_c = slot_valid_q[swap_slot_q] ? sram_rdata_w[63:32] : 32'd0;\n");
     fprintf(fp, "        swap_fw_ok_c  = (swap_epoch_q > swap_cur_ep_c) &\n");
-    fprintf(fp, "                        ({8'd0, cand_buf_q[5][31:24]} <= cap_mask_q) &\n");
-    fprintf(fp, "                        ({8'd0, cand_buf_q[5][23:16]} <= cap_mask_q) &\n");
-    fprintf(fp, "                        ($signed(cand_buf_q[4][63:32]) > 32'sd0) &\n");
-    fprintf(fp, "                        ($signed(cand_buf_q[3][63:32]) <= $signed(cand_buf_q[3][31:0]));\n");
+    fprintf(fp, "                        ({8'd0, cand_next_lo_q} <= cap_mask_q) &\n");
+    fprintf(fp, "                        ({8'd0, cand_next_hi_q} <= cap_mask_q) &\n");
+    fprintf(fp, "                        cand_dt_ok_q &\n");
+    fprintf(fp, "                        cand_b_ok_q;\n");
     fprintf(fp, "    end\n\n");
 
     /* Combinational control for `u_chart_sram` and `u_core` */
     fprintf(fp, "    logic [SLOT_W-1:0] step_slot_c;\n");
+    fprintf(fp, "    logic              step_cache_hit_c;\n");
     fprintf(fp, "    logic [SLOT_W-1:0] swap_req_slot_c;\n");
     fprintf(fp, "    logic [SLOT_W-1:0] wr_chart_slot_c;\n");
     fprintf(fp, "    wire               unused_aux_hi_ok = &{1'b0, cmd_aux_i[15:SLOT_W]};\n\n");
 
     fprintf(fp, "    always_comb begin\n");
-    fprintf(fp, "        core_rd_idx_c   = (top_st_q == TOP_IDLE && cmd_valid_i && cmd_op_i == CMD_STEP) ? 3'd5 : cmd_word_i;\n");
-    fprintf(fp, "        step_slot_c     = core_rd_data_w[16 +: SLOT_W] & cap_mask_q[SLOT_W-1:0];\n");
-    fprintf(fp, "        swap_req_slot_c = cmd_aux_i[SLOT_W-1:0] & cap_mask_q[SLOT_W-1:0];\n");
-    fprintf(fp, "        wr_chart_slot_c = cmd_aux_i[SLOT_W-1:0];\n\n");
+    fprintf(fp, "        core_rd_idx_c    = (top_st_q == TOP_IDLE && cmd_valid_i && cmd_op_i == CMD_STEP) ? 3'd5 : cmd_word_i;\n");
+    fprintf(fp, "        step_slot_c      = core_rd_data_w[16 +: SLOT_W] & cap_mask_q[SLOT_W-1:0];\n");
+    fprintf(fp, "        step_cache_hit_c = bound_cache_valid_q & (step_slot_c == bound_cache_slot_q);\n");
+    fprintf(fp, "        swap_req_slot_c  = cmd_aux_i[SLOT_W-1:0] & cap_mask_q[SLOT_W-1:0];\n");
+    fprintf(fp, "        wr_chart_slot_c  = cmd_aux_i[SLOT_W-1:0];\n\n");
     fprintf(fp, "        sram_ce_c       = 1'b0;\n");
     fprintf(fp, "        sram_we_c       = 1'b0;\n");
     fprintf(fp, "        sram_addr_c     = {SRAM_AW{1'b0}};\n");
@@ -1579,16 +2680,26 @@ static void emit_sv(FILE *fp, int dsp_count, int max_depth, int k_rad, uint32_t 
     fprintf(fp, "                            core_wr_idx_c   = cmd_word_i;\n");
     fprintf(fp, "                            core_wr_data_c  = cmd_data_i;\n");
     fprintf(fp, "                        end\n");
+    fprintf(fp, "                        CMD_STAGE_CAND: begin\n");
+    fprintf(fp, "                            if (cmd_word_i < 3'd6) begin\n");
+    fprintf(fp, "                                sram_ce_c    = 1'b1;\n");
+    fprintf(fp, "                                sram_we_c    = 1'b1;\n");
+    fprintf(fp, "                                sram_addr_c  = {SHADOW_SLOT, cmd_word_i};\n");
+    fprintf(fp, "                                sram_wdata_c = cmd_data_i;\n");
+    fprintf(fp, "                            end\n");
+    fprintf(fp, "                        end\n");
     fprintf(fp, "                        CMD_WRITE_CHART: begin\n");
     fprintf(fp, "                            sram_ce_c    = 1'b1;\n");
     fprintf(fp, "                            sram_we_c    = 1'b1;\n");
-    fprintf(fp, "                            sram_addr_c  = {wr_chart_slot_c, cmd_word_i};\n");
+    fprintf(fp, "                            sram_addr_c  = {1'b0, wr_chart_slot_c, cmd_word_i};\n");
     fprintf(fp, "                            sram_wdata_c = cmd_data_i;\n");
     fprintf(fp, "                        end\n");
     fprintf(fp, "                        CMD_STEP: begin\n");
-    fprintf(fp, "                            sram_ce_c       = 1'b1;\n");
-    fprintf(fp, "                            sram_we_c       = 1'b0;\n");
-    fprintf(fp, "                            sram_addr_c     = {step_slot_c, 3'd0};\n");
+    fprintf(fp, "                            if (!step_cache_hit_c) begin\n");
+    fprintf(fp, "                                sram_ce_c   = 1'b1;\n");
+    fprintf(fp, "                                sram_we_c   = 1'b0;\n");
+    fprintf(fp, "                                sram_addr_c = {1'b0, step_slot_c, 3'd0};\n");
+    fprintf(fp, "                            end\n");
     fprintf(fp, "                            core_wr_valid_c = 1'b1;\n");
     fprintf(fp, "                            core_wr_kind_c  = 2'd2;\n");
     fprintf(fp, "                            core_wr_idx_c   = 3'd0;\n");
@@ -1597,54 +2708,64 @@ static void emit_sv(FILE *fp, int dsp_count, int max_depth, int k_rad, uint32_t 
     fprintf(fp, "                        CMD_SWAP: begin\n");
     fprintf(fp, "                            sram_ce_c   = 1'b1;\n");
     fprintf(fp, "                            sram_we_c   = 1'b0;\n");
-    fprintf(fp, "                            sram_addr_c = {swap_req_slot_c, 3'd6};\n");
+    fprintf(fp, "                            sram_addr_c = {1'b0, swap_req_slot_c, 3'd6};\n");
     fprintf(fp, "                        end\n");
     fprintf(fp, "                        default: begin end\n");
     fprintf(fp, "                    endcase\n");
     fprintf(fp, "                end\n");
-    fprintf(fp, "            end\n");
+    fprintf(fp, "            end\n\n");
 
-    /* TOP_FETCH_BOUND: `beat_q = 0..5` receives SRAM read of word `beat_q` and issues read `beat_q + 1` */
     fprintf(fp, "            TOP_FETCH_BOUND: begin\n");
     fprintf(fp, "                core_wr_valid_c = 1'b1;\n");
     fprintf(fp, "                core_wr_kind_c  = 2'd1;\n");
-    fprintf(fp, "                core_wr_idx_c   = beat_q;\n");
+    fprintf(fp, "                core_wr_idx_c   = sub_beat_q[2:0];\n");
     fprintf(fp, "                core_wr_data_c  = slot_valid_q[act_slot_q] ? sram_rdata_w : 64'd0;\n");
-    fprintf(fp, "                if (beat_q < 3'd5) begin\n");
+    fprintf(fp, "                if (sub_beat_q < 4'd5) begin\n");
     fprintf(fp, "                    sram_ce_c   = 1'b1;\n");
     fprintf(fp, "                    sram_we_c   = 1'b0;\n");
-    fprintf(fp, "                    sram_addr_c = {act_slot_q, beat_q + 3'd1};\n");
+    fprintf(fp, "                    sram_addr_c = {1'b0, act_slot_q, sub_beat_q[2:0] + 3'd1};\n");
     fprintf(fp, "                end\n");
-    fprintf(fp, "            end\n");
+    fprintf(fp, "            end\n\n");
 
     fprintf(fp, "            TOP_START_CORE: begin\n");
     fprintf(fp, "                core_wr_valid_c = 1'b1;\n");
     fprintf(fp, "                core_wr_kind_c  = 2'd2;\n");
     fprintf(fp, "                core_wr_idx_c   = 3'd1;\n");
-    fprintf(fp, "                core_wr_data_c  = u_ext_hold_q;\n");
+    fprintf(fp, "                core_wr_data_c  = {{32{u_ext_hold32_q[31]}}, $unsigned(u_ext_hold32_q)};\n");
     fprintf(fp, "            end\n");
 
+    /* On accept, `TOP_SWAP_CHK` immediately reads `{SHADOW_SLOT, 3'd0}` (0 SRAM writes!) */
     fprintf(fp, "            TOP_SWAP_CHK: begin\n");
     fprintf(fp, "                if (swap_fw_ok_c) begin\n");
-    fprintf(fp, "                    sram_ce_c    = 1'b1;\n");
-    fprintf(fp, "                    sram_we_c    = 1'b1;\n");
-    fprintf(fp, "                    sram_addr_c  = {swap_slot_q, 3'd0};\n");
-    fprintf(fp, "                    sram_wdata_c = cand_buf_q[0];\n");
+    fprintf(fp, "                    sram_ce_c   = 1'b1;\n");
+    fprintf(fp, "                    sram_we_c   = 1'b0;\n");
+    fprintf(fp, "                    sram_addr_c = {SHADOW_SLOT, 3'd0};\n");
     fprintf(fp, "                end\n");
     fprintf(fp, "            end\n");
 
-    /* Release-ordered 64b SRAM commit: beat 1..5 -> w1..w5, beat 6 -> w7=0, beat 7 -> w6={epoch,0} LAST! */
+    /* Shadow-to-Slot Ping-Pong Commit (`sub_beat_q` 0..12, `sram_rdata_w` holds read word):
+     *   even 0..10 : write `{1'b0, swap_slot_q, w}` from `sram_rdata_w` (masked by `cand_staged_mask_q`)
+     *   odd  1..9  : read  `{SHADOW_SLOT, w+1}` into `sram_rdata_w`
+     *   11         : write `{1'b0, swap_slot_q, 3'd7} <= 64'd0`
+     *   >= 12      : release-ordered final commit `{1'b0, swap_slot_q, 3'd6} <= {swap_epoch_q, 32'd0}` */
     fprintf(fp, "            TOP_SWAP_COMMIT: begin\n");
     fprintf(fp, "                sram_ce_c = 1'b1;\n");
-    fprintf(fp, "                sram_we_c = 1'b1;\n");
-    fprintf(fp, "                if (beat_q < 3'd6) begin\n");
-    fprintf(fp, "                    sram_addr_c  = {swap_slot_q, beat_q};\n");
-    fprintf(fp, "                    sram_wdata_c = cand_buf_q[beat_q];\n");
-    fprintf(fp, "                end else if (beat_q == 3'd6) begin\n");
-    fprintf(fp, "                    sram_addr_c  = {swap_slot_q, 3'd7};\n");
+    fprintf(fp, "                if (sub_beat_q < 4'd11) begin\n");
+    fprintf(fp, "                    if (!sub_beat_q[0]) begin\n");
+    fprintf(fp, "                        sram_we_c    = 1'b1;\n");
+    fprintf(fp, "                        sram_addr_c  = {1'b0, swap_slot_q, sub_beat_q[3:1]};\n");
+    fprintf(fp, "                        sram_wdata_c = cand_staged_pad_c[sub_beat_q[3:1]] ? sram_rdata_w : 64'd0;\n");
+    fprintf(fp, "                    end else begin\n");
+    fprintf(fp, "                        sram_we_c   = 1'b0;\n");
+    fprintf(fp, "                        sram_addr_c = {SHADOW_SLOT, sub_beat_q[3:1] + 3'd1};\n");
+    fprintf(fp, "                    end\n");
+    fprintf(fp, "                end else if (sub_beat_q == 4'd11) begin\n");
+    fprintf(fp, "                    sram_we_c    = 1'b1;\n");
+    fprintf(fp, "                    sram_addr_c  = {1'b0, swap_slot_q, 3'd7};\n");
     fprintf(fp, "                    sram_wdata_c = 64'd0;\n");
     fprintf(fp, "                end else begin\n");
-    fprintf(fp, "                    sram_addr_c  = {swap_slot_q, 3'd6};\n");
+    fprintf(fp, "                    sram_we_c    = 1'b1;\n");
+    fprintf(fp, "                    sram_addr_c  = {1'b0, swap_slot_q, 3'd6};\n");
     fprintf(fp, "                    sram_wdata_c = {swap_epoch_q, 32'd0};\n");
     fprintf(fp, "                end\n");
     fprintf(fp, "            end\n");
@@ -1655,19 +2776,24 @@ static void emit_sv(FILE *fp, int dsp_count, int max_depth, int k_rad, uint32_t 
 
     fprintf(fp, "    always_ff @(posedge clk or negedge rst_n) begin\n");
     fprintf(fp, "        if (!rst_n) begin\n");
-    fprintf(fp, "            top_st_q     <= TOP_IDLE;\n");
-    fprintf(fp, "            beat_q       <= 3'd0;\n");
-    fprintf(fp, "            cap_mask_q   <= HW_MASK16;\n");
+    fprintf(fp, "            top_st_q            <= TOP_IDLE;\n");
+    fprintf(fp, "            sub_beat_q          <= 4'd0;\n");
+    fprintf(fp, "            cap_mask_q          <= HW_MASK16;\n");
     fprintf(fp, "            slot_valid_q <= {MAX_CHARTS{1'b0}};\n");
-    fprintf(fp, "            act_slot_q   <= {SLOT_W{1'b0}};\n");
-    fprintf(fp, "            mode_hold_q  <= 16'd0;\n");
-    fprintf(fp, "            u_ext_hold_q <= 64'd0;\n");
-    fprintf(fp, "            cand_buf_q   <= 384'd0;\n");
-    fprintf(fp, "            swap_slot_q  <= {SLOT_W{1'b0}};\n");
-    fprintf(fp, "            swap_epoch_q <= 32'd0;\n");
-    fprintf(fp, "            step_done_q  <= 1'b0;\n");
-    fprintf(fp, "            swap_done_q  <= 1'b0;\n");
-    fprintf(fp, "            swap_acc_q   <= 1'b0;\n");
+    fprintf(fp, "            act_slot_q          <= {SLOT_W{1'b0}};\n");
+    fprintf(fp, "            bound_cache_valid_q <= 1'b0;\n");
+    fprintf(fp, "            bound_cache_slot_q  <= {SLOT_W{1'b0}};\n");
+    fprintf(fp, "            u_ext_hold32_q      <= 32'sd0;\n");
+    fprintf(fp, "            cand_staged_mask_q  <= 6'd0;\n");
+    fprintf(fp, "            cand_b_ok_q         <= 1'b1;\n");
+    fprintf(fp, "            cand_dt_ok_q        <= 1'b0;\n");
+    fprintf(fp, "            cand_next_lo_q      <= 8'd0;\n");
+    fprintf(fp, "            cand_next_hi_q      <= 8'd0;\n");
+    fprintf(fp, "            swap_slot_q         <= {SLOT_W{1'b0}};\n");
+    fprintf(fp, "            swap_epoch_q        <= 32'd0;\n");
+    fprintf(fp, "            step_done_q         <= 1'b0;\n");
+    fprintf(fp, "            swap_done_q         <= 1'b0;\n");
+    fprintf(fp, "            swap_acc_q          <= 1'b0;\n");
     fprintf(fp, "        end else begin\n");
     fprintf(fp, "            step_done_q <= 1'b0;\n");
     fprintf(fp, "            swap_done_q <= 1'b0;\n");
@@ -1682,20 +2808,30 @@ static void emit_sv(FILE *fp, int dsp_count, int max_depth, int k_rad, uint32_t 
     fprintf(fp, "                            end\n");
     fprintf(fp, "                            CMD_STAGE_CAND: begin\n");
     fprintf(fp, "                                if (cmd_word_i < 3'd6) begin\n");
-    fprintf(fp, "                                    cand_buf_q[cmd_word_i] <= cmd_data_i;\n");
+    fprintf(fp, "                                    cand_staged_mask_q[cmd_word_i] <= 1'b1;\n");
+    fprintf(fp, "                                    if (cmd_word_i == 3'd3) begin\n");
+    fprintf(fp, "                                        cand_b_ok_q <= ($signed(cmd_data_i[63:32]) <= $signed(cmd_data_i[31:0]));\n");
+    fprintf(fp, "                                    end else if (cmd_word_i == 3'd4) begin\n");
+    fprintf(fp, "                                        cand_dt_ok_q <= ($signed(cmd_data_i[63:32]) > 32'sd0);\n");
+    fprintf(fp, "                                    end else if (cmd_word_i == 3'd5) begin\n");
+    fprintf(fp, "                                        cand_next_lo_q <= cmd_data_i[31:24];\n");
+    fprintf(fp, "                                        cand_next_hi_q <= cmd_data_i[23:16];\n");
+    fprintf(fp, "                                    end\n");
     fprintf(fp, "                                end\n");
     fprintf(fp, "                            end\n");
     fprintf(fp, "                            CMD_WRITE_CHART: begin\n");
+    fprintf(fp, "                                if (wr_chart_slot_c == bound_cache_slot_q) begin\n");
+    fprintf(fp, "                                    bound_cache_valid_q <= 1'b0;\n");
+    fprintf(fp, "                                end\n");
     fprintf(fp, "                                if (cmd_word_i == 3'd7) begin\n");
     fprintf(fp, "                                    slot_valid_q[wr_chart_slot_c] <= 1'b1;\n");
     fprintf(fp, "                                end\n");
     fprintf(fp, "                            end\n");
     fprintf(fp, "                            CMD_STEP: begin\n");
-    fprintf(fp, "                                act_slot_q   <= step_slot_c;\n");
-    fprintf(fp, "                                mode_hold_q  <= cmd_aux_i;\n");
-    fprintf(fp, "                                u_ext_hold_q <= cmd_data_i;\n");
-    fprintf(fp, "                                beat_q       <= 3'd0;\n");
-    fprintf(fp, "                                top_st_q     <= TOP_FETCH_BOUND;\n");
+    fprintf(fp, "                                act_slot_q     <= step_slot_c;\n");
+    fprintf(fp, "                                u_ext_hold32_q <= clamp_top64_to_32(cmd_data_i);\n");
+    fprintf(fp, "                                sub_beat_q     <= 4'd0;\n");
+    fprintf(fp, "                                top_st_q       <= step_cache_hit_c ? TOP_START_CORE : TOP_FETCH_BOUND;\n");
     fprintf(fp, "                            end\n");
     fprintf(fp, "                            CMD_SWAP: begin\n");
     fprintf(fp, "                                swap_slot_q  <= swap_req_slot_c;\n");
@@ -1708,10 +2844,12 @@ static void emit_sv(FILE *fp, int dsp_count, int max_depth, int k_rad, uint32_t 
     fprintf(fp, "                end\n");
 
     fprintf(fp, "                TOP_FETCH_BOUND: begin\n");
-    fprintf(fp, "                    if (beat_q == 3'd5) begin\n");
-    fprintf(fp, "                        top_st_q <= TOP_START_CORE;\n");
+    fprintf(fp, "                    if (sub_beat_q >= 4'd5) begin\n");
+    fprintf(fp, "                        bound_cache_valid_q <= 1'b1;\n");
+    fprintf(fp, "                        bound_cache_slot_q  <= act_slot_q;\n");
+    fprintf(fp, "                        top_st_q            <= TOP_START_CORE;\n");
     fprintf(fp, "                    end else begin\n");
-    fprintf(fp, "                        beat_q <= beat_q + 3'd1;\n");
+    fprintf(fp, "                        sub_beat_q <= sub_beat_q + 4'd1;\n");
     fprintf(fp, "                    end\n");
     fprintf(fp, "                end\n");
 
@@ -1732,19 +2870,22 @@ static void emit_sv(FILE *fp, int dsp_count, int max_depth, int k_rad, uint32_t 
     fprintf(fp, "                        swap_acc_q  <= 1'b0;\n");
     fprintf(fp, "                        top_st_q    <= TOP_IDLE;\n");
     fprintf(fp, "                    end else begin\n");
-    fprintf(fp, "                        beat_q   <= 3'd1;\n");
-    fprintf(fp, "                        top_st_q <= TOP_SWAP_COMMIT;\n");
+    fprintf(fp, "                        sub_beat_q <= 4'd0;\n");
+    fprintf(fp, "                        top_st_q   <= TOP_SWAP_COMMIT;\n");
     fprintf(fp, "                    end\n");
     fprintf(fp, "                end\n");
 
     fprintf(fp, "                TOP_SWAP_COMMIT: begin\n");
-    fprintf(fp, "                    if (beat_q == 3'd7) begin\n");
+    fprintf(fp, "                    if (sub_beat_q >= 4'd12) begin\n");
+    fprintf(fp, "                        if (swap_slot_q == bound_cache_slot_q) begin\n");
+    fprintf(fp, "                            bound_cache_valid_q <= 1'b0;\n");
+    fprintf(fp, "                        end\n");
     fprintf(fp, "                        slot_valid_q[swap_slot_q] <= 1'b1;\n");
     fprintf(fp, "                        swap_done_q               <= 1'b1;\n");
     fprintf(fp, "                        swap_acc_q                <= 1'b1;\n");
     fprintf(fp, "                        top_st_q                  <= TOP_IDLE;\n");
     fprintf(fp, "                    end else begin\n");
-    fprintf(fp, "                        beat_q <= beat_q + 3'd1;\n");
+    fprintf(fp, "                        sub_beat_q <= sub_beat_q + 4'd1;\n");
     fprintf(fp, "                    end\n");
     fprintf(fp, "                end\n");
 
@@ -1753,7 +2894,7 @@ static void emit_sv(FILE *fp, int dsp_count, int max_depth, int k_rad, uint32_t 
     fprintf(fp, "        end\n");
     fprintf(fp, "    end\n\n");
 
-    fprintf(fp, "    wire unused_mode_hold_ok = &{1'b0, mode_hold_q, CMD_NOP};\n");
+    fprintf(fp, "    wire unused_mode_hold_ok = &{1'b0, CMD_NOP, cand_staged_pad_c[7:6]};\n");
     fprintf(fp, "    assign ready_o         = (top_st_q == TOP_IDLE) & core_ready_w;\n");
     fprintf(fp, "    assign step_done_o     = step_done_q;\n");
     fprintf(fp, "    assign swap_done_o     = swap_done_q;\n");
@@ -1768,8 +2909,11 @@ static void emit_sv(FILE *fp, int dsp_count, int max_depth, int k_rad, uint32_t 
     fprintf(fp, "    logic [2:0]  f_past_st_q;\n");
     fprintf(fp, "    logic        f_past_fw_ok_q;\n");
     fprintf(fp, "    logic [15:0] f_past_cap_q;\n");
-    fprintf(fp, "    logic [63:0] f_past_cand0_q;\n");
-    fprintf(fp, "    logic [63:0] f_past_cand5_q;\n");
+    fprintf(fp, "    logic [5:0]  f_past_mask_q;\n");
+    fprintf(fp, "    logic        f_past_b_ok_q;\n");
+    fprintf(fp, "    logic        f_past_dt_ok_q;\n");
+    fprintf(fp, "    logic [7:0]  f_past_nlo_q;\n");
+    fprintf(fp, "    logic [7:0]  f_past_nhi_q;\n");
     fprintf(fp, "    initial f_past_valid_q = 1'b0;\n");
     fprintf(fp, "    always @(posedge clk) begin\n");
     fprintf(fp, "        f_past_valid_q <= 1'b1;\n");
@@ -1778,8 +2922,11 @@ static void emit_sv(FILE *fp, int dsp_count, int max_depth, int k_rad, uint32_t 
     fprintf(fp, "        f_past_st_q    <= top_st_q;\n");
     fprintf(fp, "        f_past_fw_ok_q <= swap_fw_ok_c;\n");
     fprintf(fp, "        f_past_cap_q   <= cap_mask_q;\n");
-    fprintf(fp, "        f_past_cand0_q <= cand_buf_q[0];\n");
-    fprintf(fp, "        f_past_cand5_q <= cand_buf_q[5];\n");
+    fprintf(fp, "        f_past_mask_q  <= cand_staged_mask_q;\n");
+    fprintf(fp, "        f_past_b_ok_q  <= cand_b_ok_q;\n");
+    fprintf(fp, "        f_past_dt_ok_q <= cand_dt_ok_q;\n");
+    fprintf(fp, "        f_past_nlo_q   <= cand_next_lo_q;\n");
+    fprintf(fp, "        f_past_nhi_q   <= cand_next_hi_q;\n");
     fprintf(fp, "    end\n");
     fprintf(fp, "    always_comb begin\n");
     fprintf(fp, "        if (!rst_n) begin\n");
@@ -1787,23 +2934,36 @@ static void emit_sv(FILE *fp, int dsp_count, int max_depth, int k_rad, uint32_t 
     fprintf(fp, "            assert (!step_done_o && !swap_done_o && !swap_accepted_o);\n");
     fprintf(fp, "            assert (cap_mask_q == HW_MASK16);\n");
     fprintf(fp, "            assert (slot_valid_q == {MAX_CHARTS{1'b0}});\n");
+    fprintf(fp, "            assert (!bound_cache_valid_q);\n");
+    fprintf(fp, "            assert (cand_staged_mask_q == 6'd0 && cand_b_ok_q && !cand_dt_ok_q);\n");
     fprintf(fp, "        end\n");
     fprintf(fp, "        assert ((cap_mask_q & (~HW_MASK16)) == 16'd0);\n");
     fprintf(fp, "        if ((top_st_q == TOP_IDLE) && (!core_ready_w)) begin\n");
     fprintf(fp, "            assert (!ready_o && !sram_ce_c && !sram_we_c && !core_wr_valid_c);\n");
     fprintf(fp, "        end\n");
+    fprintf(fp, "        if ((top_st_q == TOP_IDLE) && cmd_valid_i && core_ready_w && (cmd_op_i == CMD_STEP) && step_cache_hit_c) begin\n");
+    fprintf(fp, "            assert (!sram_ce_c && !sram_we_c);\n");
+    fprintf(fp, "        end\n");
+    fprintf(fp, "        if ((top_st_q == TOP_IDLE) && cmd_valid_i && core_ready_w && (cmd_op_i == CMD_STAGE_CAND) && (cmd_word_i < 3'd6)) begin\n");
+    fprintf(fp, "            assert (sram_ce_c && sram_we_c && (sram_addr_c == {SHADOW_SLOT, cmd_word_i}));\n");
+    fprintf(fp, "        end\n");
     fprintf(fp, "        if ((top_st_q == TOP_FETCH_BOUND) || (top_st_q == TOP_START_CORE) || (top_st_q == TOP_WAIT_CORE)) begin\n");
     fprintf(fp, "            assert (sram_we_c == 1'b0);\n");
     fprintf(fp, "            assert (!ready_o);\n");
     fprintf(fp, "        end\n");
-    fprintf(fp, "        if ((top_st_q == TOP_SWAP_CHK) && (!swap_fw_ok_c)) begin\n");
+    fprintf(fp, "        if (top_st_q == TOP_SWAP_CHK) begin\n");
     fprintf(fp, "            assert (sram_we_c == 1'b0);\n");
+    fprintf(fp, "            if (!swap_fw_ok_c) assert (sram_ce_c == 1'b0);\n");
+    fprintf(fp, "        end\n");
+    fprintf(fp, "        if ((top_st_q == TOP_SWAP_COMMIT) && sram_we_c) begin\n");
+    fprintf(fp, "            assert (sram_addr_c[SRAM_AW-1] == 1'b0);\n");
     fprintf(fp, "        end\n");
     fprintf(fp, "        if (f_past_valid_q && f_past_rst_n_q && rst_n) begin\n");
     fprintf(fp, "            if (!f_past_ready_q) begin\n");
     fprintf(fp, "                assert (cap_mask_q == f_past_cap_q);\n");
-    fprintf(fp, "                assert (cand_buf_q[0] == f_past_cand0_q);\n");
-    fprintf(fp, "                assert (cand_buf_q[5] == f_past_cand5_q);\n");
+    fprintf(fp, "                assert (cand_staged_mask_q == f_past_mask_q);\n");
+    fprintf(fp, "                assert (cand_b_ok_q == f_past_b_ok_q && cand_dt_ok_q == f_past_dt_ok_q);\n");
+    fprintf(fp, "                assert (cand_next_lo_q == f_past_nlo_q && cand_next_hi_q == f_past_nhi_q);\n");
     fprintf(fp, "            end\n");
     fprintf(fp, "            if ((f_past_st_q == TOP_WAIT_CORE)) begin\n");
     fprintf(fp, "                assert (!swap_done_o && !swap_accepted_o);\n");
@@ -1847,32 +3007,58 @@ int main(int argc, char **argv) {
         return 1;
     }
 
+    /* Pass 1: Declarative SSA Operator IR + FLOW v7.0.1 2-Jet Retiming + SEARU DSP Binding */
     uint32_t   rad_epochs = 0;
     int        k_rad      = solve_radix_unroll_2jet(max_depth, &rad_epochs);
-    dag_cone_t ca, cb, cd, cc;
-    build_flow_2jet_cones(&ca, &cb, &cd, &cc);
+    dag_cone_t cones[NUM_CONES];
+    build_cones_from_ssa_ir(cones);
+    for (int c = 0; c < NUM_CONES; ++c) {
+        solve_cone_with_flow_2jet(&cones[c], dsp_count, max_depth);
+    }
 
-    solve_cone_with_flow_2jet(&ca, dsp_count, max_depth);
-    solve_cone_with_flow_2jet(&cb, dsp_count, max_depth);
-    solve_cone_with_flow_2jet(&cd, dsp_count, max_depth);
-    solve_cone_with_flow_2jet(&cc, dsp_count, max_depth);
+    const int base_ca  = 1;
+    const int base_cb  = base_ca + cones[CONE_A].num_stages;
+    const int st_isqrt = base_cb + cones[CONE_B].num_stages;
+    const int base_cd  = st_isqrt + 1;
+    const int st_udiv  = base_cd + cones[CONE_D].num_stages;
+    const int base_cc  = st_udiv + 1;
 
+    searu_hls_stats_t hls_stats;
+    memset(&hls_stats, 0, sizeof(hls_stats));
+    optimize_dsp_slots_searu(cones, dsp_count, max_depth,
+                             base_ca, base_cb, base_cd, base_cc, &hls_stats);
+
+    /* Pass 2: Global FSM Live-Range Analysis & SEARU Heterogeneous-Width Register Allocation */
+    reg_alloc_t  ra;
+    scalar_map_t smap;
+    allocate_shared_cut_registers(cones, dsp_count, max_depth,
+                                  base_ca, base_cb, base_cd, base_cc, &ra, &smap, &hls_stats);
+
+    /* Pass 3: Critical-Path Optimized RTL & Shadow-SRAM Emitter */
     FILE *fp = fopen(out_path, "w");
     if (!fp) {
         perror("fopen");
         return 1;
     }
-    emit_sv(fp, dsp_count, max_depth, k_rad, rad_epochs, &ca, &cb, &cd, &cc);
+    emit_sv(fp, dsp_count, max_depth, k_rad, rad_epochs, cones, &ra, &smap, &hls_stats);
     fclose(fp);
 
     const int rad_iters   = 64 / k_rad;
-    const int quad_cycles = ca.num_stages + cb.num_stages + rad_iters +
-                            cd.num_stages + rad_iters + cc.num_stages;
-    const int cut_bits    = ca.cut_reg_bits + cb.cut_reg_bits +
-                            cd.cut_reg_bits + cc.cut_reg_bits;
-    printf("  [FLOW-BOOTSTRAP] out=%s | dsp=%d max_depth=%d -> K_rad=%d, stages=(%d+%d+%d+%d), cut_dff=%d bits, quad_cyc=%d (CONVERGED)\n",
+    const int quad_cycles = cones[CONE_A].num_stages + cones[CONE_B].num_stages + rad_iters +
+                            cones[CONE_D].num_stages + rad_iters + cones[CONE_C].num_stages;
+    const int virt_bits   = cones[CONE_A].cut_reg_bits + cones[CONE_B].cut_reg_bits +
+                            cones[CONE_D].cut_reg_bits + cones[CONE_C].cut_reg_bits;
+    printf("  [FLOW-BOOTSTRAP] out=%s | dsp=%d max_depth=%d -> K_rad=%d, stages=(%d+%d+%d+%d), "
+           "dsp_ops=%u->%u, cut_dff=%d->%d bits (%d lanes, mux=%u->%ub), "
+           "searu_it=%u+%u (epi=%u+%u), quad_cyc=%d (CONVERGED)\n",
            out_path, dsp_count, max_depth, k_rad,
-           ca.num_stages, cb.num_stages, cd.num_stages, cc.num_stages,
-           cut_bits, quad_cycles);
+           cones[CONE_A].num_stages, cones[CONE_B].num_stages,
+           cones[CONE_D].num_stages, cones[CONE_C].num_stages,
+           hls_stats.dsp_uniq_ops_init, hls_stats.dsp_uniq_ops_best,
+           virt_bits, ra.shared_cut_bits, ra.num_lanes,
+           hls_stats.lane_mux_bits_init, hls_stats.lane_mux_bits_best,
+           hls_stats.p1_iters, hls_stats.p2_iters,
+           hls_stats.p1_epiphanies, hls_stats.p2_epiphanies,
+           quad_cycles);
     return 0;
 }
