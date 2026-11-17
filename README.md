@@ -1,63 +1,65 @@
-# ELE v7.0.1 — Self-Hosting `SEARU × FLOW` Silicon Realization
+# ELE v8.0.0 — Unified HoTT Front-End + Back-End Silicon Platform (`RTL` + `576B .flow PDK` + `.fir` $\to$ `GDSII v6.0`)
 
-**Self-Hosting `SEARU × FLOW v7.0.1` Symbiotic 2-Jet Silicon Bootstrap (`tools/ele_bootstrap.c` $\to$ Pure Synthesizable IEEE 1800 SystemVerilog): Pure-GPR C17 Co-Synthesis (`flow_step_atlas` Continuous Retiming $\times$ `SEARU_SOLVE_INLINE` DSP Operand-Affinity Binding & Mux-Aware Register Coloring), `-127` Reclaimed Core/Atlas Sequential DFFs, Fine-Grained Regime Clock Gating & Coherent Chart-Bound Caching (`0` Steady-State SRAM Sense-Amp Reads), 3-Tier Physical Hierarchy (`42`-Pin QFN-48 ASIC Chip / `141`-Pin Core Macro / `157`-Pin 64b NoC Macro), Dual `ele_bus_invert17` Charge-Minimal Pad PHY (`<= 8/17` SSO Cap + Idle CSA Isolation), True `$mem_v2` Synchronous 1RW 64-Bit SRAM with Shadow-SRAM Zero-`cand_buf_q` `@swap`, `33×33` Limb-Decomposed DSP Atoms, `9×` Yosys SAT `QED` Formal Proofs, `64 / 64` (`100.0%`) RTL Sabotage Kill Rate, and Full Dual-Profile `0-ULP` 512-Bit Lockstep (including Live `searu_heal_and_swap` $\Delta < 0$ Barrier Healing) against Frozen `FLOW`.**
+**Self-Hosting `SEARU × FLOW` Symbiotic 2-Jet Silicon & Univalent Photomask Compiler (`Flow.lean` SSOT + pure-config `Ele.lean` + `tools/ele_bootstrap.c` + `tools/ele_fab.h` $\to$ Pure Synthesizable IEEE 1800 SystemVerilog + Verified Binary `.gds` GDSII v6.0): `FLOW v8.0.0` Lean 4 SSOT (`0 sorryAx`, auto-generated `ele_pdk_abi.h` with `0` bit-punning, `3× 576B` `.flow` PDK Atlases for `sky130` / `euv7` / `sic800v`, QTT `.fir` morphisms `ele_core_ir.fir` & `gf256_sbox_mac.fir`), Univalent Logic-to-Physical Co-Evolution (Proved `euv7` Repeater Split `146,724 ps -> 136,309 ps`), Abacus + 3-Layer Kan `RSMT` + `2-Jet` Optical Diffraction `OPC/ILT` (`<= 6 nm` EPE), 4-Tier Physical Hierarchy (`42`/`44`/`141`/`157`-Pin), `<0.7V` AI GPU VPD, `<1 µs` `800V DC` SiC SSCB, `1.20 p.u.` `GFM`, `ASIL-D` BMS, `12×` Yosys SAT `QED`, `0-ULP` Co-Sim, and `28 / 28` (`100.0%`) Fab/GDSII + `76 / 76` (`100.0%`) RTL Sabotage Audits.**
 
 ---
 
-## Self-Hosting `SEARU × FLOW 2-Jet` Symbiotic Silicon Bootstrap & 3-Tier Physical Hierarchy
+## Unified HoTT / `SEARU × FLOW 2-Jet` Logic-to-Lithography Architecture
 
-Instead of hand-translating C17 `int128` operators into an unroutable `2,226`-pin / `2,761`-pin / `65×65` monolithic FSM with `8,192` loose flip-flops pretending to be SRAM — or relying on greedy hand-coded HLS heuristics — `ELE v7.0.1` decomposes hardware into **Primordial Physical Seed Atoms** ([`rtl/ele_primordial.sv`](rtl/ele_primordial.sv) + [`rtl/ele_em_phy.sv`](rtl/ele_em_phy.sv)) and natively couples **[`FLOW`](https://github.com/hianova/FLOW)'s continuous 2-Jet manifold solver (`flow_step_atlas` in `../FLOW/flow.h`) with discrete `SEARU` phase-boundary synthesis (`SEARU_SOLVE_INLINE` in `../FLOW/searu.h` + `../FLOW/flow_opt_params.h`)** inside a pure-GPR (`-std=c17 -mgeneral-regs-only`, zero-float) build-time compiler ([`tools/ele_bootstrap.c`](tools/ele_bootstrap.c)) to schedule, bind, color, clock-gate, and emit synthesizable IEEE 1800 SystemVerilog ([`rtl/ele_flow_core.sv`](rtl/ele_flow_core.sv)):
+`ELE v8.0.0` eliminates both the front-end/back-end wall and downstream DSL duplication: SystemVerilog RTL, Abacus placement, 3-layer Manhattan Steiner routing (`M1`/`VIA12`/`M2`/`VIA23`/`M3`), IR-drop, `2-Jet` Inverse Lithography (`OPC/ILT`), and binary `.gds` photomasks compile from domain-free `Flow.Schema` ABI & `Flow.Morphism` (`.fir`) compilers governed by **[`FLOW v8.0.0`](../FLOW/Flow.lean)**:
 
 ```text
-  FLOW + SEARU (../FLOW/{flow.h, searu.h, flow_opt_params.h} — Frozen v7.0.1 Reference, 0 Bytes Modified)
+  FLOW v8.0.0 Pure-Math SSOT (../FLOW/{Flow.lean, Flow/*.lean, flow.h, searu.h, flow_opt_params.h, flow_ir.h} — 0 sorryAx)
         │
-        ├──► Build-Time SEARU × FLOW 2-Jet Symbiotic HLS Compiler (tools/ele_bootstrap.c, -mgeneral-regs-only)
-        │      • Continuous Retiming  : Converges flow_step_atlas on SSA DAG under (--dsp-count M, --max-depth D)
-        │      • Pass 1 (DSP Binding) : SEARU_SOLVE_INLINE searches per-stage dsp_slot permutations across
-        │                               Cones A/B/C to minimize shared cut bits + unique 33b DSP operands + mux fan-in
-        │      • Pass 2 (Cut Coloring): SEARU_SOLVE_INLINE refines heterogeneous-width live-range lane bindings
-        │                               to minimize DFF bits + writer-mux fan-in with O(N^2) 0-overlap proof
-        │      • Pass 3 (Power & DFF) : Folds d_mag into sr_acc_q (-64 DFFs), promotes op_mask/r2 to zero-DFF
-        │                               invariants (-33 DFFs), gates Cone A/C/D regime clocks & DSP enables,
-        │                               and emits coherent chart-bound caching (-30 Atlas DFFs, 0 steady SRAM reads)
-        │      • Emits pure IEEE 1800 SystemVerilog (rtl/ele_flow_core.sv)
+        ├──► Ele.lean (Pure Silicon Parameter Config: <=200 lines, 0 theorems, 0 custom serialization)
+        │      • Configures PdkSpec (pdkSky130, pdkEuv7, pdkSic800v) + Flow.Morphism.Builder circuits
+        │      └──► Emits build/ele_pdk_abi.h + 3× 576B .flow PDKs + ele_core_ir.fir + gf256_sbox_mac.fir
+        │
+        ├──► Build-Time Symbiotic HLS + Univalent Fab Compiler (tools/ele_bootstrap.c + tools/ele_fab.h)
+        │      • Pure-GPR C17 / C++20-clean (-mgeneral-regs-only -fno-jump-tables, 0 heap/float)
+        │      • Typed Schema ABI       : #include "ele_pdk_abi.h" (FNV-1a hash + bounds check, 0 bit-punning)
+        │      • Front-End HLS & .fir   : --fir core SSA retiming + --fir-synth linear .fir -> SV + 1024-vec Verilator
+        │      • Univalent Co-Evolution : Monotonic 2-Pass SEARU × FLOW 2-Jet repeater-insertion & placement
+        │      • Legalizer & Kan Router : Abacus row alignment + 3-layer Kan RSMT + Chart-2 IR-drop
+        │      • 2-Jet OPC & GDSII v6.0 : Local-ROI 2D aerial diffraction serifs + 1nm DBU Excess-64 .gds
+        │                                 + independent raw-byte GDSII DRC / 3D Union-Find LVS verifier
         ▼
-  ELE v7.0.1 Synthesizable Silicon IPs & Verification Gates (rtl/, tools/)
+  ELE v8.0.0 Synthesizable Silicon IPs, GDSII Photomasks & Verification Gates (Ele.lean, rtl/, tools/)
   ├── rtl/ele_primordial.sv        : Primordial Physical Seed Atoms
   │   ├── ele_mul33_atom           : Operand-isolated 33x33 -> 66 signed DSP slice (0 idle flips)
   │   ├── ele_rad2_step_atom       : Unified 1-subtractor radix-2 slice shared by isqrt & udiv
   │   └── ele_sram_1rw64           : True synchronous 1RW 64-bit Chart Arena SRAM ($mem_v2)
-  ├── rtl/ele_em_phy.sv            : Charge-Minimal Pad PHY, Ternary MAC & QFN-48 ASIC Top
+  ├── rtl/ele_em_phy.sv            : Charge-Minimal Pad PHY, Ternary MAC & Manifold QFN-48 Top
   │   ├── ele_bus_invert65         : 65-wire on-die Bus-Invert PHY (<= 32/65 flips + idle CSA isolation)
   │   ├── ele_bus_invert17         : 17-wire narrow ASIC pad PHY (<= 8/17 SSO + idle CSA isolation)
   │   ├── ele_ternary_mac_dualrail : Glitch-free dual monotonic rail 1.58b ternary MAC + negator gating
-  │   └── ele_flow_qfn_top         : Tier 3 — 42-pin 6x6 mm QFN-48 Charge-Minimal ASIC Chip
+  │   └── ele_flow_qfn_top         : Tier 3A — 42-pin 6x6 mm QFN-48 Charge-Minimal Manifold ASIC
+  ├── rtl/ele_power_phy.sv         : Switched-Power Actuators, 800V SiC SSCB & Power-QFN48 ASIC
+  │   ├── ele_dpwm_multiphase      : 4-phase 90-deg interleaved HR-DPWM, 4->1 phase shedding, >=1-cyc
+  │   │                              dead-time clamp (0 shoot-through k-inductive QED), 0-cyc fault_kill
+  │   ├── ele_sscb_trip_atom       : 800V DC SiC Solid-State Breaker (<1 us 2-Jet dI/dt + d^2I/dt^2
+  │   │                              concavity discriminator + adiabatic I^2*t fuse & 0-A re-arm latch)
+  │   └── ele_power_qfn_top        : Tier 3B — 44-pin QFN-48 Closed-Loop VPD + 800V SiC SSCB ASIC
+  │                                  (5-wire BI5 host link <= 2/5 SSO + dual 12b ADC + 0-cyc reflex)
   ├── rtl/ele_flow_core.sv         : SEARU × FLOW Synthesized 64-Bit Streaming Engine & Atlas NoC Top
   │   ├── ele_flow_core            : Tier 1 — 141-pin 0-ULP 512-bit 2-Jet manifold core macro
   │   └── ele_flow_atlas_top       : Tier 2 — 157-pin 64b NoC macro + Bound-Cache + Shadow-SRAM @swap
-  ├── rtl/ele_cosim_tb.sv          : Full 8-probe dual-profile 0-ULP DPI-C wind-tunnel, QFN-48 pad-SSO
-  │                                  telemetry, 2^-120/2^-124 knife-edges & live searu_heal_and_swap
-  └── tools/rtl_sabotage_check.py  : 64-mutant parallel SV single-fault RTL sabotage & kill-rate gate
+  ├── rtl/ele_cosim_tb.sv          : Full 11-probe dual-profile 0-ULP DPI-C wind-tunnel (VPD, SSCB,
+  │                                  GFM inverter, LFP BMS, QFN-48 BI17/BI5, 2^-120/2^-124, SEARU heal)
+  ├── tools/ele_fab.h              : Pure-GPR .flow PDK decoder, Univalent Fab compiler, 2-Jet OPC &
+  │                                  raw-byte GDSII v6.0 DRC + 3D Union-Find LVS checker
+  ├── tools/fab_sabotage_check.py  : 28-mutant parallel C17/Fab/DRC/LVS/OPC/GDSII sabotage gate (100%)
+  └── tools/rtl_sabotage_check.py  : 76-mutant parallel SV single-fault RTL sabotage gate (100%)
 ```
 
-### 3-Tier Physical Packaging & Pinout Hierarchy
+### 4-Tier Physical Packaging & Pinout Hierarchy
 
 | Hierarchy Tier | Module | Physical Pins | Target Integration & I/O Architecture |
 | :--- | :--- | :--- | :--- |
 | **Tier 1 (Core Macro)** | `ele_flow_core` | **`141` pins** | Hardened 64-bit streaming 2-Jet manifold compute block (`0` SRAM) |
-| **Tier 2 (On-Die NoC)** | `ele_flow_atlas_top` | **`157` pins** | Wide 64-bit SoC/FPGA macro with `1× $mem_v2` 1RW SRAM + coherent chart-bound cache + Shadow-SRAM `@swap` |
-| **Tier 3 (Discrete ASIC)** | **`ele_flow_qfn_top`** | **`42` pins** | **`6×6 mm` QFN-48 chip** (`42` signal + `6` VDD/VSS pins, **`-73.2%`** vs `157`, **`-98.5%`** vs `2,761`) with live 17-wire Bus-Invert Rx/Tx PHY (`<= 8/17` SSO) |
-
-### Silicon Craftsmanship & Dynamic Power ($C V^2 f \alpha$) Architecture (`v7.0.1`)
-
-- **`-127` Physical Flip-Flops Reclaimed (`-97` Core + `-30` Atlas Wrapper)**:
-  - **`d_mag` Folded into `sr_acc_q` (`-64` DFFs)**: `isqrt` rounds its final 64-bit root directly into `sr_acc_q`, which holds `d_mag` across Cone D until `sym_div128_clamped` overwrites `sr_acc_q` with `init_quot`.
-  - **Combinational Step Invariants (`-33` DFFs)**: `op_mask_q` (`1b`) and `r2_q` (`32b`) are derived directly from persistent `b1_q`, `b2_q`, and `state_w_q[2]` (which never mutate until the final commit beat), eliminating `33` redundant DFFs with zero critical-path penalty.
-  - **Atlas Wrapper Register Compaction & Coherent Chart-Bound Cache (`-30` Net DFFs, `-100%` Steady-State SRAM Sense-Amp Reads)**: Eliminates `16`-bit `mode_hold_q` (forwarding `{cmd_aux_i, cap_mask_q}` directly into `u_core` on `CMD_STEP`), pre-clamps `u_ext_hold_q` from `64b` to `32b`, and tracks the resident chart slot (`bound_cache_valid_q` + `bound_cache_slot_q`) with automatic hardware invalidation on matching `CMD_WRITE_CHART` / `CMD_SWAP` commits — skipping all `6 × 64b` SRAM reads (`sram_ce_c = 0`) and saving `6` clock cycles per repeated-chart step.
-- **Zero Spurious Datapath & PHY Switching**:
-  - **Regime-Aware Clock & DSP Isolation**: Gating `a2_x_sq` (`b2 != 0`), `c1_dsq` (`r2 != 0`), `a7/a8` (`op_mask_q`), and `a9` (`~op_mask_q`) eliminates quadratic multiplier and cut-lane switching on linear/autonomous/converged steps (`0` datapath DFF toggles on steady converged steps; `-99.2%` / `-98.9%` idle vs active core flips).
-  - **128-Bit `sr_aux_q` Upper-Half & `pre_sat` Divider Gating**: `sym_div128_clamped` initialization updates only `sr_aux_q[63:0]` (never clobbering `sr_aux_q[127:64]`) and completely gates `sr_rem_q`, `sr_acc_q`, and `sr_aux_q` writes whenever `pre_sat` triggers (`anum_hi >= den`).
-  - **Idle PHY CSA & Negator Operand Isolation**: `ele_bus_invert65` and `ele_bus_invert17` isolate their 65-bit / 17-bit XOR-popcount CSA trees to `0` when `!valid_i`, and `ele_ternary_mac_dualrail` gates its 32-bit two's-complement magnitude negator when `!valid_i || !trit_nz_i`.
+| **Tier 2 (On-Die NoC)** | `ele_flow_atlas_top` | **`157` pins** | Wide 64-bit SoC/FPGA macro with `1× $mem_v2` 1RW SRAM + coherent bound cache + Shadow-SRAM `@swap` |
+| **Tier 3A (Manifold ASIC)** | `ele_flow_qfn_top` | **`42` pins** | **`6×6 mm` QFN-48 chip** (`42` signal + `6` VDD/VSS) with 17-wire BI17 Rx/Tx PHY (`<= 8/17` SSO) |
+| **Tier 3B (Power/SSCB ASIC)** | **`ele_power_qfn_top`** | **`44` pins** | **`6×6 mm` QFN-48 Digital Power & SiC Protection chip** (`ele_flow_atlas_top` + `ele_dpwm_multiphase` `301` cells / `32` DFFs + `ele_sscb_trip_atom` `2,730` cells / `74` DFFs + 5-wire BI5 `<= 2/5` SSO + 12b dual ADC + `SSCB -> DPWM` 0-cycle kill) |
 
 ---
 
@@ -65,55 +67,92 @@ Instead of hand-translating C17 `int128` operators into an unroutable `2,226`-pi
 
 | Metric | Legacy Hand-Written SV | **Profile A (`--dsp-count 1 --max-depth 22`)** | **Profile B (`--dsp-count 3 --max-depth 36`, Canonical)** |
 | :--- | :--- | :--- | :--- |
-| **Physical Pins (`qfn` / `core` / `atlas`)** | `2,761` / `2,226` / `2,761` | **`42` / `141` / `157` (`-98.5%` QFN-48)** | **`42` / `141` / `157` (`-98.5%` QFN-48)** |
+| **Physical Pins (`qfn` / `pwr_qfn` / `core` / `atlas`)** | `2,761` / — / `2,226` / `2,761` | **`42` / `44` / `141` / `157` (QFN-48)** | **`42` / `44` / `141` / `157` (QFN-48)** |
 | **Chart Arena Storage (`1RW SRAM`)** | `8,192` loose DFFs | **`1× $mem_v2` 1RW 64b SRAM (`0` steady reads on cache hit)** | **`1× $mem_v2` 1RW 64b SRAM (`0` steady reads on cache hit)** |
-| **External Pad SSO Noise (`qfn_top`)** | Unbounded `100%` simultaneous flips | **`<= 8 / 17` wires (`< 50%` SSO, `-20.6%` pad toggles)** | **`<= 8 / 17` wires (`< 50%` SSO, `-22.7%` pad toggles)** |
+| **External Pad SSO Noise (`flow_qfn` / `pwr_qfn`)** | Unbounded `100%` flips | **`<= 8/17` (`-20.6%`) / `<= 2/5` (`-63.8%`)** | **`<= 8/17` (`-22.7%`) / `<= 2/5` (`-63.8%`)** |
 | **DSP / Radix-2 Hardware** | `1× 65×65` + 2 subtractors | `1× 33×33` DSP + `1×` Radix-2 (`K_rad=1`) | `3× 33×33` DSP + `2×` Radix-2 (`K_rad=2`) |
 | **Pipeline-Cut Bits (`VIRTUAL -> SHARED`)** | Unshared (`2,459` / `933` bits) | **`429` bits (`-82.6%` SEARU colored, `955b` mux)** | **`262` bits (`-71.9%` SEARU colored, `33` uniq DSP ops)** |
 | **Internal Core Datapath DFF Bits** | Unshared (`> 2,500` bits) | **`925` bits (`-97` reclaimed DFFs)** | **`756` bits (`-97` reclaimed DFFs)** |
-| **Synthesized Physical DFFs (`core` / `atlas`)** | `3,674` / `520` DFFs (+ `8,192` mem) | **`1,782` (`-51.5%`) / `131` (`-74.8%`, `0` `cand_buf_q`)** | **`1,593` (`-56.6%`) / `131` (`-74.8%`, `0` `cand_buf_q`)** |
-| **Flattened Core CMOS Cells** | `58,245` cells | **`33,277` cells (`-42.9%` vs legacy)** | **`47,954` cells (`-17.7%` vs legacy)** |
+| **Flattened Core CMOS Cells (`ele_flow_core`)** | `58,245` cells | **`33,277` cells (`-42.9%` vs legacy)** | **`47,954` cells (`-17.7%` vs legacy)** |
+| **Power & Protection Atom Area** | None | **`301` cells (`ele_dpwm_multiphase`) + `2,730` cells (`ele_sscb_trip_atom`)** | **`301` cells (`ele_dpwm_multiphase`) + `2,730` cells (`ele_sscb_trip_atom`)** |
 | **Critical Path (`ltp -noff`)** | Unbounded `65×65` cone | **`237` CMOS gate levels (`-40.2%` vs Profile B)** | **`396` CMOS gate levels** |
 | **Step Latency (`quad / lin / idle`)** | `143 / 70 / 4` cyc | `155 / 83 / 8` cyc (`20` idle flips, **`-99.2%`**) | **`73 / 38 / 3` cyc (`10` idle flips, **`-98.9%`**)** |
 
 ---
 
-## Dual-Profile 8-Probe Wind-Tunnel, Formal `9× QED` & `100.0%` RTL Sabotage Gate
+## Unified HoTT Front-End + Back-End Fab Signoff ([`Flow.lean`](../FLOW/Flow.lean) + [`Ele.lean`](Ele.lean) $\to$ `576B .flow` + `.fir` $\to$ `GDSII v6.0`)
 
-**Both** Area Profile A (`--dsp-count 1 --max-depth 22`) and Canonical Profile B (`--dsp-count 3 --max-depth 36`) execute the **100% full, un-shortened** 8-probe X-poisoned co-simulation suite (`Verilator 5.054` `-Wall --x-assign unique --x-initial unique`, zero smoke shortcuts):
+[`Flow/`](../FLOW/Flow/) serves as the sole domain-free Lean 4 SSOT (`0 sorryAx`, `-DwarningAsError=true`) certifying midpoint-split quadratic reduction (`Flow.Bundle`), constructive lattice clearance / snap-grid / box geometry (`Flow.Interval`), `Flow.Schema` (`ele_pdk_abi.h`), and QTT `.fir` morphism graphs (`Flow.Morphism`). Thin [`Ele.lean`](Ele.lean) (`0` local theorems) configures `pdkSky130`, `pdkEuv7`, and `pdkSic800v` into `3× 576B` `.flow` Atlases + `ele_core_ir.fir` + shared `gf256_sbox_mac.fir`, consumed by [`tools/ele_fab.h`](tools/ele_fab.h) & [`tools/ele_bootstrap.c`](tools/ele_bootstrap.c):
+
+| Process Atlas (`576B .flow`) | GDSII Hash & Size | Polygons | Repeaters | Crit Path | Wirelength | Max IR-Drop | `2-Jet` OPC EPE | Binary DRC / LVS |
+| :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
+| **`sky130`** (`pdk_sky130.flow`) | `0x7B2A077904419EFE` (`124,086 B`) | `1,908` | `0` | `11,253 ps` | `6,364 µm` | `49 mV` | `42 -> 2 nm` (`104` serifs) | **`0` DRC / `0`-open / `0`-short** |
+| **`euv7`** (`pdk_euv7.flow`) | `0x709DF7462226CE05` (`126,774 B`) | `1,950` | **`2`** | `136,309 ps` | `671 µm` | `43 mV` | `3 -> 1 nm` (`108` serifs) | **`0` DRC / `0`-open / `0`-short** |
+| **`sic800v`** (`pdk_sic800v.flow`) | `0xA19E0DE21B3540C3` (`124,150 B`) | `1,909` | `0` | `4,971 ps` | `20,416 µm` | `67 mV` | `46 -> 6 nm` (`104` serifs) | **`0` DRC / `0`-open / `0`-short** |
+
+- **Machine-Checked Univalent Split Ablation (`euv7`)**: Locked front-end (`reps = 0`) traps placement/routing at `crit = 146,724 ps` (`E = 587,894`), whereas Univalent HoTT Co-Evolution inserts `2` repeaters across the front-end/back-end boundary to achieve **`crit = 136,309 ps` (`E = 546,331`, both delay & closure improved)**.
+- **Shared Cross-Domain `.fir` Projection (`gf256_sbox_mac.fir`)**: Byte-identical to `../QUA/qcc/build/gf256_sbox_mac.fir`, compiled via `--fir-synth` into Verilator `0-ULP` SV (`1,024`-vector lockstep vs Pure-GPR `flow_ir_eval_u64`), latch-free Yosys netlist, and `124,022 B` `sky130` GDSII (`DRC=0, LVS=0`).
+
+---
+
+## Dual-Profile 11-Probe Wind-Tunnel, `12×` Formal `QED` & `100.0%` Dual Sabotage Gate
+
+**Both** Area Profile A (`--dsp-count 1 --max-depth 22`) and Canonical Profile B (`--dsp-count 3 --max-depth 36`) execute the **100% full, un-shortened** 11-probe X-poisoned co-simulation suite (`Verilator 5.054` `-Wall --x-assign unique --x-initial unique`, zero smoke shortcuts):
+
+### High-Leverage Electricity Domains (Probes 9–11)
+
+- **Probe 9 (`44`-Pin `ele_power_qfn_top` — AI GPU `<0.7V` 4-Phase VPD Transient & `800V DC` SiC SSCB)**:
+  - **9A (`<0.7V` VPD `1,500 A/µs` GPU Load Slam `80A <-> 1,080A`, `4` Coupled Phases `L_ph=12 nH, C_out=18 mF`)**:
+    - **Canonical Profile B**: **`ELE` undershoot `49.6 mV` / overshoot `90.8 mV`** (Schmitt `1 <-> 4` phase boost, `0` light-load phase-2 switches) vs Digital Type-III PID **`87.5 mV` / `455.5 mV`** — **`43.2%` (`7,776 µF`) equivalent MLCC output capacitance saved**!
+    - **Area Profile A**: **`ELE` undershoot `55.1 mV` / overshoot `88.3 mV`** vs PID **`87.5 mV` / `455.5 mV`** — **`37.0%` (`6,660 µF`) equivalent MLCC saved**!
+    - Verified continuously on every `2 ns` tick: `0` shoot-through events, `0` dead-time violations, `90°` quadrature phase interleaving, 0-cycle `fault_kill_i`, and `max_tx5_flips = 2 / 5` (`<= 2`, `-63.8%` wire toggles: `34` vs `94`).
+  - **9B (`800V DC` SiC Solid-State Circuit Breaker)**:
+    - **Bolted Short-Circuit (`200 A/µs`)**: Trips in **`200 ns` (`0.20 µs`)** via 2-Jet $dI/dt + d^2I/dt^2$ discriminator (`I_peak = 140 A` vs `972 A` `900 A + 400 ns` baseline, **`> 10×` lower $\int I^2 dt$ let-through energy**) AND simultaneously shuts off VRM DrMOS gates in **0 clock cycles**.
+    - **Capacitive Hot-Swap Inrush (`560V -> 800V` RC/RLC Precharge)**: Concave $d^2I/dt^2 < 0$ rollover rides through with **`0` false trips** (vs `1` false trip on fixed-$dI/dt$ comparator).
+    - Verified zero-current re-arm interlock (`sscb_clr_i` rejected under live current `50 A`, accepted at `0 A`), adiabatic $\int I^2 dt$ overload trip (`cause = 3'b100`), and `0`-cycle hard-OCP trip (`cause = 3'b001`).
+
+- **Probe 10 (Grid-Forming `GFM` Inverter `1.20 p.u.` Saturation & `satSEP` Anti-Lock-In Ride-Through)**:
+  - Deep `0.15 p.u.` grid sag + `-32°` phase jump over `150 ms` on `ele_flow_atlas_top` (`0-ULP` 512-bit lockstep vs `flow_step_atlas` across all `140` EMT steps):
+  - Triggers live `searu_heal_and_swap` (`ele_dpi_searu_heal`) + hardware `CMD_SWAP` on $\Delta < 0$ grid-strength bifurcation, holds **`max |I| = 1.198 p.u.` (`<= 1.200 p.u.`)** across fault + clearance, and resynchronizes in **`4 ms` (`0.065°` final error)** with strictly bounded EMT hardware WCET (`5..81` cyc on Profile B, `10..163` cyc on Profile A).
+  - Conventional Clamped-PI baseline overshoots to `1.500 p.u.` transient current and locks irreversibly into **`satSEP` (`168.323°` final angle error)**.
+
+- **Probe 11 (ISO 26262 `ASIL-D` LFP `LiFePO4` `32 mV` Hysteresis & Lossless $2^{-49}$ BMS Observer)**:
+  - `1,024` sub-LSB dynamic EV drive/regen micro-pulses over `ele_flow_atlas_top` (`0-ULP` C17 lockstep): **`0.00%` SoC secular drift (`0` sub-LSB bits lost)** vs **`1.92%` SoC drift** on naive truncated Coulomb counter and **`14.08%` SoC error** on hysteresis-blind plateau EKF (`0.35 mV/%` plateau fooled by `±16 mV` hysteresis).
+  - Verified **`2` chatter-free Schmitt Charge <-> Discharge branch transitions** and **`16 / 16` `KanLock` EMI glitch rejections**.
+
+### Foundational Silicon, Formal `12× QED` & Adversarial Sabotage Gates (Probes 1–8, Gates 4–6)
 
 - **Probe 1 (`0-ULP` 512-Bit Differential)**: `20,480 / 20,480` vectors on Profile B + `20,480 / 20,480` vectors on Profile A (`40,960` total) bit-identical across `w0..w7` (`0` defects).
-- **Probe 2 (Gauge Parity & $2^{-49}$ Fiber)**: `1,024` odd-mirror pairs (`0` cycle/value asymmetries) + `2,048`-generation autonomous sub-LSB fiber (`0-ULP` drift through `ele_sram_1rw64`) on both profiles.
-- **Probe 3 (`ele_sram_1rw64` Atlas, Coherent Chart-Bound Cache & Release-Ordered `@swap` Firewall)**: Hardware `cap_mask` slot clamping (`0xFF -> 15`), firewall rejection (`0` target SRAM writes on all `10` adversarial `@swap` vectors including exact `cap_mask + 1` boundaries), release-ordered `w6` Shadow-SRAM zero-`cand_buf_q` `@swap` commit, active-slot `bound_cache` coherence across live `CMD_WRITE_CHART` and `CMD_SWAP` overwrites, and in-flight step immunity.
-- **Probe 4 (CMOS Switching-Energy Telemetry)**:
-  - `ele_flow_core` tickless convergence + regime clock gating cuts active-vs-converged DFF bit flips by **`-99.2%`** on Profile A (`531` vs `68,176`, `20` flips/converged step) and **`-98.9%`** on Profile B (`355` vs `35,191`, `10` flips/converged step — `0` datapath flips).
-  - `ele_bus_invert65`: **`max_flips = 32 / 65`**, **`-14.7%` wire toggles** (`29,435` vs `34,519`).
-  - `ele_ternary_mac_dualrail`: **`0-ULP` bipolar match**, **`-8.2%` DFF toggles** (`4,655` vs `5,073`) + `0`-flip zero-skip.
-- **Probe 5 (Analytical $2^{-120}$ / $2^{-124}$ Cross-Limb Knife-Edges — `3,700` Vectors / Profile)**: `3,688` analytical multipole knife-edges (`944` `isqrt` $k=2..60$ positive/negative gauge twins across `ele_mul33_atom` 33-bit limb & 64-bit carry/borrow cliffs + `2,700` `sym_div128_clamped` 64-stage `0.5 ULP` half-way rounding & `over_cap` cliffs + `42` `sub_valid`/Schmitt/KanLock cliffs + `2` extreme 125-bit $\Delta \ge 2^{124}$ & inverted Schmitt cliffs) plus `12` exact Q49 convergence, isometric Lyapunov, `G1 == 0, R2 < 0` gauge, and 128-bit `pre_sat` boundary vectors at `0-ULP`.
-- **Probe 6 (SEARU Zero-Memory 1-Bit `DualChaosState` + `Epiphany` Crucible + Live `searu_heal_and_swap` Hardware Barrier Healing)**:
-  - `4,096` closed-loop multi-chart `ele_flow_atlas_top` steps (`k=1..6` branchless SWAR XorShift `AND` cooling + Zipf singular jumps + `405` `Epiphany` phase-boundary lock/re-heat events) interleaved with `256` live `@swap` firewall checks (`142` accepted, `114` rejected) verified at `0-ULP` against `flow_step_atlas` & `flow_arena_try_swap`.
-  - **Live `searu_heal_and_swap` $\Delta < 0$ Barrier Self-Healing**: Loads an unreachable discriminant-barrier chart (`b0 = 1,600,000, b1 = 0, b2 = 2 * 65536`) into `ele_flow_atlas_top`, verifies `0-ULP` hardware stall (`!CONVERGED && dt == 0`), invokes `searu.h`'s `searu_heal_and_swap` via DPI-C (`ele_dpi_searu_heal`) with a 24-term `searu_bilevel_term` actuator bank, commits the synthesized chart via live hardware `CMD_SWAP` (`top_try_swap`), and verifies `0-ULP` 512-bit hardware convergence to the exact target root (`CONVERGED == 1`, `x == 241,664`) plus pre/post-heal phase-gate no-op invariance.
-- **Probe 7 (FSM Handshake Bubble Chaos, Busy Illegal-Write Immunity & Exhaustive Mid-Flight `rst_n` Recovery)**:
-  - Irregular `0..17`-cycle `wr_valid_i` / `cmd_valid_i` backpressure bubbles with scrambled beat ordering and hostile invalid-cycle bus garbage.
-  - Active in-flight (`ready_o == 0`) hostile write & opcode hammering across `ele_flow_core` and `ele_flow_atlas_top` (`CMD_STEP` & `CMD_SWAP`), proving `100%` register & SRAM immunity (`0-ULP`).
-  - Cycle-by-cycle mid-flight `rst_n = 0` abort & immediate `0-ULP` clean-slate recovery across **every** in-flight cycle offset (`73`/`155` core + `94`/`176` top offsets) and dynamically measured accepted `@swap` commits.
-- **Probe 8 (`42`-Pin QFN-48 Charge-Minimal ASIC Padframe Lockstep & 17-Wire Pad-SSO Telemetry)**:
-  - Executes `256` multi-chart quadratic/linear/autonomous/Citardauq-tunnel steps (including full lossless 16-bit `mode_req` via `SET_AUX_HI` and busy flit-ignore hammering during both core solve and 4-beat Tx readout bursts) interleaved with `32` valid & adversarial `@swap` transactions (`12` accepted, `20` rejected) through `ele_flow_qfn_top` (`42` pins) at **`0-ULP` 512-bit lockstep** against `flow_step_atlas` & `ele_dpi_try_swap`.
-  - Continuously verifies **`max_rx_flips = 8 / 17` (`<= 8`)** and **`max_tx_flips = 8 / 17` (`<= 8`)** (`< 50%` Simultaneous Switching Output pad noise ceiling on every single clock cycle), cutting total external QFN-48 pad toggles by **`-22.7%`** (`33,144` vs `42,889` on Profile B) and standalone `ele_bus_invert17` wire toggles by **`-25.6%`** (`6,880` vs `9,257`).
-- **`9×` Yosys Formal SAT / Unbounded k-Induction `QED` (`make formal-gate`)**: `ele_bus_invert65`, `ele_bus_invert17`, `ele_ternary_mac_dualrail`, `ele_mul33_atom`, `ele_rad2_step_atom`, `ele_flow_core` (`dsp=3`), `ele_flow_core` (`dsp=1`), `ele_flow_atlas_top`, and **`ele_flow_qfn_top`** (formally proving 42-pin QFN-48 reset safety, coherent chart-bound cache SRAM idle gating, unconditional busy flit-ignore invariance, 4-beat Tx readout burst sequencing, `<= 8/17` external pad SSO ceiling, `done_o -> ready_o`, SEU fault recovery, `cap_mask <= 15`, `@swap` firewall safety, and KanLock invariance).
-- **Gate 6 — Adversarial SystemVerilog RTL Sabotage Audit (`make mutate-check` / `make verify`)**: `tools/rtl_sabotage_check.py` injects `64` stratified single-fault SystemVerilog mutations (`8` QFN-48/PHY + `10` Primordial + `46` Core/Atlas) across isolated parallel Verilator sandboxes, requiring unique match, clean compilation (`compile_rc == 0`), and dynamic runtime kill (**`64 / 64 = 100.0%` mutant kill rate, `0` survivors**).
+- **Probe 2 (Gauge Parity & $2^{-49}$ Fiber)**: `1,024` odd-mirror pairs (`0` asymmetries) + `2,048`-gen autonomous fiber (`0-ULP` drift).
+- **Probe 3 (`ele_sram_1rw64` Atlas, Coherent Cache & `@swap` Firewall)**: Hardware `cap_mask` slot clamping, `10` adversarial `@swap` firewall rejections, Shadow-SRAM `@swap` commit, and active-slot `bound_cache` invalidation.
+- **Probe 4 (CMOS Switching-Energy Telemetry)**: `-99.2%` (Profile A) / `-98.9%` (Profile B) idle-vs-active core DFF flips (`20` / `10` idle flips), `ele_bus_invert65` (`-14.7%`), and `ele_ternary_mac_dualrail` (`-8.2%` + zero-skip).
+- **Probe 5 (Analytical $2^{-120}$ / $2^{-124}$ Cross-Limb Knife-Edges)**: `3,688` multipole knife-edges + `12` exact boundary cliffs = `3,700` vectors/profile (`0-ULP`).
+- **Probe 6 (`SEARU` Crucible + Live `searu_heal_and_swap`)**: `4,096` closed-loop steps + `256` `@swap` firewall checks + live $\Delta < 0$ hardware barrier healing (`CONVERGED = 1, x = 241,664`).
+- **Probe 7 (FSM Bubble Chaos, Busy Hammering & Mid-Flight `rst_n` Recovery)**: `0..17`-cycle bubbles, hostile busy writes across `ele_flow_core` & `ele_flow_atlas_top`, and exhaustive cycle-by-cycle `rst_n` abort/recovery.
+- **Probe 8 (`42`-Pin `ele_flow_qfn_top` Lockstep & `ele_bus_invert17`)**: `256` multi-chart steps + `32` `@swap` checks at `0-ULP`, capping pad SSO at `<= 8 / 17` wires (`-22.7%` Profile B / `-20.6%` Profile A).
+- **Gate 4 — `12×` Yosys Formal SAT / Unbounded k-Induction `QED` (`make formal-gate`)**:
+  All `9` original manifold/PHY proofs (`ele_bus_invert65`, `ele_bus_invert17`, `ele_ternary_mac_dualrail`, `ele_mul33_atom`, `ele_rad2_step_atom`, `ele_flow_core (dsp=3)`, `ele_flow_core (dsp=1)`, `ele_flow_atlas_top`, `ele_flow_qfn_top`) PLUS **`3` new power/protection unbounded `k`-induction proofs**:
+  - `ele_dpwm_multiphase` (unconditional `0` shoot-through, `>= 1`-cycle dead-time separation, `0`-cycle `fault_kill_i`, shed phase High-Z)
+  - `ele_sscb_trip_atom` (`0`-cycle hard OCP, concave hot-swap ride-through, sticky trip latch under live current, monotonic saturating $\int I^2 dt$)
+  - `ele_power_qfn_top` (`44`-pin QFN-48 reset safety, pin-level `0` shoot-through, `SSCB -> DPWM` 0-cycle reflex, busy write-ignore, `<= 2/5` BI5 SSO ceiling)
+- **Gate 6 — Dual Adversarial Sabotage Audit (`make mutate-check` / `make verify`, `104 / 104 = 100.0%`)**:
+  - [`tools/rtl_sabotage_check.py`](tools/rtl_sabotage_check.py): Injects **`76`** stratified single-fault SV mutations (`8` phy/qfn + `12` power/sscb + `10` primordial + `46` core/top), verifying unique match, clean Verilator compilation, and dynamic runtime kill: **`76 / 76 = 100.0%` (`0` survivors)**.
+  - [`tools/fab_sabotage_check.py`](tools/fab_sabotage_check.py): Injects **`28`** single-fault C17/Fab mutations across `5` categories (`6` `drc_pitch_width_grid` + `6` `lvs_open_short_pad` + `6` `univalent_coevolution` + `5` `litho_2jet_opc` + `5` `gdsii_binary_framing`): **`28 / 28 = 100.0%` (`0` survivors)**.
 
 ---
 
 ## Quick Start
 
-Requires sibling [`FLOW`](https://github.com/hianova/FLOW) (`../FLOW` at `v7.0.1`, pinned via `ref: v7.0.1` in [`.github/workflows/ci.yml`](.github/workflows/ci.yml)), a C17 compiler (`clang`/`gcc`), `verilator` ($\ge 5.0$), `yosys`, and `python3`:
+Requires sibling [`FLOW v8.0.0`](../FLOW/README.md) (`../FLOW`), Lean 4 (`lean` / `elan`), a C17/C++20 compiler (`clang`/`gcc`), `verilator` ($\ge 5.0$), `yosys`, and `python3`:
 
 ```sh
-# Fast 5-gate sign-off (Hygiene, Bootstrap, Full 8-Probe Dual-Profile Co-Sim, 9x SAT QED, 42-Pin QFN/SRAM Audit)
+# Lean 4 SSOT PDK + ABI + .fir emission (Flow.lean + Ele.lean -> build/{ele_pdk_abi.h,pdk_*.flow,*.fir})
+make clean && make lean-pdk-gate
+
+# Fast 5-gate sign-off (Hygiene/SSOT, Lean PDK/ABI, 3-PDK GDSII + .fir Silicon/Verilator, 11-Probe Co-Sim, 12x SAT QED, QFN Audit)
 make clean && make test
 
-# Full 6-gate sign-off including parallel SystemVerilog RTL sabotage kill-rate audit (64/64 = 100.0%)
+# Full 6-gate sign-off including 76 RTL + 28 Fab/GDSII parallel sabotage kill-rate audits (104/104 = 100.0%)
 make clean && make verify
 ```
 

@@ -1,5 +1,5 @@
 /* SPDX-License-Identifier: MIT
- * tools/ele_bootstrap.c — Self-Hosting SEARU × FLOW v7.0.1 Symbiotic Silicon Compiler
+ * tools/ele_bootstrap.c — Self-Hosting SEARU × FLOW v7.1.0 Symbiotic Silicon Compiler
  *
  * Build-time 3-pass SSA hardware compiler combining continuous FLOW 2-Jet lattice
  * retiming (`../FLOW/flow.h`) with discrete SEARU Sparse-k / Kan-pin / Crucible
@@ -32,6 +32,8 @@
 
 #include "flow.h"
 #include "searu.h"
+#include "flow_ir.h"
+#include "ele_fab.h"
 
 #define MAX_CONE_NODES  16
 #define MAX_PREDS       6
@@ -90,61 +92,7 @@ typedef enum {
     EXPR_C10_KAN_COMMIT
 } ssa_expr_id_t;
 
-/* Pass-1 Declarative SSA Micro-Op IR Descriptor */
-typedef struct {
-    cone_id_t     cone;
-    int           local_idx;
-    const char   *name;
-    node_phase_t  phase;
-    int           delay_lvls;
-    int           reg_bits;
-    int           num_preds;
-    int           preds[MAX_PREDS];
-    ssa_expr_id_t expr_id;
-} ssa_op_spec_t;
-
-static const ssa_op_spec_t k_ssa_op_specs[NUM_SSA_OPS] = {
-    /* Cone A: Exact 2^-49 Guard-Bit Residual G0 & 2^-32 Tangent G1 (11 ops) */
-    {CONE_A,  0, "a0_ug_u",       PHASE_DSP33,      17,  64, 0, {0},          EXPR_A0_UG_U},
-    {CONE_A,  1, "a1_b1_x",       PHASE_DSP33,      17,  64, 0, {0},          EXPR_A1_B1_X},
-    {CONE_A,  2, "a2_x_sq",       PHASE_DSP33,      17,  64, 0, {0},          EXPR_A2_X_SQ},
-    {CONE_A,  3, "a3_b2_x",       PHASE_DSP33,      17,  64, 0, {0},          EXPR_A3_B2_X},
-    {CONE_A,  4, "a4_b0_eff",     PHASE_POST_LOGIC, 10, 128, 1, {0},          EXPR_A4_B0_EFF},
-    {CONE_A,  5, "a5_b2xsq_lo",   PHASE_DSP33,      17,  66, 1, {2},          EXPR_A5_B2XSQ_LO},
-    {CONE_A,  6, "a6_b2xsq_hi",   PHASE_DSP33,      17,  66, 1, {2},          EXPR_A6_B2XSQ_HI},
-    {CONE_A,  7, "a7_g0_op",      PHASE_POST_LOGIC, 13, 128, 4, {1, 4, 5, 6}, EXPR_A7_G0_OP},
-    {CONE_A,  8, "a8_g1_op",      PHASE_POST_LOGIC,  8,  64, 1, {3},          EXPR_A8_G1_OP},
-    {CONE_A,  9, "a9_jet_au",     PHASE_POST_LOGIC, 11, 192, 1, {4},          EXPR_A9_JET_AU},
-    {CONE_A, 10, "a10_jet_mux",   PHASE_POST_LOGIC,  5,   0, 4, {4, 7, 8, 9}, EXPR_A10_JET_MUX},
-
-    /* Cone B: 128-Bit Multi-Limb Discriminant G1^2 - G0*R2 (9 ops) */
-    {CONE_B,  0, "b0_g1_ll",      PHASE_DSP33,      17,  66, 0, {0},          EXPR_B0_G1_LL},
-    {CONE_B,  1, "b1_g1_hl",      PHASE_DSP33,      17,  66, 0, {0},          EXPR_B1_G1_HL},
-    {CONE_B,  2, "b2_g1_hh",      PHASE_DSP33,      17,  66, 0, {0},          EXPR_B2_G1_HH},
-    {CONE_B,  3, "b3_g0r2_0",     PHASE_DSP33,      17,  66, 0, {0},          EXPR_B3_G0R2_0},
-    {CONE_B,  4, "b4_g0r2_1",     PHASE_DSP33,      17,  66, 0, {0},          EXPR_B4_G0R2_1},
-    {CONE_B,  5, "b5_g0r2_2",     PHASE_DSP33,      17,  66, 0, {0},          EXPR_B5_G0R2_2},
-    {CONE_B,  6, "b6_g1_sq",      PHASE_POST_LOGIC, 12, 128, 3, {0, 1, 2},    EXPR_B6_G1_SQ},
-    {CONE_B,  7, "b7_g0_r2",      PHASE_POST_LOGIC, 12, 128, 3, {3, 4, 5},    EXPR_B7_G0_R2},
-    {CONE_B,  8, "b8_disc_sub",   PHASE_POST_LOGIC, 11,   0, 2, {6, 7},       EXPR_B8_DISC_SUB},
-
-    /* Cone D: Gauge-Invariant Citardauq & Restoring Divider Normalization (2 ops) */
-    {CONE_D,  0, "d0_cit_sel",    PHASE_POST_LOGIC, 14, 194, 0, {0},          EXPR_D0_CIT_SEL},
-    {CONE_D,  1, "d1_div_norm",   PHASE_POST_LOGIC, 14,   0, 1, {0},          EXPR_D1_DIV_NORM},
-
-    /* Cone C: Coordinate Clamp, Exact 128-Bit Lyapunov Guard & Kan Commit (11 ops) */
-    {CONE_C,  0, "c0_delta_cand", PHASE_PRE_LOGIC,  13,  33, 0, {0},          EXPR_C0_DELTA_CAND},
-    {CONE_C,  1, "c1_d_sq",       PHASE_DSP33,      17,  64, 1, {0},          EXPR_C1_D_SQ},
-    {CONE_C,  2, "c2_g1dc_lo",    PHASE_DSP33,      17,  66, 1, {0},          EXPR_C2_G1DC_LO},
-    {CONE_C,  3, "c3_g1dc_hi",    PHASE_DSP33,      17,  66, 1, {0},          EXPR_C3_G1DC_HI},
-    {CONE_C,  4, "c4_r2_dc",      PHASE_DSP33,      17,  64, 1, {0},          EXPR_C4_R2_DC},
-    {CONE_C,  5, "c5_r2dsq_lo",   PHASE_DSP33,      17,  66, 1, {1},          EXPR_C5_R2DSQ_LO},
-    {CONE_C,  6, "c6_r2dsq_hi",   PHASE_DSP33,      17,  66, 1, {1},          EXPR_C6_R2DSQ_HI},
-    {CONE_C,  7, "c7_g0_cand",    PHASE_POST_LOGIC, 13, 128, 4, {2, 3, 5, 6}, EXPR_C7_G0_CAND},
-    {CONE_C,  8, "c8_lyap_guard", PHASE_POST_LOGIC, 14, 288, 3, {0, 4, 7},    EXPR_C8_LYAP_GUARD},
-    {CONE_C,  9, "c9_post_round", PHASE_POST_LOGIC, 13, 192, 1, {8},          EXPR_C9_POST_ROUND},
-    {CONE_C, 10, "c10_kan_commit",PHASE_POST_LOGIC,  7,   0, 2, {8, 9},       EXPR_C10_KAN_COMMIT},
-};
+/* Node descriptors are supplied externally by Lean SSOT `.fir` (`build_cones_from_fir`) */
 
 typedef struct {
     const char   *name;
@@ -268,34 +216,57 @@ static int solve_radix_unroll_2jet(int max_depth, uint32_t *out_epochs) {
     return resolved_k;
 }
 
-static void build_cones_from_ssa_ir(dag_cone_t cones[NUM_CONES]) {
+static void build_cones_from_fir(dag_cone_t cones[NUM_CONES], const flow_ir_prog_t *fir) {
     static const char *k_cone_names[NUM_CONES] = {
         "CONE_A_RESIDUAL",
         "CONE_B_DISC",
         "CONE_D_CITARDAUQ",
         "CONE_C_LYAP_COMMIT",
     };
+    static const uint32_t k_cone_base_val[NUM_CONES] = {1U, 12U, 21U, 23U};
+    if (fir->mult != FLOW_IR_MULT_CARTESIAN || fir->num_ops != NUM_SSA_OPS ||
+        fir->num_inputs != 1U) {
+        fprintf(stderr, "FATAL: invalid core .fir morphism metadata\n");
+        exit(1);
+    }
     memset(cones, 0, sizeof(dag_cone_t) * NUM_CONES);
     for (int c = 0; c < NUM_CONES; ++c) {
         cones[c].cone_name = k_cone_names[c];
     }
-    for (int op = 0; op < NUM_SSA_OPS; ++op) {
-        const ssa_op_spec_t *sp = &k_ssa_op_specs[op];
-        dag_cone_t          *cn = &cones[sp->cone];
-        if (sp->local_idx != cn->num_nodes) {
-            fprintf(stderr, "FATAL: SSA IR table index mismatch on %s\n", sp->name);
+    for (uint32_t i = 0U; i < fir->num_ops; ++i) {
+        const flow_ir_op_t *op = &fir->ops[i];
+        if (op->kind != FLOW_IR_OP_STAGE_PIPE) {
+            fprintf(stderr, "FATAL: unexpected op kind %u in core .fir\n", (unsigned)op->kind);
+            exit(1);
+        }
+        uint32_t cone      = (uint32_t)(op->p0 & 0xFFULL);
+        uint32_t local_idx = (uint32_t)((op->p0 >> 8U) & 0xFFULL);
+        uint32_t phase     = (uint32_t)((op->p0 >> 16U) & 0xFFULL);
+        uint32_t expr_id   = (uint32_t)((op->p0 >> 24U) & 0xFFULL);
+        if (cone >= NUM_CONES || phase > PHASE_POST_LOGIC || expr_id >= NUM_SSA_OPS) {
+            fprintf(stderr, "FATAL: corrupt metadata in core .fir op %u\n", (unsigned)i);
+            exit(1);
+        }
+        dag_cone_t *cn = &cones[cone];
+        if ((int)local_idx != cn->num_nodes || cn->num_nodes >= MAX_CONE_NODES) {
+            fprintf(stderr, "FATAL: SSA cone index mismatch in core .fir\n");
             exit(1);
         }
         dag_node_t *nd = &cn->nodes[cn->num_nodes++];
         memset(nd, 0, sizeof(*nd));
-        nd->name       = sp->name;
-        nd->phase      = sp->phase;
-        nd->delay_lvls = sp->delay_lvls;
-        nd->reg_bits   = sp->reg_bits;
-        nd->num_preds  = sp->num_preds;
-        nd->expr_id    = sp->expr_id;
-        for (int p = 0; p < sp->num_preds; ++p) {
-            nd->preds[p] = sp->preds[p];
+        nd->name       = fir->vals[op->out_val].name;
+        nd->phase      = (node_phase_t)phase;
+        nd->delay_lvls = (int)op->p1;
+        nd->reg_bits   = (int)op->p2;
+        nd->num_preds  = (int)op->num_ins;
+        nd->expr_id    = (ssa_expr_id_t)expr_id;
+        for (uint16_t p = 0U; p < op->num_ins; ++p) {
+            uint32_t src_v = op->ins[p];
+            if (src_v < k_cone_base_val[cone]) {
+                fprintf(stderr, "FATAL: cross-cone pred in core .fir\n");
+                exit(1);
+            }
+            nd->preds[p] = (int)(src_v - k_cone_base_val[cone]);
         }
     }
 }
@@ -2980,14 +2951,469 @@ static void emit_sv(FILE *fp, int dsp_count, int max_depth, int k_rad, uint32_t 
     fprintf(fp, "`default_nettype wire\n");
 }
 
+static ele_fab_ws_t   g_ele_fab_ws;
+static uint8_t        g_ele_fab_ref_buf[ELE_FAB_MAX_GDS_BYTES];
+static uint8_t        g_ele_fab_disk_buf[ELE_FAB_MAX_GDS_BYTES];
+static flow_ir_prog_t g_ele_fir_prog;
+static uint8_t        g_ele_fir_raw[FLOW_IR_MAX_FILE_BYTES];
+
+static void emit_sv_resized_rhs(FILE *fp, uint32_t vid, uint16_t src_w, uint16_t dst_w) {
+    if (src_w == dst_w) {
+        fprintf(fp, "w_%u", (unsigned)vid);
+    } else if (src_w > dst_w) {
+        fprintf(fp, "w_%u[%u:0]", (unsigned)vid, (unsigned)(dst_w - 1U));
+    } else {
+        fprintf(fp, "{{%u{1'b0}}, w_%u}", (unsigned)(dst_w - src_w), (unsigned)vid);
+    }
+}
+
+static void emit_sv_gf2m_funcs(FILE *fp, uint32_t tag, uint16_t deg, uint64_t poly, bool emit_inv) {
+    uint64_t poly_low = poly & flow_ir_mask_u64(deg);
+    fprintf(fp,
+            "    function automatic logic [%u:0] gf2m_mul_fn_%u(\n"
+            "        input logic [%u:0] fa,\n"
+            "        input logic [%u:0] fb\n"
+            "    );\n"
+            "        logic [%u:0] res;\n"
+            "        logic [%u:0] cur;\n"
+            "        integer k;\n"
+            "        begin\n"
+            "            res = %u'h0;\n"
+            "            cur = fa;\n"
+            "            for (k = 0; k < %u; k = k + 1) begin\n"
+            "                if (fb[k]) res = res ^ cur;\n",
+            (unsigned)(deg - 1U), (unsigned)tag, (unsigned)(deg - 1U), (unsigned)(deg - 1U),
+            (unsigned)(deg - 1U), (unsigned)(deg - 1U), (unsigned)deg, (unsigned)deg);
+    if (deg == 1U) {
+        fprintf(fp, "                cur = %u'h0;\n", (unsigned)deg);
+    } else {
+        fprintf(fp,
+                "                if (cur[%u]) cur = {cur[%u:0], 1'b0} ^ %u'h%" PRIx64 ";\n"
+                "                else          cur = {cur[%u:0], 1'b0};\n",
+                (unsigned)(deg - 1U), (unsigned)(deg - 2U), (unsigned)deg, poly_low,
+                (unsigned)(deg - 2U));
+    }
+    fprintf(fp,
+            "            end\n"
+            "            gf2m_mul_fn_%u = res;\n"
+            "        end\n"
+            "    endfunction\n",
+            (unsigned)tag);
+
+    if (emit_inv) {
+        uint64_t exp = flow_ir_mask_u64(deg) - UINT64_C(1);
+        fprintf(fp,
+                "    function automatic logic [%u:0] gf2m_inv_fn_%u(input logic [%u:0] fx);\n"
+                "        logic [%u:0] res;\n"
+                "        logic [%u:0] base;\n"
+                "        begin\n"
+                "            if (fx == %u'h0) begin\n"
+                "                gf2m_inv_fn_%u = %u'h0;\n"
+                "            end else begin\n"
+                "                res  = %u'h1;\n"
+                "                base = fx;\n",
+                (unsigned)(deg - 1U), (unsigned)tag, (unsigned)(deg - 1U), (unsigned)(deg - 1U),
+                (unsigned)(deg - 1U), (unsigned)deg, (unsigned)tag, (unsigned)deg, (unsigned)deg);
+        for (uint16_t b = 0U; b < deg; ++b) {
+            if (((exp >> b) & UINT64_C(1)) != UINT64_C(0)) {
+                fprintf(fp, "                res  = gf2m_mul_fn_%u(res, base);\n", (unsigned)tag);
+            }
+            if (b + 1U < deg) {
+                fprintf(fp, "                base = gf2m_mul_fn_%u(base, base);\n", (unsigned)tag);
+            }
+        }
+        fprintf(fp,
+                "                gf2m_inv_fn_%u = res;\n"
+                "            end\n"
+                "        end\n"
+                "    endfunction\n",
+                (unsigned)tag);
+    }
+}
+
+static void emit_fir_sv(FILE *fp, const flow_ir_prog_t *p) {
+    fprintf(fp, "// SPDX-License-Identifier: MIT\n");
+    fprintf(fp, "// AUTO-GENERATED BY `tools/ele_bootstrap.c --fir-synth` FROM Unified `.fir` (`%s`)\n",
+            p->name);
+    fprintf(fp, "`default_nettype none\n");
+    fprintf(fp, "/* verilator lint_off DECLFILENAME */\n\n");
+    fprintf(fp, "module %s (\n", p->name);
+
+    uint32_t total_ports = p->num_inputs + p->num_outputs;
+    uint32_t port_idx    = 0U;
+    for (uint32_t i = 0U; i < p->num_inputs; ++i) {
+        uint32_t vid = p->inputs[i];
+        uint16_t w   = p->vals[vid].width;
+        ++port_idx;
+        fprintf(fp, "    input  logic [%u:0] %s%s\n", (unsigned)(w - 1U), p->vals[vid].name,
+                (port_idx < total_ports) ? "," : "");
+    }
+    for (uint32_t i = 0U; i < p->num_outputs; ++i) {
+        uint32_t vid = p->outputs[i];
+        uint16_t w   = p->vals[vid].width;
+        ++port_idx;
+        fprintf(fp, "    output logic [%u:0] %s%s\n", (unsigned)(w - 1U), p->vals[vid].name,
+                (port_idx < total_ports) ? "," : "");
+    }
+    fprintf(fp, ");\n");
+
+    for (uint32_t i = 0U; i < p->num_vals; ++i) {
+        fprintf(fp, "    logic [%u:0] w_%u;\n", (unsigned)(p->vals[i].width - 1U), (unsigned)i);
+    }
+    for (uint32_t i = 0U; i < p->num_inputs; ++i) {
+        uint32_t vid = p->inputs[i];
+        fprintf(fp, "    assign w_%u = %s;\n", (unsigned)vid, p->vals[vid].name);
+    }
+
+    for (uint32_t i = 0U; i < p->num_ops; ++i) {
+        const flow_ir_op_t *op = &p->ops[i];
+        uint16_t k = op->kind;
+        if (k == FLOW_IR_OP_GF2M_MUL || k == FLOW_IR_OP_GF2M_INV) {
+            emit_sv_gf2m_funcs(fp, i, (uint16_t)op->p0, op->p1, (k == FLOW_IR_OP_GF2M_INV));
+        }
+    }
+
+    for (uint32_t i = 0U; i < p->num_ops; ++i) {
+        const flow_ir_op_t *op = &p->ops[i];
+        uint32_t oid           = op->out_val;
+        uint16_t ow            = p->vals[oid].width;
+        uint16_t k             = op->kind;
+
+        if (k == FLOW_IR_OP_CONST_U64) {
+            uint64_t mv = op->p0 & flow_ir_mask_u64(ow);
+            fprintf(fp, "    assign w_%u = %u'h%" PRIx64 ";\n", (unsigned)oid, (unsigned)ow, mv);
+        } else if (k == FLOW_IR_OP_SLICE) {
+            uint32_t iv = op->ins[0];
+            uint16_t iw = p->vals[iv].width;
+            uint16_t lo = (uint16_t)op->p0;
+            if (lo + ow <= iw) {
+                fprintf(fp, "    assign w_%u = w_%u[%u:%u];\n", (unsigned)oid, (unsigned)iv,
+                        (unsigned)(lo + ow - 1U), (unsigned)lo);
+            } else {
+                fprintf(fp, "    assign w_%u = ", (unsigned)oid);
+                emit_sv_resized_rhs(fp, iv, iw, ow);
+                fprintf(fp, ";\n");
+            }
+        } else if (k == FLOW_IR_OP_CONCAT) {
+            fprintf(fp, "    assign w_%u = {", (unsigned)oid);
+            for (int32_t j = (int32_t)op->num_ins - 1; j >= 0; --j) {
+                fprintf(fp, "w_%u%s", (unsigned)op->ins[j], (j > 0) ? ", " : "");
+            }
+            fprintf(fp, "};\n");
+        } else if (k == FLOW_IR_OP_XOR_VEC || k == FLOW_IR_OP_AND_VEC || k == FLOW_IR_OP_ADD ||
+                   k == FLOW_IR_OP_SUB) {
+            const char *sym = (k == FLOW_IR_OP_XOR_VEC) ? "^"
+                              : (k == FLOW_IR_OP_AND_VEC) ? "&"
+                              : (k == FLOW_IR_OP_ADD)     ? "+"
+                                                          : "-";
+            uint32_t a = op->ins[0], b = op->ins[1];
+            fprintf(fp, "    assign w_%u = ", (unsigned)oid);
+            emit_sv_resized_rhs(fp, a, p->vals[a].width, ow);
+            fprintf(fp, " %s ", sym);
+            emit_sv_resized_rhs(fp, b, p->vals[b].width, ow);
+            fprintf(fp, ";\n");
+        } else if (k == FLOW_IR_OP_NOT_VEC) {
+            uint32_t a = op->ins[0];
+            fprintf(fp, "    assign w_%u = ~(", (unsigned)oid);
+            emit_sv_resized_rhs(fp, a, p->vals[a].width, ow);
+            fprintf(fp, ");\n");
+        } else if (k == FLOW_IR_OP_OR_REDUCE) {
+            fprintf(fp, "    assign w_%u = |w_%u;\n", (unsigned)oid, (unsigned)op->ins[0]);
+        } else if (k == FLOW_IR_OP_MUL_FXP || k == FLOW_IR_OP_SQR_FXP) {
+            uint32_t a  = op->ins[0];
+            uint32_t b  = (k == FLOW_IR_OP_SQR_FXP) ? op->ins[0] : op->ins[1];
+            uint16_t wa = p->vals[a].width;
+            uint16_t wb = p->vals[b].width;
+            uint16_t sh = (uint16_t)((k == FLOW_IR_OP_SQR_FXP)
+                                         ? ((2ULL * op->p0 > op->p2) ? (2ULL * op->p0 - op->p2) : 0ULL)
+                                         : ((op->p0 + op->p1 > op->p2) ? (op->p0 + op->p1 - op->p2) : 0ULL));
+            uint16_t fw = (uint16_t)((wa + wb > sh + ow) ? (wa + wb) : (sh + ow));
+            fprintf(fp, "    wire [%u:0] mul_a_%u = ", (unsigned)(fw - 1U), (unsigned)i);
+            emit_sv_resized_rhs(fp, a, wa, fw);
+            fprintf(fp, ";\n");
+            fprintf(fp, "    wire [%u:0] mul_b_%u = ", (unsigned)(fw - 1U), (unsigned)i);
+            emit_sv_resized_rhs(fp, b, wb, fw);
+            fprintf(fp, ";\n");
+            fprintf(fp, "    wire [%u:0] mul_p_%u = mul_a_%u * mul_b_%u;\n",
+                    (unsigned)(fw - 1U), (unsigned)i, (unsigned)i, (unsigned)i);
+            fprintf(fp, "    assign w_%u = mul_p_%u[%u:%u];\n", (unsigned)oid, (unsigned)i,
+                    (unsigned)(sh + ow - 1U), (unsigned)sh);
+        } else if (k == FLOW_IR_OP_GF2M_MUL) {
+            uint16_t deg = (uint16_t)op->p0;
+            fprintf(fp, "    assign w_%u = gf2m_mul_fn_%u(w_%u[%u:0], w_%u[%u:0]);\n",
+                    (unsigned)oid, (unsigned)i, (unsigned)op->ins[0], (unsigned)(deg - 1U),
+                    (unsigned)op->ins[1], (unsigned)(deg - 1U));
+        } else if (k == FLOW_IR_OP_GF2M_INV) {
+            uint16_t deg = (uint16_t)op->p0;
+            fprintf(fp, "    assign w_%u = gf2m_inv_fn_%u(w_%u[%u:0]);\n",
+                    (unsigned)oid, (unsigned)i, (unsigned)op->ins[0], (unsigned)(deg - 1U));
+        } else if (k == FLOW_IR_OP_CTRL_SEL) {
+            uint32_t sb = op->ins[0], vf = op->ins[1], vt = op->ins[2];
+            fprintf(fp, "    assign w_%u = w_%u[0] ? ", (unsigned)oid, (unsigned)sb);
+            emit_sv_resized_rhs(fp, vt, p->vals[vt].width, ow);
+            fprintf(fp, " : ");
+            emit_sv_resized_rhs(fp, vf, p->vals[vf].width, ow);
+            fprintf(fp, ";\n");
+        } else if (k == FLOW_IR_OP_SHL_VAR || k == FLOW_IR_OP_SHR_VAR) {
+            const char *op_s = (k == FLOW_IR_OP_SHL_VAR) ? "<<" : ">>";
+            uint32_t a = op->ins[0], shv = op->ins[1];
+            fprintf(fp, "    assign w_%u = ", (unsigned)oid);
+            emit_sv_resized_rhs(fp, a, p->vals[a].width, ow);
+            fprintf(fp, " %s w_%u;\n", op_s, (unsigned)shv);
+        } else if (k == FLOW_IR_OP_EQ_ZERO) {
+            uint32_t a = op->ins[0];
+            fprintf(fp, "    assign w_%u = (w_%u == %u'h0) ? 1'b1 : 1'b0;\n",
+                    (unsigned)oid, (unsigned)a, (unsigned)p->vals[a].width);
+        } else if (k == FLOW_IR_OP_LUT_ROM) {
+            uint32_t a = op->ins[0];
+            fprintf(fp, "    always_comb begin\n        case (w_%u)\n", (unsigned)a);
+            for (uint32_t l = 0U; l < op->lut_len; ++l) {
+                uint64_t lv = p->lut_pool[op->lut_off + l] & flow_ir_mask_u64(ow);
+                fprintf(fp, "            %u'h%x: w_%u = %u'h%" PRIx64 ";\n",
+                        (unsigned)p->vals[a].width, (unsigned)l, (unsigned)oid, (unsigned)ow, lv);
+            }
+            fprintf(fp, "            default: w_%u = %u'h0;\n        endcase\n    end\n",
+                    (unsigned)oid, (unsigned)ow);
+        }
+    }
+
+    for (uint32_t i = 0U; i < p->num_outputs; ++i) {
+        uint32_t vid = p->outputs[i];
+        fprintf(fp, "    assign %s = w_%u;\n", p->vals[vid].name, (unsigned)vid);
+    }
+    fprintf(fp, "endmodule\n");
+    fprintf(fp, "/* verilator lint_on DECLFILENAME */\n");
+    fprintf(fp, "`default_nettype wire\n");
+}
+
+static int run_fir_synth_cmd(const char *fir_path, const char *sv_path,
+                             const char *pdk_path, const char *gds_path,
+                             bool verify_fir) {
+    if (!flow_ir_load_file(&g_ele_fir_prog, fir_path, g_ele_fir_raw, sizeof(g_ele_fir_raw))) {
+        fprintf(stderr, "FATAL: failed to load .fir morphism %s\n", fir_path);
+        return 1;
+    }
+    if (g_ele_fir_prog.mult != FLOW_IR_MULT_LINEAR) {
+        fprintf(stderr, "FATAL: --fir-synth expects .linear morphism (got mult=%u)\n",
+                (unsigned)g_ele_fir_prog.mult);
+        return 1;
+    }
+
+    FILE *fp = fopen(sv_path, "w");
+    if (!fp) {
+        perror("fopen");
+        return 1;
+    }
+    emit_fir_sv(fp, &g_ele_fir_prog);
+    fclose(fp);
+
+    if (verify_fir && g_ele_fir_prog.num_inputs <= FLOW_IR_MAX_IO &&
+        g_ele_fir_prog.num_outputs <= FLOW_IR_MAX_IO) {
+        uint64_t in_v[FLOW_IR_MAX_IO];
+        uint64_t out_v[FLOW_IR_MAX_IO];
+        uint64_t chk = 0ULL;
+        for (uint32_t v = 0U; v < 256U; ++v) {
+            for (uint32_t k = 0U; k < g_ele_fir_prog.num_inputs; ++k) {
+                uint64_t x = (uint64_t)((v + k * 37U) ^ (v >> 1U));
+                in_v[k]    = x & flow_ir_mask_u64(g_ele_fir_prog.vals[g_ele_fir_prog.inputs[k]].width);
+            }
+            if (!flow_ir_eval_u64(&g_ele_fir_prog, in_v, out_v)) {
+                fprintf(stderr, "FATAL: flow_ir_eval_u64 failed on %s\n", fir_path);
+                return 1;
+            }
+            chk = (chk * UINT64_C(1315423911)) ^ out_v[0];
+        }
+        printf("  [FLOW-FIR-EVAL] mod=%s | 256-vec GPR eval PASS (fnv=0x%016" PRIX64 ")\n",
+               g_ele_fir_prog.name, chk);
+    }
+
+    if (pdk_path != NULL && gds_path != NULL) {
+        ele_fab_pdk_t pdk;
+        int rc = ele_fab_load_pdk(pdk_path, &pdk);
+        if (rc != ELE_FAB_OK) {
+            fprintf(stderr, "FATAL: --fir-synth failed to load PDK %s (rc=%d)\n", pdk_path, rc);
+            return 1;
+        }
+        ele_fab_compile_fir_die(&g_ele_fab_ws, &pdk, &g_ele_fir_prog);
+        ele_fab_apply_opc_2jet(&g_ele_fab_ws);
+        rc = ele_fab_write_gds(&g_ele_fab_ws, gds_path);
+        if (rc != ELE_FAB_OK) {
+            fprintf(stderr, "FATAL: --fir-synth write_gds failed (rc=%d)\n", rc);
+            return 1;
+        }
+        rc = ele_fab_verify_gds_bytes(&g_ele_fab_ws, g_ele_fab_ws.gds_buf, g_ele_fab_ws.gds_len);
+        if (rc != ELE_FAB_OK) {
+            fprintf(stderr, "FATAL: --fir-synth DRC/LVS failed on %s (rc=%d)\n", gds_path, rc);
+            return 1;
+        }
+        printf("  [FLOW-FIR-FAB] mod=%s pdk=%-14s | wire=%3dum ir=%2dmV OPC=%2d->%2dnm | gds=%s (%uB, DRC=0, LVS=0)\n",
+               g_ele_fir_prog.name, pdk.name, g_ele_fab_ws.total_wire_um,
+               g_ele_fab_ws.max_ir_drop_mv, g_ele_fab_ws.epe_naive_max_nm,
+               g_ele_fab_ws.epe_opc_max_nm, gds_path, g_ele_fab_ws.gds_len);
+    }
+    return 0;
+}
+
+static int run_single_fab_proj(const char *pdk_path, const char *gds_path) {
+    ele_fab_pdk_t pdk;
+    int rc = ele_fab_load_pdk(pdk_path, &pdk);
+    if (rc != ELE_FAB_OK) {
+        fprintf(stderr, "FATAL: failed to load PDK .flow atlas %s (rc=%d)\n", pdk_path, rc);
+        return 1;
+    }
+    ele_fab_compile_die(&g_ele_fab_ws, &pdk, true);
+    ele_fab_apply_opc_2jet(&g_ele_fab_ws);
+    rc = ele_fab_write_gds(&g_ele_fab_ws, gds_path);
+    if (rc != ELE_FAB_OK) {
+        fprintf(stderr, "FATAL: failed to write GDSII stream %s (rc=%d)\n", gds_path, rc);
+        return 1;
+    }
+    rc = ele_fab_verify_gds_bytes(&g_ele_fab_ws, g_ele_fab_ws.gds_buf, g_ele_fab_ws.gds_len);
+    if (rc != ELE_FAB_OK) {
+        fprintf(stderr, "FATAL: DRC/LVS/GDSII sign-off failed on %s (rc=%d)\n", gds_path, rc);
+        return 1;
+    }
+    printf("  [FLOW-FAB] pdk=%-16s | pitch=%4dnm g=%2dnm | reps=%d crit=%4dps wire=%3dum "
+           "ir=%2dmV | opc_epe=%2d->%2dnm (%d serifs) | gds=%s (%uB, polys=%d, fnv=0x%016" PRIX64 ")\n",
+           pdk.name, pdk.pitch_nm, pdk.grid_nm,
+           g_ele_fab_ws.repeaters_inserted, g_ele_fab_ws.crit_delay_ps,
+           g_ele_fab_ws.total_wire_um, g_ele_fab_ws.max_ir_drop_mv,
+           g_ele_fab_ws.epe_naive_max_nm, g_ele_fab_ws.epe_opc_max_nm,
+           g_ele_fab_ws.opc_polys_added, gds_path,
+           g_ele_fab_ws.gds_len, g_ele_fab_ws.parsed_count, g_ele_fab_ws.gds_fnv1a);
+    return 0;
+}
+
+static int run_fab_verify(const char *build_dir) {
+    static const char *k_pdk_names[3] = {"sky130", "euv7", "sic800v"};
+    uint64_t gds_hashes[3] = {0ULL, 0ULL, 0ULL};
+    int32_t  reps[3]       = {0, 0, 0};
+
+    for (int p = 0; p < 3; ++p) {
+        char pdk_path[512];
+        char gds_path[512];
+        snprintf(pdk_path, sizeof(pdk_path), "%s/pdk_%s.flow", build_dir, k_pdk_names[p]);
+        snprintf(gds_path, sizeof(gds_path), "%s/ele_power_%s.gds", build_dir, k_pdk_names[p]);
+
+        ele_fab_pdk_t pdk;
+        int rc = ele_fab_load_pdk(pdk_path, &pdk);
+        if (rc != ELE_FAB_OK) {
+            fprintf(stderr, "FATAL: --fab-verify failed loading %s (rc=%d)\n", pdk_path, rc);
+            return 1;
+        }
+
+        /* 1. Unified HoTT SEARU x FLOW 2-Jet co-evolution + 2-Jet OPC + GDSII write */
+        ele_fab_compile_die(&g_ele_fab_ws, &pdk, true);
+        ele_fab_apply_opc_2jet(&g_ele_fab_ws);
+        rc = ele_fab_write_gds(&g_ele_fab_ws, gds_path);
+        if (rc != ELE_FAB_OK) {
+            fprintf(stderr, "FATAL: --fab-verify write_gds failed for %s (rc=%d)\n", gds_path, rc);
+            return 1;
+        }
+
+        uint32_t ref_len    = g_ele_fab_ws.gds_len;
+        uint64_t ref_hash   = g_ele_fab_ws.gds_fnv1a;
+        int32_t  unif_reps  = g_ele_fab_ws.repeaters_inserted;
+        int32_t  unif_delay = g_ele_fab_ws.crit_delay_ps;
+        int32_t  unif_wire  = g_ele_fab_ws.total_wire_um;
+        int32_t  unif_ir    = g_ele_fab_ws.max_ir_drop_mv;
+        int64_t  unif_E     = g_ele_fab_ws.total_energy;
+        int32_t  epe_naive  = g_ele_fab_ws.epe_naive_max_nm;
+        int32_t  epe_opc    = g_ele_fab_ws.epe_opc_max_nm;
+        int32_t  n_serifs   = g_ele_fab_ws.opc_polys_added;
+        if (ref_len == 0U || ref_len > ELE_FAB_MAX_GDS_BYTES) {
+            fprintf(stderr, "FATAL: invalid GDS byte count %u\n", ref_len);
+            return 1;
+        }
+        memcpy(g_ele_fab_ref_buf, g_ele_fab_ws.gds_buf, ref_len);
+
+        /* 2. Raw disk readback + independent binary GDSII/DRC/LVS/OPC verification */
+        FILE *fp = fopen(gds_path, "rb");
+        if (!fp) {
+            fprintf(stderr, "FATAL: cannot reopen written GDS %s\n", gds_path);
+            return 1;
+        }
+        size_t rd = fread(g_ele_fab_disk_buf, 1U, sizeof(g_ele_fab_disk_buf), fp);
+        fclose(fp);
+        if (rd != (size_t)ref_len) {
+            fprintf(stderr, "FATAL: disk GDS size mismatch on %s\n", gds_path);
+            return 1;
+        }
+        rc = ele_fab_verify_gds_bytes(&g_ele_fab_ws, g_ele_fab_disk_buf, (uint32_t)rd);
+        if (rc != ELE_FAB_OK) {
+            fprintf(stderr, "FATAL: physical DRC/LVS/GDSII sign-off failed on %s (rc=%d)\n", gds_path, rc);
+            return 1;
+        }
+        int32_t unif_polys = g_ele_fab_ws.parsed_count;
+
+        /* 3. Bit-Exact Determinism Gate: re-compile from scratch and verify memcmp == 0 */
+        ele_fab_compile_die(&g_ele_fab_ws, &pdk, true);
+        ele_fab_apply_opc_2jet(&g_ele_fab_ws);
+        ele_fab_write_gds(&g_ele_fab_ws, NULL);
+        if (g_ele_fab_ws.gds_len != ref_len ||
+            g_ele_fab_ws.gds_fnv1a != ref_hash ||
+            memcmp(g_ele_fab_ws.gds_buf, g_ele_fab_ref_buf, ref_len) != 0) {
+            fprintf(stderr, "FATAL: Bit-exact GDSII determinism violated on %s!\n", k_pdk_names[p]);
+            return 1;
+        }
+
+        /* 4. Front-End / Back-End Unification Ablation on interconnect-dominated 7nm EUV */
+        if (p == 1) { /* euv7 */
+            ele_fab_compile_die(&g_ele_fab_ws, &pdk, false);
+            int32_t split_delay = g_ele_fab_ws.crit_delay_ps;
+            int64_t split_E     = g_ele_fab_ws.total_energy;
+            if (unif_reps <= 0 || unif_delay >= split_delay || unif_E >= split_E) {
+                fprintf(stderr,
+                        "FATAL: Univalent 7nm EUV ablation failed (reps=%d, delay %d vs split %d, E %" PRId64 " vs %" PRId64 ")\n",
+                        unif_reps, unif_delay, split_delay, unif_E, split_E);
+                return 1;
+            }
+            printf("  [UNIVALENCE-EUV7] Split(no-rep): crit=%dps E=%" PRId64
+                   " -> Unified(rep=%d): crit=%dps E=%" PRId64 " (DELAY & CLOSURE IMPROVED)\n",
+                   split_delay, split_E, unif_reps, unif_delay, unif_E);
+        }
+
+        if (epe_naive <= 0 || epe_opc >= epe_naive || n_serifs <= 0) {
+            fprintf(stderr, "FATAL: 2-Jet OPC EPE contraction failed on %s (%d -> %d nm, serifs=%d)\n",
+                    k_pdk_names[p], epe_naive, epe_opc, n_serifs);
+            return 1;
+        }
+
+        gds_hashes[p] = ref_hash;
+        reps[p]       = unif_reps;
+        printf("  [FAB-SIGNOFF %-7s] bits=0x%016" PRIX64 " (%uB, %d polys) | reps=%d crit=%4dps "
+               "wire=%3dum ir=%2dmV | OPC=%2d->%2dnm (%d serifs) | DRC=0 LVS=0-open/0-short\n",
+               k_pdk_names[p], ref_hash, ref_len, unif_polys,
+               unif_reps, unif_delay, unif_wire, unif_ir,
+               epe_naive, epe_opc, n_serifs);
+    }
+
+    if (gds_hashes[0] == gds_hashes[1] || gds_hashes[1] == gds_hashes[2] ||
+        gds_hashes[0] == gds_hashes[2] || reps[0] == reps[1]) {
+        fprintf(stderr, "FATAL: Multi-PDK polymorphism check failed (identical GDS or repeaters)!\n");
+        return 1;
+    }
+    return 0;
+}
+
 static void usage(const char *prog) {
-    fprintf(stderr, "Usage: %s [--dsp-count <1..6>] [--max-depth <18..64>] -o <out.sv>\n", prog);
+    fprintf(stderr,
+            "Usage: %s [--dsp-count <1..6>] [--max-depth <18..64>] --fir <core.fir> -o <out.sv> [--pdk <pdk.flow> --gds-out <out.gds>]\n"
+            "       %s --fir-synth <in.fir> -o <out.sv> [--pdk <pdk.flow> --gds-out <out.gds>] [--verify-fir]\n"
+            "       %s --fab-verify <build_dir>\n",
+            prog, prog, prog);
 }
 
 int main(int argc, char **argv) {
-    int         dsp_count = 3;
-    int         max_depth = 36;
-    const char *out_path  = NULL;
+    int         dsp_count    = 3;
+    int         max_depth    = 36;
+    const char *out_path     = NULL;
+    const char *pdk_path     = NULL;
+    const char *gds_out_path = NULL;
+    const char *fab_verify_d = NULL;
+    const char *fir_path     = NULL;
+    const char *fir_synth_p  = NULL;
+    bool        verify_fir   = false;
 
     for (int i = 1; i < argc; ++i) {
         if (strcmp(argv[i], "--dsp-count") == 0 && i + 1 < argc) {
@@ -2996,22 +3422,50 @@ int main(int argc, char **argv) {
             max_depth = atoi(argv[++i]);
         } else if (strcmp(argv[i], "-o") == 0 && i + 1 < argc) {
             out_path = argv[++i];
+        } else if (strcmp(argv[i], "--pdk") == 0 && i + 1 < argc) {
+            pdk_path = argv[++i];
+        } else if (strcmp(argv[i], "--gds-out") == 0 && i + 1 < argc) {
+            gds_out_path = argv[++i];
+        } else if (strcmp(argv[i], "--fab-verify") == 0 && i + 1 < argc) {
+            fab_verify_d = argv[++i];
+        } else if (strcmp(argv[i], "--fir") == 0 && i + 1 < argc) {
+            fir_path = argv[++i];
+        } else if (strcmp(argv[i], "--fir-synth") == 0 && i + 1 < argc) {
+            fir_synth_p = argv[++i];
+        } else if (strcmp(argv[i], "--verify-fir") == 0) {
+            verify_fir = true;
         } else {
             usage(argv[0]);
             return 1;
         }
     }
 
-    if (out_path == NULL || dsp_count < 1 || dsp_count > 6 || max_depth < 18 || max_depth > 64) {
+    if (fab_verify_d != NULL) {
+        return run_fab_verify(fab_verify_d);
+    }
+
+    if (fir_synth_p != NULL) {
+        if (out_path == NULL) {
+            usage(argv[0]);
+            return 1;
+        }
+        return run_fir_synth_cmd(fir_synth_p, out_path, pdk_path, gds_out_path, verify_fir);
+    }
+
+    if (out_path == NULL || fir_path == NULL || dsp_count < 1 || dsp_count > 6 || max_depth < 18 || max_depth > 64) {
         usage(argv[0]);
         return 1;
     }
 
-    /* Pass 1: Declarative SSA Operator IR + FLOW v7.0.1 2-Jet Retiming + SEARU DSP Binding */
+    /* Pass 1: Unified Lean SSOT `.fir` + FLOW 2-Jet Retiming + SEARU DSP Binding */
     uint32_t   rad_epochs = 0;
     int        k_rad      = solve_radix_unroll_2jet(max_depth, &rad_epochs);
     dag_cone_t cones[NUM_CONES];
-    build_cones_from_ssa_ir(cones);
+    if (!flow_ir_load_file(&g_ele_fir_prog, fir_path, g_ele_fir_raw, sizeof(g_ele_fir_raw))) {
+        fprintf(stderr, "FATAL: failed loading unified core IR %s\n", fir_path);
+        return 1;
+    }
+    build_cones_from_fir(cones, &g_ele_fir_prog);
     for (int c = 0; c < NUM_CONES; ++c) {
         solve_cone_with_flow_2jet(&cones[c], dsp_count, max_depth);
     }
@@ -3060,5 +3514,11 @@ int main(int argc, char **argv) {
            hls_stats.p1_iters, hls_stats.p2_iters,
            hls_stats.p1_epiphanies, hls_stats.p2_epiphanies,
            quad_cycles);
+
+    if (pdk_path != NULL && gds_out_path != NULL) {
+        if (run_single_fab_proj(pdk_path, gds_out_path) != 0) {
+            return 1;
+        }
+    }
     return 0;
 }

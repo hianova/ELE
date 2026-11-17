@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
 // ele_em_phy.sv — Synthesizable Electromagnetic & Charge-Minimal PHY Primitives
-//                 + 42-Pin QFN-48 Charge-Minimal ASIC Top (`ele_flow_qfn_top`) — ELE v7.0.1
+//                 + 42-Pin QFN-48 Charge-Minimal ASIC Top (`ele_flow_qfn_top`) — ELE v7.1.0
 //
 // Pure IEEE 1800 SystemVerilog leaf hardware primitives & ASIC padframe wrapper
 // with idle-cycle operand isolation on CSA popcount trees & magnitude negators:

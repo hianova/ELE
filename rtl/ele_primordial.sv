@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-// ele_primordial.sv — Primordial Physical Silicon Seed Atoms for ELE v7.0.1
+// ele_primordial.sv — Primordial Physical Silicon Seed Atoms for ELE v7.1.0
 //
 // Physically honest leaf silicon primitives targeted by the self-hosting
 // SEARU x FLOW 2-Jet lattice bootstrap synthesizer (`tools/ele_bootstrap.c`):

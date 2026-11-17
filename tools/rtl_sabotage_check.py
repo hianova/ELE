@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
 """
-rtl_sabotage_check.py — SystemVerilog Single-Fault RTL Mutation & Kill-Rate Gate for ELE v7.0.1
+rtl_sabotage_check.py — SystemVerilog Single-Fault RTL Mutation & Kill-Rate Gate for ELE v8.0.0
 ===============================================================================================
 Empirically proves functional & protocol completeness of ELE's pure-SV co-simulation wind-tunnel
-by injecting 64 stratified single-fault SystemVerilog hardware mutations across ALL THREE tiers:
+by injecting 76 stratified single-fault SystemVerilog hardware mutations across ALL FOUR tiers:
   - `rtl/ele_em_phy.sv` (8 padframe & 17-wire Bus-Invert PHY mutants across `ele_bus_invert17`
     and `ele_flow_qfn_top`),
+  - `rtl/ele_power_phy.sv` (12 switched-power, DPWM dead-time/shedding, 800V SiC SSCB &
+    44-pin `ele_power_qfn_top` reflex/BI5 mutants),
   - `rtl/ele_primordial.sv` (10 leaf-silicon mutants across `ele_mul33_atom`, `ele_rad2_step_atom`,
     and `ele_sram_1rw64`), and
   - `rtl/ele_flow_core.sv` (46 datapath, FSM, reset, Schmitt/KanLock, bound-cache coherence, and
@@ -502,6 +504,91 @@ def build_rtl_mutants() -> list[RtlMutant]:
             "assign swap_accepted_o = rst_n ? (atlas_swap_done_w ? atlas_swap_acc_w : swap_acc_lat_q) : 1'b0;",
             "assign swap_accepted_o = 1'b0;",
         ),
+        # --- Category 9: Switched-Power DPWM, 800V DC SiC SSCB & 44-Pin Power-QFN (`rtl/ele_power_phy.sv`, 12 mutants) ---
+        RtlMutant(
+            "DPWM_SHOOT_THROUGH_LO_STUCK",
+            "power_vpd_sscb_qfn",
+            "rtl/ele_power_phy.sv",
+            "                        hi_q[p] <= 1'b1;\n                        lo_q[p] <= 1'b0;",
+            "                        hi_q[p] <= 1'b1;\n                        lo_q[p] <= 1'b1;",
+        ),
+        RtlMutant(
+            "DPWM_DEADTIME_LO_TO_HI_BYPASS",
+            "power_vpd_sscb_qfn",
+            "rtl/ele_power_phy.sv",
+            "                    if (lo_q[p]) begin",
+            "                    if (1'b0) begin",
+        ),
+        RtlMutant(
+            "DPWM_FAULT_KILL_MASK_DROP",
+            "power_vpd_sscb_qfn",
+            "rtl/ele_power_phy.sv",
+            "assign pwm_hi_o     = (rst_n & en_i & (~fault_kill_i)) ? hi_q : {N_PHASES{1'b0}};",
+            "assign pwm_hi_o     = (rst_n & en_i) ? hi_q : {N_PHASES{1'b0}};",
+        ),
+        RtlMutant(
+            "DPWM_INTERLEAVE_PHASE_COLLAPSE",
+            "power_vpd_sscb_qfn",
+            "rtl/ele_power_phy.sv",
+            "ph_cnt_c[p*CNT_W +: CNT_W] = cnt_q + CNT_W'(p * QUAD_SHIFT);",
+            "ph_cnt_c[p*CNT_W +: CNT_W] = cnt_q;",
+        ),
+        RtlMutant(
+            "DPWM_SHED_PHASE_FAIL_ACTIVE",
+            "power_vpd_sscb_qfn",
+            "rtl/ele_power_phy.sv",
+            "if (!phase_en_c[p]) begin",
+            "if (1'b0) begin",
+        ),
+        RtlMutant(
+            "SSCB_HARD_OCP_DISABLE",
+            "power_vpd_sscb_qfn",
+            "rtl/ele_power_phy.sv",
+            "cause_hard_c = sample_active_c & (i_meas_i >= i_hard_max_i);",
+            "cause_hard_c = 1'b0;",
+        ),
+        RtlMutant(
+            "SSCB_JET2_CONCAVITY_IGNORE",
+            "power_vpd_sscb_qfn",
+            "rtl/ele_power_phy.sv",
+            "(j2_concave_sum_c >= 18'sd0);",
+            "1'b1;",
+        ),
+        RtlMutant(
+            "SSCB_JET2_PREDICTIVE_DISABLE",
+            "power_vpd_sscb_qfn",
+            "rtl/ele_power_phy.sv",
+            "cause_jet2_c = sample_active_c & jet2_hit_c & (persist_next_c >= conf_eff_c);",
+            "cause_jet2_c = 1'b0;",
+        ),
+        RtlMutant(
+            "SSCB_I2T_ACCUM_DISABLE",
+            "power_vpd_sscb_qfn",
+            "rtl/ele_power_phy.sv",
+            "i2t_next_c = i2t_sum_c[32] ? 32'hFFFF_FFFF : i2t_sum_c[31:0];",
+            "i2t_next_c = i2t_acc_q;",
+        ),
+        RtlMutant(
+            "SSCB_REARM_LIVE_CURRENT_LEAK",
+            "power_vpd_sscb_qfn",
+            "rtl/ele_power_phy.sv",
+            "rearm_ok_c   = clr_rearm_i & (i_meas_i == 16'd0);",
+            "rearm_ok_c   = clr_rearm_i;",
+        ),
+        RtlMutant(
+            "PWR_QFN_SSCB_REFLEX_SEVER",
+            "power_vpd_sscb_qfn",
+            "rtl/ele_power_phy.sv",
+            "assign dpwm_fault_kill_c = ext_fault_i | sscb_trip_comb_c;",
+            "assign dpwm_fault_kill_c = ext_fault_i;",
+        ),
+        RtlMutant(
+            "PWR_QFN_RX_BI5_DROP_INV",
+            "power_vpd_sscb_qfn",
+            "rtl/ele_power_phy.sv",
+            "assign rx_dec4 = rx_bi5_i[3:0] ^ {4{rx_bi5_i[4]}};",
+            "assign rx_dec4 = rx_bi5_i[3:0];",
+        ),
     ]
 
 
@@ -511,6 +598,7 @@ def run_verilator_sim(
     mdir: Path,
     phy_sv: Path,
     prim_sv: Path,
+    pwr_sv: Path,
     core_sv: Path,
     tb_sv: Path,
     flow_obj: Path,
@@ -548,6 +636,7 @@ def run_verilator_sim(
         [
             str(phy_sv),
             str(prim_sv),
+            str(pwr_sv),
             str(core_sv),
             str(tb_sv),
             str(flow_obj),
@@ -588,25 +677,30 @@ def eval_rtl_mutant(
 
         phy_text = sources["rtl/ele_em_phy.sv"]
         prim_text = sources["rtl/ele_primordial.sv"]
+        pwr_text = sources["rtl/ele_power_phy.sv"]
         core_text = sources["rtl/ele_flow_core.sv"]
         if m.rel_file == "rtl/ele_em_phy.sv":
             phy_text = phy_text.replace(m.target, m.replacement, 1)
         elif m.rel_file == "rtl/ele_primordial.sv":
             prim_text = prim_text.replace(m.target, m.replacement, 1)
+        elif m.rel_file == "rtl/ele_power_phy.sv":
+            pwr_text = pwr_text.replace(m.target, m.replacement, 1)
         else:
             core_text = core_text.replace(m.target, m.replacement, 1)
 
         phy_path = wdir / "ele_em_phy.sv"
         prim_path = wdir / "ele_primordial.sv"
+        pwr_path = wdir / "ele_power_phy.sv"
         core_path = wdir / "ele_flow_core.sv"
         phy_path.write_text(phy_text, encoding="utf-8")
         prim_path.write_text(prim_text, encoding="utf-8")
+        pwr_path.write_text(pwr_text, encoding="utf-8")
         core_path.write_text(core_text, encoding="utf-8")
 
         tb_sv = root / "rtl" / "ele_cosim_tb.sv"
 
         compiled_ok, killed, rc, detail = run_verilator_sim(
-            verilator, env, mdir, phy_path, prim_path, core_path, tb_sv, flow_obj, fast_mode=True
+            verilator, env, mdir, phy_path, prim_path, pwr_path, core_path, tb_sv, flow_obj, fast_mode=True
         )
         if not compiled_ok:
             return (m, False, False, rc, detail)
@@ -616,7 +710,7 @@ def eval_rtl_mutant(
             mdir_full = wdir / f"mdir_full_{m.name}"
             mdir_full.mkdir(parents=True, exist_ok=True)
             compiled_ok, killed, rc, detail = run_verilator_sim(
-                verilator, env, mdir_full, phy_path, prim_path, core_path, tb_sv, flow_obj, fast_mode=False
+                verilator, env, mdir_full, phy_path, prim_path, pwr_path, core_path, tb_sv, flow_obj, fast_mode=False
             )
 
         return (m, compiled_ok, killed, rc, detail)
@@ -628,6 +722,8 @@ def main() -> int:
     t0 = time.monotonic()
     root = Path(__file__).resolve().parent.parent
     env = os.environ.copy()
+    for mk in ("MAKEFLAGS", "MFLAGS", "MAKELEVEL"):
+        env.pop(mk, None)
     extra_paths = ["/opt/homebrew/opt/llvm/bin", "/opt/homebrew/bin", "/usr/local/bin"]
     env["PATH"] = ":".join(extra_paths + [env.get("PATH", "")])
     verilator = env.get("VERILATOR", "verilator")
@@ -652,6 +748,7 @@ def main() -> int:
     sources = {
         "rtl/ele_em_phy.sv": (root / "rtl" / "ele_em_phy.sv").read_text(encoding="utf-8"),
         "rtl/ele_primordial.sv": (root / "rtl" / "ele_primordial.sv").read_text(encoding="utf-8"),
+        "rtl/ele_power_phy.sv": (root / "rtl" / "ele_power_phy.sv").read_text(encoding="utf-8"),
         "rtl/ele_flow_core.sv": (root / "rtl" / "ele_flow_core.sv").read_text(encoding="utf-8"),
     }
 
@@ -673,16 +770,18 @@ def main() -> int:
             raise RuntimeError(f"Mutant {m.name} replacement is identical to target!")
 
     phy_cnt = sum(1 for m in mutants if m.rel_file == "rtl/ele_em_phy.sv")
+    pwr_cnt = sum(1 for m in mutants if m.rel_file == "rtl/ele_power_phy.sv")
     prim_cnt = sum(1 for m in mutants if m.rel_file == "rtl/ele_primordial.sv")
     core_cnt = sum(1 for m in mutants if m.rel_file == "rtl/ele_flow_core.sv")
 
     print("================================================================================")
-    print("  ELE v7.0.1 — Adversarial SystemVerilog Single-Fault RTL Sabotage Audit")
+    print("  ELE v8.0.0 — Adversarial SystemVerilog Single-Fault RTL Sabotage Audit")
     print("================================================================================")
     print("  golden_profiles_status : PASS (Canonical dsp=3 & Area dsp=1 both exit 0)")
     print(
         f"  adversarial_rtl_mutants: {len(mutants)} single-fault SV mutants "
-        f"({phy_cnt} phy/qfn + {prim_cnt} primordial + {core_cnt} core/top)"
+        f"({phy_cnt} phy/qfn + {pwr_cnt} power/sscb + {prim_cnt} primordial + {core_cnt} core/top)",
+        flush=True,
     )
 
     tmpdir = Path(tempfile.mkdtemp(prefix="ele_rtl_sabotage_"))
@@ -703,13 +802,17 @@ def main() -> int:
                 )
                 for m in mutants
             ]
+            done = 0
             for fut in concurrent.futures.as_completed(futs):
                 m, compiled_ok, killed, _, detail = fut.result()
+                done += 1
                 by_cat.setdefault(m.category, []).append(compiled_ok and killed)
                 if not compiled_ok:
                     compile_errors.append((m, detail))
                 elif not killed:
                     survivors.append(m)
+                if done % 16 == 0 or done == len(mutants):
+                    print(f"  [progress] {done}/{len(mutants)} RTL mutants audited...", flush=True)
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
 
