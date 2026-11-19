@@ -59,29 +59,55 @@ extern "C" {
 #define ELE_LAYER_PAD           60
 #define ELE_LAYER_OPC_SERIF     70 /* dt 1 = 2-Jet OPC hammerhead/serif */
 
-/* Independent Sign-Off Error Codes */
-enum {
-    ELE_FAB_OK                     = 0,
-    ELE_FAB_ERR_PDK_IO             = 1,
-    ELE_FAB_ERR_PDK_FORMAT         = 2,
-    ELE_FAB_ERR_GDS_HEADER         = 10,
-    ELE_FAB_ERR_GDS_UNITS          = 11,
-    ELE_FAB_ERR_GDS_BOUNDARY       = 12,
-    ELE_FAB_ERR_GDS_TAIL           = 13,
-    ELE_FAB_ERR_DRC_GRID           = 20,
-    ELE_FAB_ERR_DRC_WIDTH          = 21,
-    ELE_FAB_ERR_DRC_CELL_OVERLAP   = 22,
-    ELE_FAB_ERR_DRC_RAIL_SHORT     = 23,
-    ELE_FAB_ERR_DRC_VIA_ENCLOSURE  = 24,
-    ELE_FAB_ERR_DRC_SPACE          = 25,
-    ELE_FAB_ERR_DRC_HV_SPACE       = 26,
-    ELE_FAB_ERR_DRC_OPC_MRC        = 27,
-    ELE_FAB_ERR_LVS_PIN_MISS       = 30,
-    ELE_FAB_ERR_LVS_OPEN           = 31,
-    ELE_FAB_ERR_LVS_SHORT          = 32,
-    ELE_FAB_ERR_LVS_PAD_COUNT      = 33,
-    ELE_FAB_ERR_LITHO_PULLBACK     = 40
-};
+/* Physical Sign-Off HoTT Fallback Fibers (Retraction Manifolds) */
+typedef enum {
+    ELE_FIBER_SIGNOFF_CLEAN = 0,
+    ELE_FIBER_FALLBACK_PDK_IO = 1,
+    ELE_FIBER_FALLBACK_PDK_FORMAT = 2,
+    ELE_FIBER_FALLBACK_GDS_HEADER = 10,
+    ELE_FIBER_FALLBACK_GDS_UNITS = 11,
+    ELE_FIBER_FALLBACK_GDS_BOUNDARY = 12,
+    ELE_FIBER_FALLBACK_GDS_TAIL = 13,
+    ELE_FIBER_HOLD_DRC_GRID = 20,
+    ELE_FIBER_HOLD_DRC_WIDTH = 21,
+    ELE_FIBER_HOLD_DRC_CELL_OVERLAP = 22,
+    ELE_FIBER_HOLD_DRC_RAIL_SHORT = 23,
+    ELE_FIBER_HOLD_DRC_VIA_ENCLOSURE = 24,
+    ELE_FIBER_HOLD_DRC_SPACE = 25,
+    ELE_FIBER_HOLD_DRC_HV_SPACE = 26,
+    ELE_FIBER_HOLD_DRC_OPC_MRC = 27,
+    ELE_FIBER_HOLD_LVS_PIN_MISS = 30,
+    ELE_FIBER_HOLD_LVS_OPEN = 31,
+    ELE_FIBER_HOLD_LVS_SHORT = 32,
+    ELE_FIBER_HOLD_LVS_PAD_COUNT = 33,
+    ELE_FIBER_HOLD_LITHO_PULLBACK = 40
+} ele_fab_fiber_t;
+
+static inline const char *ele_fab_fiber_name(ele_fab_fiber_t f) {
+    switch (f) {
+    case ELE_FIBER_SIGNOFF_CLEAN:          return "ELE_FIBER_SIGNOFF_CLEAN";
+    case ELE_FIBER_FALLBACK_PDK_IO:        return "ELE_FIBER_FALLBACK_PDK_IO";
+    case ELE_FIBER_FALLBACK_PDK_FORMAT:    return "ELE_FIBER_FALLBACK_PDK_FORMAT";
+    case ELE_FIBER_FALLBACK_GDS_HEADER:    return "ELE_FIBER_FALLBACK_GDS_HEADER";
+    case ELE_FIBER_FALLBACK_GDS_UNITS:     return "ELE_FIBER_FALLBACK_GDS_UNITS";
+    case ELE_FIBER_FALLBACK_GDS_BOUNDARY:  return "ELE_FIBER_FALLBACK_GDS_BOUNDARY";
+    case ELE_FIBER_FALLBACK_GDS_TAIL:      return "ELE_FIBER_FALLBACK_GDS_TAIL";
+    case ELE_FIBER_HOLD_DRC_GRID:          return "ELE_FIBER_HOLD_DRC_GRID";
+    case ELE_FIBER_HOLD_DRC_WIDTH:         return "ELE_FIBER_HOLD_DRC_WIDTH";
+    case ELE_FIBER_HOLD_DRC_CELL_OVERLAP:  return "ELE_FIBER_HOLD_DRC_CELL_OVERLAP";
+    case ELE_FIBER_HOLD_DRC_RAIL_SHORT:    return "ELE_FIBER_HOLD_DRC_RAIL_SHORT";
+    case ELE_FIBER_HOLD_DRC_VIA_ENCLOSURE: return "ELE_FIBER_HOLD_DRC_VIA_ENCLOSURE";
+    case ELE_FIBER_HOLD_DRC_SPACE:         return "ELE_FIBER_HOLD_DRC_SPACE";
+    case ELE_FIBER_HOLD_DRC_HV_SPACE:      return "ELE_FIBER_HOLD_DRC_HV_SPACE";
+    case ELE_FIBER_HOLD_DRC_OPC_MRC:       return "ELE_FIBER_HOLD_DRC_OPC_MRC";
+    case ELE_FIBER_HOLD_LVS_PIN_MISS:      return "ELE_FIBER_HOLD_LVS_PIN_MISS";
+    case ELE_FIBER_HOLD_LVS_OPEN:          return "ELE_FIBER_HOLD_LVS_OPEN";
+    case ELE_FIBER_HOLD_LVS_SHORT:         return "ELE_FIBER_HOLD_LVS_SHORT";
+    case ELE_FIBER_HOLD_LVS_PAD_COUNT:     return "ELE_FIBER_HOLD_LVS_PAD_COUNT";
+    case ELE_FIBER_HOLD_LITHO_PULLBACK:    return "ELE_FIBER_HOLD_LITHO_PULLBACK";
+    default:                               return "ELE_FIBER_UNKNOWN";
+    }
+}
 
 typedef struct {
     char     name[24];
@@ -244,7 +270,23 @@ typedef struct {
     uint8_t            custom_spec;
     int32_t            saved_num_nets;
     ele_fab_net_t      saved_nets[ELE_FAB_MAX_NETS];
+
+    /* HoTT Physical Sign-Off Fiber State */
+    ele_fab_fiber_t    last_fiber;
+    uint32_t           fiber_epoch;
+    uint64_t           fiber_witness_mask;
 } ele_fab_ws_t;
+
+static inline ele_fab_fiber_t ele_fab_record_fiber(ele_fab_ws_t *ws, ele_fab_fiber_t f) {
+    if (ws != NULL) {
+        ws->last_fiber = f;
+        ws->fiber_epoch++;
+        if (f != ELE_FIBER_SIGNOFF_CLEAN && (uint32_t)f < 64U) {
+            ws->fiber_witness_mask |= (UINT64_C(1) << (uint32_t)f);
+        }
+    }
+    return f;
+}
 
 static inline uint64_t ele_fab_read_le64(const uint8_t *p) {
     return ((uint64_t)p[0])       | ((uint64_t)p[1] << 8)  |
@@ -331,20 +373,20 @@ static inline uint64_t ele_fab_fnv1a(const uint8_t *buf, uint32_t len) {
  * 1. Process Physics Metric .flow Loader
  * ============================================================================ */
 
-static inline int ele_fab_load_pdk(const char *path, ele_fab_pdk_t *out) {
+static inline ele_fab_fiber_t ele_fab_load_pdk(const char *path, ele_fab_pdk_t *out) {
     if (!path || !out) {
-        return ELE_FAB_ERR_PDK_IO;
+        return ELE_FIBER_FALLBACK_PDK_IO;
     }
     memset(out, 0, sizeof(*out));
     FILE *fp = fopen(path, "rb");
     if (!fp) {
-        return ELE_FAB_ERR_PDK_IO;
+        return ELE_FIBER_FALLBACK_PDK_IO;
     }
     uint8_t raw[ELE_FAB_PDK_BYTES + 16U];
     size_t n = fread(raw, 1U, sizeof(raw), fp);
     fclose(fp);
     if (n != ELE_FAB_PDK_BYTES) {
-        return ELE_FAB_ERR_PDK_FORMAT;
+        return ELE_FIBER_FALLBACK_PDK_FORMAT;
     }
 
     for (uint32_t w = 0U; w < 8U; ++w) {
@@ -361,7 +403,7 @@ static inline int ele_fab_load_pdk(const char *path, ele_fab_pdk_t *out) {
         int32_t b_enter = (int32_t)(uint32_t)(all_charts[c][3] & UINT64_C(0xFFFFFFFF));
         int32_t dt_max  = (int32_t)(uint32_t)(all_charts[c][4] >> 32U);
         if (epoch < 1U || tag != 0U || b_exit > b_enter || dt_max < 1) {
-            return ELE_FAB_ERR_PDK_FORMAT;
+            return ELE_FIBER_FALLBACK_PDK_FORMAT;
         }
         if (c < 4U) {
             memcpy(out->chart_cells[c], all_charts[c], sizeof(flow_cell));
@@ -370,7 +412,7 @@ static inline int ele_fab_load_pdk(const char *path, ele_fab_pdk_t *out) {
 
     ele_pdk_abi_t abi;
     if (!ele_pdk_abi_unpack(all_charts, ELE_PDK_ABI_CHART_COUNT, &abi)) {
-        return ELE_FAB_ERR_PDK_FORMAT;
+        return ELE_FIBER_FALLBACK_PDK_FORMAT;
     }
 
     out->grid_nm      = (int32_t)abi.grid_nm;
@@ -405,9 +447,9 @@ static inline int ele_fab_load_pdk(const char *path, ele_fab_pdk_t *out) {
         (out->via_size_nm % out->grid_nm) != 0 ||
         (out->via_enc_nm % out->grid_nm) != 0 ||
         out->r_sheet_mohm <= 0 || out->c_unit_af <= 0 || out->lambda_nm <= 0) {
-        return ELE_FAB_ERR_PDK_FORMAT;
+        return ELE_FIBER_FALLBACK_PDK_FORMAT;
     }
-    return ELE_FAB_OK;
+    return ELE_FIBER_SIGNOFF_CLEAN;
 }
 
 /* ============================================================================
@@ -590,12 +632,12 @@ static inline void ele_fab_record_line_end(ele_fab_ws_t *ws, int32_t net_id, int
     le->y1     = y1;
 }
 
-static inline int ele_fab_legalize_and_route(ele_fab_ws_t *ws,
-                                             const uint8_t perm_row[ELE_FAB_BASE_CELLS],
-                                             const int32_t cell_target_x[ELE_FAB_BASE_CELLS],
-                                             uint8_t split_mask,
-                                             bool emit_geometry,
-                                             bool relax_2jet) {
+static inline ele_fab_fiber_t ele_fab_legalize_and_route(ele_fab_ws_t *ws,
+                                                         const uint8_t perm_row[ELE_FAB_BASE_CELLS],
+                                                         const int32_t cell_target_x[ELE_FAB_BASE_CELLS],
+                                                         uint8_t split_mask,
+                                                         bool emit_geometry,
+                                                         bool relax_2jet) {
     const ele_fab_pdk_t *pdk = &ws->pdk;
     const int32_t P = pdk->pitch_nm;
     const int32_t W = pdk->min_width_nm;
@@ -1195,7 +1237,7 @@ static inline int ele_fab_legalize_and_route(ele_fab_ws_t *ws,
                               ws->core_x1 + 2 * P, ws->row_y1[3] + 2 * P, -1);
         }
     }
-    return ELE_FAB_OK;
+    return ele_fab_record_fiber(ws, ELE_FIBER_SIGNOFF_CLEAN);
 }
 
 static inline uint8_t ele_fab_decode_genome(const uint64_t canvas[4],
@@ -1222,8 +1264,8 @@ static inline uint8_t ele_fab_decode_genome(const uint64_t canvas[4],
     return (uint8_t)(canvas[3] & UINT64_C(0xFF));
 }
 
-static inline int ele_fab_run_coevolution(ele_fab_ws_t *ws, const ele_fab_pdk_t *pdk,
-                                          bool allow_univalent_split) {
+static inline ele_fab_fiber_t ele_fab_run_coevolution(ele_fab_ws_t *ws, const ele_fab_pdk_t *pdk,
+                                                      bool allow_univalent_split) {
     const uint32_t n_vars = 200U;
     uint64_t init_canvas[4] = {UINT64_C(0), UINT64_C(0), UINT64_C(0), UINT64_C(0)};
     uint64_t kan_pin[4]     = {UINT64_C(0), UINT64_C(0), UINT64_C(0), UINT64_C(0xFF)};
@@ -1285,22 +1327,23 @@ static inline int ele_fab_run_coevolution(ele_fab_ws_t *ws, const ele_fab_pdk_t 
 
     uint8_t best_split_mask = ele_fab_decode_genome(sres.canvas, allow_univalent_split,
                                                     perm_row, target_x);
-    ele_fab_legalize_and_route(ws, perm_row, target_x, best_split_mask, true, true);
+    ele_fab_fiber_t route_fiber = ele_fab_legalize_and_route(
+        ws, perm_row, target_x, best_split_mask, true, true);
     ws->searu_iters      = sres.iterations_run;
     ws->searu_epiphanies = sres.epiphanies;
-    return ELE_FAB_OK;
+    return route_fiber;
 }
 
-static inline int ele_fab_compile_die(ele_fab_ws_t *ws, const ele_fab_pdk_t *pdk,
-                                      bool allow_univalent_split) {
+static inline ele_fab_fiber_t ele_fab_compile_die(ele_fab_ws_t *ws, const ele_fab_pdk_t *pdk,
+                                                  bool allow_univalent_split) {
     ele_fab_build_chip_spec(ws, pdk);
     return ele_fab_run_coevolution(ws, pdk, allow_univalent_split);
 }
 
-static inline int ele_fab_compile_fir_die(ele_fab_ws_t *ws, const ele_fab_pdk_t *pdk,
-                                          const flow_ir_prog_t *fir) {
+static inline ele_fab_fiber_t ele_fab_compile_fir_die(ele_fab_ws_t *ws, const ele_fab_pdk_t *pdk,
+                                                      const flow_ir_prog_t *fir) {
     if (!ws || !pdk || !fir || fir->num_inputs == 0U || fir->num_outputs == 0U) {
-        return ELE_FAB_ERR_PDK_FORMAT;
+        return ele_fab_record_fiber(ws, ELE_FIBER_FALLBACK_PDK_FORMAT);
     }
     memset(ws, 0, sizeof(*ws));
     ws->pdk         = *pdk;
@@ -1544,7 +1587,7 @@ static inline int32_t ele_fab_nearest_collinear_gap(const ele_fab_ws_t *ws,
     return min_gap;
 }
 
-static inline int ele_fab_apply_opc_2jet(ele_fab_ws_t *ws) {
+static inline ele_fab_fiber_t ele_fab_apply_opc_2jet(ele_fab_ws_t *ws) {
     const ele_fab_pdk_t *pdk = &ws->pdk;
     int32_t sigma_nm = ele_fab_litho_sigma(pdk);
 
@@ -1612,7 +1655,7 @@ static inline int ele_fab_apply_opc_2jet(ele_fab_ws_t *ws) {
     ws->epe_naive_max_nm = max_naive;
     ws->epe_opc_max_nm   = max_opc;
     ws->opc_polys_added  = added;
-    return ELE_FAB_OK;
+    return ele_fab_record_fiber(ws, ELE_FIBER_SIGNOFF_CLEAN);
 }
 
 /* ============================================================================
@@ -1633,7 +1676,10 @@ static inline void ele_fab_gds_str_rec(uint8_t *dst, uint32_t *pos, uint16_t rec
     }
 }
 
-static inline int ele_fab_write_gds(ele_fab_ws_t *ws, const char *path) {
+static inline ele_fab_fiber_t ele_fab_write_gds(ele_fab_ws_t *ws, const char *path) {
+    if (!ws) {
+        return ELE_FIBER_FALLBACK_PDK_IO;
+    }
     uint8_t *b   = ws->gds_buf;
     uint32_t pos = 0U;
 
@@ -1722,15 +1768,15 @@ static inline int ele_fab_write_gds(ele_fab_ws_t *ws, const char *path) {
     if (path != NULL) {
         FILE *fp = fopen(path, "wb");
         if (!fp) {
-            return ELE_FAB_ERR_PDK_IO;
+            return ele_fab_record_fiber(ws, ELE_FIBER_FALLBACK_PDK_IO);
         }
         size_t wr = fwrite(b, 1U, (size_t)pos, fp);
         fclose(fp);
         if (wr != (size_t)pos) {
-            return ELE_FAB_ERR_PDK_IO;
+            return ele_fab_record_fiber(ws, ELE_FIBER_FALLBACK_PDK_IO);
         }
     }
-    return ELE_FAB_OK;
+    return ele_fab_record_fiber(ws, ELE_FIBER_SIGNOFF_CLEAN);
 }
 
 /* ============================================================================
@@ -1788,10 +1834,14 @@ static inline bool ele_fab_is_conducting_layer(int16_t layer) {
             layer == ELE_LAYER_OPC_SERIF);
 }
 
-static inline int ele_fab_verify_gds_bytes(ele_fab_ws_t *ws, const uint8_t *buf, uint32_t len) {
+static inline ele_fab_fiber_t ele_fab_verify_gds_bytes(ele_fab_ws_t *ws, const uint8_t *buf, uint32_t len) {
+    if (!ws) {
+        return ELE_FIBER_FALLBACK_GDS_HEADER;
+    }
+    ws->fiber_witness_mask = UINT64_C(0);
     const ele_fab_pdk_t *pdk = &ws->pdk;
     if (!buf || len < 64U) {
-        return ELE_FAB_ERR_GDS_HEADER;
+        return ele_fab_record_fiber(ws, ELE_FIBER_FALLBACK_GDS_HEADER);
     }
 
     uint32_t pos = 0U;
@@ -1809,21 +1859,21 @@ static inline int ele_fab_verify_gds_bytes(ele_fab_ws_t *ws, const uint8_t *buf,
         uint16_t rlen = ele_fab_read_be16(buf + pos);
         uint16_t rtyp = ele_fab_read_be16(buf + pos + 2U);
         if (rlen < 4U || (rlen & 1U) != 0U || pos + (uint32_t)rlen > len) {
-            return ELE_FAB_ERR_GDS_HEADER;
+            return ele_fab_record_fiber(ws, ELE_FIBER_FALLBACK_GDS_HEADER);
         }
         const uint8_t *pay = buf + pos + 4U;
         uint32_t plen = (uint32_t)rlen - 4U;
 
         if (rtyp == 0x0002U) {
             if (plen != 2U || ele_fab_read_be16(pay) != 0x0258U) {
-                return ELE_FAB_ERR_GDS_HEADER;
+                return ele_fab_record_fiber(ws, ELE_FIBER_FALLBACK_GDS_HEADER);
             }
             seen_header = true;
         } else if (rtyp == 0x0305U) {
             if (plen != 16U ||
                 ele_fab_read_be64(pay) != UINT64_C(0x3E4189374BC6A7F0) ||
                 ele_fab_read_be64(pay + 8U) != UINT64_C(0x3944B82FA09B5A54)) {
-                return ELE_FAB_ERR_GDS_UNITS;
+                return ele_fab_record_fiber(ws, ELE_FIBER_FALLBACK_GDS_UNITS);
             }
             seen_units = true;
         } else if (rtyp == 0x0800U) {
@@ -1835,19 +1885,19 @@ static inline int ele_fab_verify_gds_bytes(ele_fab_ws_t *ws, const uint8_t *buf,
             cur.net_hint = -1;
         } else if (rtyp == 0x0D02U && in_boundary) {
             if (plen != 2U) {
-                return ELE_FAB_ERR_GDS_BOUNDARY;
+                return ele_fab_record_fiber(ws, ELE_FIBER_FALLBACK_GDS_BOUNDARY);
             }
             cur.layer  = (int16_t)ele_fab_read_be16(pay);
             have_layer = true;
         } else if (rtyp == 0x0E02U && in_boundary) {
             if (plen != 2U) {
-                return ELE_FAB_ERR_GDS_BOUNDARY;
+                return ele_fab_record_fiber(ws, ELE_FIBER_FALLBACK_GDS_BOUNDARY);
             }
             cur.datatype = (int16_t)ele_fab_read_be16(pay);
             have_dt      = true;
         } else if (rtyp == 0x1003U && in_boundary) {
             if (plen != 40U) {
-                return ELE_FAB_ERR_GDS_BOUNDARY;
+                return ele_fab_record_fiber(ws, ELE_FIBER_FALLBACK_GDS_BOUNDARY);
             }
             int32_t xs[5], ys[5];
             int32_t min_x = 0x3FFFFFFF, max_x = -0x3FFFFFFF;
@@ -1870,7 +1920,7 @@ static inline int ele_fab_verify_gds_bytes(ele_fab_ws_t *ws, const uint8_t *buf,
             }
             if (xs[4] != xs[0] || ys[4] != ys[0] || max_x <= min_x || max_y <= min_y ||
                 xs[0] >= xs[1] || ys[0] >= ys[2]) {
-                return ELE_FAB_ERR_GDS_BOUNDARY;
+                return ele_fab_record_fiber(ws, ELE_FIBER_FALLBACK_GDS_BOUNDARY);
             }
             cur.x0  = min_x;
             cur.y0  = min_y;
@@ -1880,7 +1930,7 @@ static inline int ele_fab_verify_gds_bytes(ele_fab_ws_t *ws, const uint8_t *buf,
         } else if (rtyp == 0x1100U) {
             if (in_boundary) {
                 if (!have_layer || !have_dt || !have_xy) {
-                    return ELE_FAB_ERR_GDS_BOUNDARY;
+                    return ele_fab_record_fiber(ws, ELE_FIBER_FALLBACK_GDS_BOUNDARY);
                 }
                 if (ws->parsed_count < ELE_FAB_MAX_POLYS) {
                     ws->parsed_polys[ws->parsed_count++] = cur;
@@ -1894,7 +1944,7 @@ static inline int ele_fab_verify_gds_bytes(ele_fab_ws_t *ws, const uint8_t *buf,
     }
 
     if (!seen_header || !seen_units || !seen_endlib || pos != len || in_boundary) {
-        return ELE_FAB_ERR_GDS_TAIL;
+        return ele_fab_record_fiber(ws, ELE_FIBER_FALLBACK_GDS_TAIL);
     }
 
     const int32_t N = ws->parsed_count;
@@ -1907,17 +1957,17 @@ static inline int ele_fab_verify_gds_bytes(ele_fab_ws_t *ws, const uint8_t *buf,
         int32_t rx1 = P[i].x1 % pdk->grid_nm;
         int32_t ry1 = P[i].y1 % pdk->grid_nm;
         if (rx0 != 0 || ry0 != 0 || rx1 != 0 || ry1 != 0) {
-            return ELE_FAB_ERR_DRC_GRID;
+            return ele_fab_record_fiber(ws, ELE_FIBER_HOLD_DRC_GRID);
         }
         int32_t w = P[i].x1 - P[i].x0;
         int32_t h = P[i].y1 - P[i].y0;
         if (P[i].layer == ELE_LAYER_M1 || P[i].layer == ELE_LAYER_M2 || P[i].layer == ELE_LAYER_M3) {
             if (w < pdk->min_width_nm || h < pdk->min_width_nm) {
-                return ELE_FAB_ERR_DRC_WIDTH;
+                return ele_fab_record_fiber(ws, ELE_FIBER_HOLD_DRC_WIDTH);
             }
         } else if (P[i].layer == ELE_LAYER_VIA12 || P[i].layer == ELE_LAYER_VIA23) {
             if (w != pdk->via_size_nm || h != pdk->via_size_nm) {
-                return ELE_FAB_ERR_DRC_WIDTH;
+                return ele_fab_record_fiber(ws, ELE_FIBER_HOLD_DRC_WIDTH);
             }
         }
     }
@@ -1927,12 +1977,12 @@ static inline int ele_fab_verify_gds_bytes(ele_fab_ws_t *ws, const uint8_t *buf,
         for (int32_t j = i + 1; j < N; ++j) {
             if (P[i].layer == ELE_LAYER_CELL_BOUND && P[j].layer == ELE_LAYER_CELL_BOUND) {
                 if (ele_fab_rect_gap(&P[i], &P[j]) < pdk->min_space_nm) {
-                    return ELE_FAB_ERR_DRC_CELL_OVERLAP;
+                    return ele_fab_record_fiber(ws, ELE_FIBER_HOLD_DRC_CELL_OVERLAP);
                 }
             } else if (P[i].layer == ELE_LAYER_POWER_RAIL && P[j].layer == ELE_LAYER_POWER_RAIL) {
                 if (P[i].datatype != P[j].datatype &&
                     ele_fab_rect_gap(&P[i], &P[j]) < pdk->min_space_nm) {
-                    return ELE_FAB_ERR_DRC_RAIL_SHORT;
+                    return ele_fab_record_fiber(ws, ELE_FIBER_HOLD_DRC_RAIL_SHORT);
                 }
             }
         }
@@ -1958,7 +2008,7 @@ static inline int ele_fab_verify_gds_bytes(ele_fab_ws_t *ws, const uint8_t *buf,
             }
         }
         if (!ok_lo || !ok_hi) {
-            return ELE_FAB_ERR_DRC_VIA_ENCLOSURE;
+            return ele_fab_record_fiber(ws, ELE_FIBER_HOLD_DRC_VIA_ENCLOSURE);
         }
     }
 
@@ -2015,13 +2065,13 @@ static inline int ele_fab_verify_gds_bytes(ele_fab_ws_t *ws, const uint8_t *buf,
             }
         }
         if (hit_poly < 0) {
-            return ELE_FAB_ERR_LVS_PIN_MISS;
+            return ele_fab_record_fiber(ws, ELE_FIBER_HOLD_LVS_PIN_MISS);
         }
         uint16_t root = ele_fab_uf_find(ws->uf_parent, (uint16_t)hit_poly);
         if (net_comp[pl->net_idx] == UINT16_C(0xFFFF)) {
             net_comp[pl->net_idx] = root;
         } else if (net_comp[pl->net_idx] != root) {
-            return ELE_FAB_ERR_LVS_OPEN;
+            return ele_fab_record_fiber(ws, ELE_FIBER_HOLD_LVS_OPEN);
         }
         if (ws->nets[pl->net_idx].is_hv) {
             ws->uf_is_hv[root] = 1U;
@@ -2036,16 +2086,16 @@ static inline int ele_fab_verify_gds_bytes(ele_fab_ws_t *ws, const uint8_t *buf,
         }
     }
     if (pad_hit_count != ELE_FAB_NUM_PADS) {
-        return ELE_FAB_ERR_LVS_PAD_COUNT;
+        return ele_fab_record_fiber(ws, ELE_FIBER_HOLD_LVS_PAD_COUNT);
     }
 
     for (int a = 0; a < ws->num_nets; ++a) {
         if (net_comp[a] == UINT16_C(0xFFFF)) {
-            return ELE_FAB_ERR_LVS_OPEN;
+            return ele_fab_record_fiber(ws, ELE_FIBER_HOLD_LVS_OPEN);
         }
         for (int b = a + 1; b < ws->num_nets; ++b) {
             if (net_comp[a] == net_comp[b]) {
-                return ELE_FAB_ERR_LVS_SHORT;
+                return ele_fab_record_fiber(ws, ELE_FIBER_HOLD_LVS_SHORT);
             }
         }
     }
@@ -2066,10 +2116,10 @@ static inline int ele_fab_verify_gds_bytes(ele_fab_ws_t *ws, const uint8_t *buf,
             }
         }
         if (in_net < 0 || out_net < 0) {
-            return ELE_FAB_ERR_LVS_OPEN;
+            return ele_fab_record_fiber(ws, ELE_FIBER_HOLD_LVS_OPEN);
         }
         if (net_comp[in_net] == net_comp[out_net]) {
-            return ELE_FAB_ERR_LVS_SHORT;
+            return ele_fab_record_fiber(ws, ELE_FIBER_HOLD_LVS_SHORT);
         }
     }
 
@@ -2097,14 +2147,14 @@ static inline int ele_fab_verify_gds_bytes(ele_fab_ws_t *ws, const uint8_t *buf,
             int32_t gap = ele_fab_rect_gap(&P[i], &P[j]);
             if (P[i].layer == ELE_LAYER_OPC_SERIF || P[j].layer == ELE_LAYER_OPC_SERIF) {
                 if (gap < pdk->min_space_nm) {
-                    return ELE_FAB_ERR_DRC_OPC_MRC;
+                    return ele_fab_record_fiber(ws, ELE_FIBER_HOLD_DRC_OPC_MRC);
                 }
             }
             if (gap < pdk->min_space_nm) {
-                return ELE_FAB_ERR_DRC_SPACE;
+                return ele_fab_record_fiber(ws, ELE_FIBER_HOLD_DRC_SPACE);
             }
             if ((hvi || ws->uf_is_hv[rj]) && gap < pdk->hv_space_nm) {
-                return ELE_FAB_ERR_DRC_HV_SPACE;
+                return ele_fab_record_fiber(ws, ELE_FIBER_HOLD_DRC_HV_SPACE);
             }
         }
     }
@@ -2117,7 +2167,7 @@ static inline int ele_fab_verify_gds_bytes(ele_fab_ws_t *ws, const uint8_t *buf,
         }
     }
     if (opc_poly_cnt <= 0) {
-        return ELE_FAB_ERR_LITHO_PULLBACK;
+        return ele_fab_record_fiber(ws, ELE_FIBER_HOLD_LITHO_PULLBACK);
     }
     int32_t sigma_nm = ele_fab_litho_sigma(pdk);
     int32_t p_naive_max = 0;
@@ -2135,10 +2185,10 @@ static inline int ele_fab_verify_gds_bytes(ele_fab_ws_t *ws, const uint8_t *buf,
     }
     if (p_naive_max <= 0 || p_opc_max >= p_naive_max ||
         ws->opc_polys_added <= 0 || ws->epe_opc_max_nm >= ws->epe_naive_max_nm) {
-        return ELE_FAB_ERR_LITHO_PULLBACK;
+        return ele_fab_record_fiber(ws, ELE_FIBER_HOLD_LITHO_PULLBACK);
     }
 
-    return ELE_FAB_OK;
+    return ele_fab_record_fiber(ws, ELE_FIBER_SIGNOFF_CLEAN);
 }
 
 #ifdef __cplusplus

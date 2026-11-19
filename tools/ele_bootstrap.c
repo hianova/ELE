@@ -3709,21 +3709,36 @@ static int run_fir_synth_cmd(const char *fir_path, const char *sv_path,
 
     if (pdk_path != NULL && gds_path != NULL) {
         ele_fab_pdk_t pdk;
-        int rc = ele_fab_load_pdk(pdk_path, &pdk);
-        if (rc != ELE_FAB_OK) {
-            fprintf(stderr, "FATAL: --fir-synth failed to load PDK %s (rc=%d)\n", pdk_path, rc);
+        ele_fab_fiber_t fiber = ele_fab_load_pdk(pdk_path, &pdk);
+        if (fiber != ELE_FIBER_SIGNOFF_CLEAN) {
+            fprintf(stderr, "FATAL: --fir-synth failed to load PDK %s (%s, code=%d)\n",
+                    pdk_path, ele_fab_fiber_name(fiber), (int)fiber);
             return 1;
         }
-        ele_fab_compile_fir_die(&g_ele_fab_ws, &pdk, &g_ele_fir_prog);
-        ele_fab_apply_opc_2jet(&g_ele_fab_ws);
-        rc = ele_fab_write_gds(&g_ele_fab_ws, gds_path);
-        if (rc != ELE_FAB_OK) {
-            fprintf(stderr, "FATAL: --fir-synth write_gds failed (rc=%d)\n", rc);
+        fiber = ele_fab_compile_fir_die(&g_ele_fab_ws, &pdk, &g_ele_fir_prog);
+        if (fiber != ELE_FIBER_SIGNOFF_CLEAN) {
+            fprintf(stderr, "FATAL: --fir-synth compile_fir_die failed (%s, code=%d)\n",
+                    ele_fab_fiber_name(fiber), (int)fiber);
             return 1;
         }
-        rc = ele_fab_verify_gds_bytes(&g_ele_fab_ws, g_ele_fab_ws.gds_buf, g_ele_fab_ws.gds_len);
-        if (rc != ELE_FAB_OK) {
-            fprintf(stderr, "FATAL: --fir-synth DRC/LVS failed on %s (rc=%d)\n", gds_path, rc);
+        fiber = ele_fab_apply_opc_2jet(&g_ele_fab_ws);
+        if (fiber != ELE_FIBER_SIGNOFF_CLEAN) {
+            fprintf(stderr, "FATAL: --fir-synth OPC failed (%s, code=%d)\n",
+                    ele_fab_fiber_name(fiber), (int)fiber);
+            return 1;
+        }
+        fiber = ele_fab_write_gds(&g_ele_fab_ws, gds_path);
+        if (fiber != ELE_FIBER_SIGNOFF_CLEAN) {
+            fprintf(stderr, "FATAL: --fir-synth write_gds failed (%s, code=%d)\n",
+                    ele_fab_fiber_name(fiber), (int)fiber);
+            return 1;
+        }
+        fiber = ele_fab_verify_gds_bytes(&g_ele_fab_ws, g_ele_fab_ws.gds_buf, g_ele_fab_ws.gds_len);
+        if (fiber != ELE_FIBER_SIGNOFF_CLEAN ||
+            g_ele_fab_ws.last_fiber != ELE_FIBER_SIGNOFF_CLEAN ||
+            g_ele_fab_ws.fiber_witness_mask != UINT64_C(0)) {
+            fprintf(stderr, "FATAL: --fir-synth DRC/LVS failed on %s (%s, code=%d, mask=0x%" PRIX64 ")\n",
+                    gds_path, ele_fab_fiber_name(fiber), (int)fiber, g_ele_fab_ws.fiber_witness_mask);
             return 1;
         }
         printf("  [FLOW-FIR-FAB] mod=%s pdk=%-14s | wire=%3dum ir=%2dmV OPC=%2d->%2dnm | gds=%s (%uB, DRC=0, LVS=0)\n",
@@ -3736,21 +3751,36 @@ static int run_fir_synth_cmd(const char *fir_path, const char *sv_path,
 
 static int run_single_fab_proj(const char *pdk_path, const char *gds_path) {
     ele_fab_pdk_t pdk;
-    int rc = ele_fab_load_pdk(pdk_path, &pdk);
-    if (rc != ELE_FAB_OK) {
-        fprintf(stderr, "FATAL: failed to load PDK .flow atlas %s (rc=%d)\n", pdk_path, rc);
+    ele_fab_fiber_t fiber = ele_fab_load_pdk(pdk_path, &pdk);
+    if (fiber != ELE_FIBER_SIGNOFF_CLEAN) {
+        fprintf(stderr, "FATAL: failed to load PDK .flow atlas %s (%s, code=%d)\n",
+                pdk_path, ele_fab_fiber_name(fiber), (int)fiber);
         return 1;
     }
-    ele_fab_compile_die(&g_ele_fab_ws, &pdk, true);
-    ele_fab_apply_opc_2jet(&g_ele_fab_ws);
-    rc = ele_fab_write_gds(&g_ele_fab_ws, gds_path);
-    if (rc != ELE_FAB_OK) {
-        fprintf(stderr, "FATAL: failed to write GDSII stream %s (rc=%d)\n", gds_path, rc);
+    fiber = ele_fab_compile_die(&g_ele_fab_ws, &pdk, true);
+    if (fiber != ELE_FIBER_SIGNOFF_CLEAN) {
+        fprintf(stderr, "FATAL: compile_die failed (%s, code=%d)\n",
+                ele_fab_fiber_name(fiber), (int)fiber);
         return 1;
     }
-    rc = ele_fab_verify_gds_bytes(&g_ele_fab_ws, g_ele_fab_ws.gds_buf, g_ele_fab_ws.gds_len);
-    if (rc != ELE_FAB_OK) {
-        fprintf(stderr, "FATAL: DRC/LVS/GDSII sign-off failed on %s (rc=%d)\n", gds_path, rc);
+    fiber = ele_fab_apply_opc_2jet(&g_ele_fab_ws);
+    if (fiber != ELE_FIBER_SIGNOFF_CLEAN) {
+        fprintf(stderr, "FATAL: apply_opc_2jet failed (%s, code=%d)\n",
+                ele_fab_fiber_name(fiber), (int)fiber);
+        return 1;
+    }
+    fiber = ele_fab_write_gds(&g_ele_fab_ws, gds_path);
+    if (fiber != ELE_FIBER_SIGNOFF_CLEAN) {
+        fprintf(stderr, "FATAL: failed to write GDSII stream %s (%s, code=%d)\n",
+                gds_path, ele_fab_fiber_name(fiber), (int)fiber);
+        return 1;
+    }
+    fiber = ele_fab_verify_gds_bytes(&g_ele_fab_ws, g_ele_fab_ws.gds_buf, g_ele_fab_ws.gds_len);
+    if (fiber != ELE_FIBER_SIGNOFF_CLEAN ||
+        g_ele_fab_ws.last_fiber != ELE_FIBER_SIGNOFF_CLEAN ||
+        g_ele_fab_ws.fiber_witness_mask != UINT64_C(0)) {
+        fprintf(stderr, "FATAL: DRC/LVS/GDSII sign-off failed on %s (%s, code=%d, mask=0x%" PRIX64 ")\n",
+                gds_path, ele_fab_fiber_name(fiber), (int)fiber, g_ele_fab_ws.fiber_witness_mask);
         return 1;
     }
     printf("  [FLOW-FAB] pdk=%-16s | pitch=%4dnm g=%2dnm | reps=%d crit=%4dps wire=%3dum "
@@ -3776,18 +3806,30 @@ static int run_fab_verify(const char *build_dir) {
         snprintf(gds_path, sizeof(gds_path), "%s/ele_power_%s.gds", build_dir, k_pdk_names[p]);
 
         ele_fab_pdk_t pdk;
-        int rc = ele_fab_load_pdk(pdk_path, &pdk);
-        if (rc != ELE_FAB_OK) {
-            fprintf(stderr, "FATAL: --fab-verify failed loading %s (rc=%d)\n", pdk_path, rc);
+        ele_fab_fiber_t fiber = ele_fab_load_pdk(pdk_path, &pdk);
+        if (fiber != ELE_FIBER_SIGNOFF_CLEAN) {
+            fprintf(stderr, "FATAL: --fab-verify failed loading %s (%s, code=%d)\n",
+                    pdk_path, ele_fab_fiber_name(fiber), (int)fiber);
             return 1;
         }
 
         /* 1. Unified HoTT SEARU x FLOW 2-Jet co-evolution + 2-Jet OPC + GDSII write */
-        ele_fab_compile_die(&g_ele_fab_ws, &pdk, true);
-        ele_fab_apply_opc_2jet(&g_ele_fab_ws);
-        rc = ele_fab_write_gds(&g_ele_fab_ws, gds_path);
-        if (rc != ELE_FAB_OK) {
-            fprintf(stderr, "FATAL: --fab-verify write_gds failed for %s (rc=%d)\n", gds_path, rc);
+        fiber = ele_fab_compile_die(&g_ele_fab_ws, &pdk, true);
+        if (fiber != ELE_FIBER_SIGNOFF_CLEAN) {
+            fprintf(stderr, "FATAL: --fab-verify compile_die failed for %s (%s, code=%d)\n",
+                    k_pdk_names[p], ele_fab_fiber_name(fiber), (int)fiber);
+            return 1;
+        }
+        fiber = ele_fab_apply_opc_2jet(&g_ele_fab_ws);
+        if (fiber != ELE_FIBER_SIGNOFF_CLEAN) {
+            fprintf(stderr, "FATAL: --fab-verify OPC failed for %s (%s, code=%d)\n",
+                    k_pdk_names[p], ele_fab_fiber_name(fiber), (int)fiber);
+            return 1;
+        }
+        fiber = ele_fab_write_gds(&g_ele_fab_ws, gds_path);
+        if (fiber != ELE_FIBER_SIGNOFF_CLEAN) {
+            fprintf(stderr, "FATAL: --fab-verify write_gds failed for %s (%s, code=%d)\n",
+                    gds_path, ele_fab_fiber_name(fiber), (int)fiber);
             return 1;
         }
 
@@ -3819,17 +3861,20 @@ static int run_fab_verify(const char *build_dir) {
             fprintf(stderr, "FATAL: disk GDS size mismatch on %s\n", gds_path);
             return 1;
         }
-        rc = ele_fab_verify_gds_bytes(&g_ele_fab_ws, g_ele_fab_disk_buf, (uint32_t)rd);
-        if (rc != ELE_FAB_OK) {
-            fprintf(stderr, "FATAL: physical DRC/LVS/GDSII sign-off failed on %s (rc=%d)\n", gds_path, rc);
+        fiber = ele_fab_verify_gds_bytes(&g_ele_fab_ws, g_ele_fab_disk_buf, (uint32_t)rd);
+        if (fiber != ELE_FIBER_SIGNOFF_CLEAN ||
+            g_ele_fab_ws.last_fiber != ELE_FIBER_SIGNOFF_CLEAN ||
+            g_ele_fab_ws.fiber_witness_mask != UINT64_C(0)) {
+            fprintf(stderr, "FATAL: physical DRC/LVS/GDSII sign-off failed on %s (%s, code=%d, mask=0x%" PRIX64 ")\n",
+                    gds_path, ele_fab_fiber_name(fiber), (int)fiber, g_ele_fab_ws.fiber_witness_mask);
             return 1;
         }
         int32_t unif_polys = g_ele_fab_ws.parsed_count;
 
         /* 3. Bit-Exact Determinism Gate: re-compile from scratch and verify memcmp == 0 */
-        ele_fab_compile_die(&g_ele_fab_ws, &pdk, true);
-        ele_fab_apply_opc_2jet(&g_ele_fab_ws);
-        ele_fab_write_gds(&g_ele_fab_ws, NULL);
+        (void)ele_fab_compile_die(&g_ele_fab_ws, &pdk, true);
+        (void)ele_fab_apply_opc_2jet(&g_ele_fab_ws);
+        (void)ele_fab_write_gds(&g_ele_fab_ws, NULL);
         if (g_ele_fab_ws.gds_len != ref_len ||
             g_ele_fab_ws.gds_fnv1a != ref_hash ||
             memcmp(g_ele_fab_ws.gds_buf, g_ele_fab_ref_buf, ref_len) != 0) {
