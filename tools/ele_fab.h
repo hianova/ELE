@@ -1,7 +1,7 @@
 /* SPDX-License-Identifier: MIT
  * tools/ele_fab.h — Pure-GPR Univalent HoTT Spec-to-Polygon, 2-Jet OPC/ILT & GDSII Engine (ELE v8.0.0)
  *
- * Pure C17 / C++20-clean single-header physical silicon compiler coupled to FLOW v7.1.0:
+ * Pure C17 / C++20-clean single-header physical silicon compiler coupled to FLOW v8.0.0:
  *   1. `.flow` Process Metric Atlas Loader (decodes Lean 4-certified 320B PDK Atlases).
  *   2. Unified SEARU × FLOW 2-Jet Die Co-Evolution (eliminating the front-end / back-end split):
  *      - Discrete SEARU topology + univalent repeater splitting + slot ordering + layer selection,

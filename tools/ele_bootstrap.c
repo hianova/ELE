@@ -1,9 +1,9 @@
 /* SPDX-License-Identifier: MIT
- * tools/ele_bootstrap.c — Self-Hosting SEARU × FLOW v7.1.0 Symbiotic Silicon Compiler
+ * tools/ele_bootstrap.c — Self-Hosting SEARU × FLOW v8.0.0 Symbiotic Silicon Compiler
  *
  * Build-time 3-pass SSA hardware compiler combining continuous FLOW 2-Jet lattice
- * retiming (`../FLOW/flow.h`) with discrete SEARU Sparse-k / Kan-pin / Crucible
- * combinatorial optimization (`../FLOW/searu.h` + `../FLOW/flow_opt_params.h`).
+ * retiming (`../FLOW/core/flow.h`) with discrete SEARU Sparse-k / Kan-pin / Crucible
+ * combinatorial optimization (`../FLOW/core/searu.h` + `../FLOW/core/flow_opt_params.h`).
  *
  * Zero external library dependencies (pure GPR C17 + `flow.h` + `searu.h` only):
  *   Pass 1 : Declarative 33-node SSA operator IR (`ssa_op_spec_t`) retimed across

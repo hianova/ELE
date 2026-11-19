@@ -2,7 +2,7 @@
   ELE v8.0.0 — Pure Silicon Parameter Config (`import Flow`, 0 Custom Theorems)
   ===============================================================================
   SSOT compliance: all formal fiber-bundle/lattice/convex/ABI/Morphism theorems
-  and compilers live in domain-free `../FLOW/Flow/*.lean`.
+  and compilers live in domain-free `../FLOW/{core,sdk}/lean/Flow/*.lean`.
   This file configures foundry `PdkSpec` values, `ele_pdk_abi`, and ELE circuits.
 -/
 import Flow

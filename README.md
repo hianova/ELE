@@ -6,14 +6,15 @@
 
 ## Unified HoTT / `SEARU × FLOW 2-Jet` Logic-to-Lithography Architecture
 
-`ELE v8.0.0` eliminates both the front-end/back-end wall and downstream DSL duplication: SystemVerilog RTL, Abacus placement, 3-layer Manhattan Steiner routing (`M1`/`VIA12`/`M2`/`VIA23`/`M3`), IR-drop, `2-Jet` Inverse Lithography (`OPC/ILT`), and binary `.gds` photomasks compile from domain-free `Flow.Schema` ABI & `Flow.Morphism` (`.fir`) compilers governed by **[`FLOW v8.0.0`](../FLOW/Flow.lean)**:
+`ELE v8.0.0` eliminates both the front-end/back-end wall and downstream DSL duplication: SystemVerilog RTL, Abacus placement, 3-layer Manhattan Steiner routing (`M1`/`VIA12`/`M2`/`VIA23`/`M3`), IR-drop, `2-Jet` Inverse Lithography (`OPC/ILT`), and binary `.gds` photomasks compile from domain-free `Flow.Schema` ABI & `Flow.Morphism` (`.fir`) compilers governed by **[`FLOW v8.0.0`](../FLOW/sdk/lean/Flow.lean)**:
 
 ```text
-  FLOW v8.0.0 Pure-Math SSOT (../FLOW/{Flow.lean, Flow/*.lean, flow.h, searu.h, flow_opt_params.h, flow_ir.h} — 0 sorryAx)
+  FLOW v8.0.0 Pure-Math & SDK SSOT (../FLOW/core/{flow.h,searu.h,flow_opt_params.h,lean/Flow/*.lean},
+                                     ../FLOW/sdk/{flow_ir.h,flow_ir_io.h,searu_mc_gf2.h,flow_ir_synth.h,lean/Flow*.lean})
         │
         ├──► Ele.lean (Pure Silicon Parameter Config: <=200 lines, 0 theorems, 0 custom serialization)
         │      • Configures PdkSpec (pdkSky130, pdkEuv7, pdkSic800v) + Flow.Morphism.Builder circuits
-        │      └──► Emits build/ele_pdk_abi.h + 3× 576B .flow PDKs + ele_core_ir.fir + gf256_sbox_mac.fir
+        │      └──► Emits build/ele_pdk_abi.h + 3× 576B .flow PDKs + ele_core_ir.fir + gf256_sbox_mac.fir + tower/lut5 specs
         │
         ├──► Build-Time Symbiotic HLS + Univalent Fab Compiler (tools/ele_bootstrap.c + tools/ele_fab.h)
         │      • Pure-GPR C17 / C++20-clean (-mgeneral-regs-only -fno-jump-tables, 0 heap/float)
@@ -80,9 +81,9 @@
 
 ---
 
-## Unified HoTT Front-End + Back-End Fab Signoff ([`Flow.lean`](../FLOW/Flow.lean) + [`Ele.lean`](Ele.lean) $\to$ `576B .flow` + `.fir` $\to$ `GDSII v6.0`)
+## Unified HoTT Front-End + Back-End Fab Signoff ([`Flow.lean`](../FLOW/sdk/lean/Flow.lean) + [`Ele.lean`](Ele.lean) $\to$ `576B .flow` + `.fir` $\to$ `GDSII v6.0`)
 
-[`Flow/`](../FLOW/Flow/) serves as the sole domain-free Lean 4 SSOT (`0 sorryAx`, `-DwarningAsError=true`) certifying midpoint-split quadratic reduction (`Flow.Bundle`), constructive lattice clearance / snap-grid / box geometry (`Flow.Interval`), `Flow.Schema` (`ele_pdk_abi.h`), and QTT `.fir` morphism graphs (`Flow.Morphism`). Thin [`Ele.lean`](Ele.lean) (`0` local theorems) configures `pdkSky130`, `pdkEuv7`, and `pdkSic800v` into `3× 576B` `.flow` Atlases + `ele_core_ir.fir` + shared `gf256_sbox_mac.fir`, consumed by [`tools/ele_fab.h`](tools/ele_fab.h) & [`tools/ele_bootstrap.c`](tools/ele_bootstrap.c):
+[`core/lean/Flow/`](../FLOW/core/lean/Flow/) & [`sdk/lean/Flow/`](../FLOW/sdk/lean/Flow/) serve as the sole domain-free Lean 4 SSOT (`0 sorryAx`, `-DwarningAsError=true`) certifying midpoint-split quadratic reduction (`Flow.Bundle`), constructive lattice clearance / snap-grid / box geometry (`Flow.Interval`), `Flow.Schema` (`ele_pdk_abi.h`), and QTT `.fir` morphism graphs (`Flow.Morphism`). Thin [`Ele.lean`](Ele.lean) (`0` local theorems) configures `pdkSky130`, `pdkEuv7`, and `pdkSic800v` into `3× 576B` `.flow` Atlases + `ele_core_ir.fir` + shared `gf256_sbox_mac.fir` + `gf256_tower_spec.fir` + `lut5_bijection_spec.fir`, consumed by [`tools/ele_fab.h`](tools/ele_fab.h) & [`tools/ele_bootstrap.c`](tools/ele_bootstrap.c):
 
 | Process Atlas (`576B .flow`) | GDSII Hash & Size | Polygons | Repeaters | Crit Path | Wirelength | Max IR-Drop | `2-Jet` OPC EPE | Binary DRC / LVS |
 | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
@@ -92,6 +93,7 @@
 
 - **Machine-Checked Univalent Split Ablation (`euv7`)**: Locked front-end (`reps = 0`) traps placement/routing at `crit = 146,724 ps` (`E = 587,894`), whereas Univalent HoTT Co-Evolution inserts `2` repeaters across the front-end/back-end boundary to achieve **`crit = 136,309 ps` (`E = 546,331`, both delay & closure improved)**.
 - **Shared Cross-Domain `.fir` Projection (`gf256_sbox_mac.fir`)**: Byte-identical to `../QUA/qcc/build/gf256_sbox_mac.fir`, compiled via `--fir-synth` into Verilator `0-ULP` SV (`1,024`-vector lockstep vs Pure-GPR `flow_ir_eval_u64`), latch-free Yosys netlist, and `124,022 B` `sky130` GDSII (`DRC=0, LVS=0`).
+- **SEARU `.fir` Multiplicative-Complexity & 1st-Order DOM Masking (`gf256_tower_*`, `lut5_bijection_opt`)**: Compresses `gf256_tower_spec.fir` (`96` ANDs, depth `5`, `122` Yosys cells) via `FLOW fir-synth` into `gf256_tower_a32.fir` (`32` ANDs, depth `5`, `124` cells, DOM `10` cyc / `32` masks) and `gf256_tower_d4.fir` (`33` ANDs, depth `4`, `121` cells, `gf256_tower_d4_dom` `1,097` cells at `DOM_LATENCY_CYC=8` / `DOM_MASK_BITS=33`, `16,384`-cyc X-poisoned `0-ULP` + HW $\Delta=(0.0085, 0.0164) < 0.20$ + `euv7` `DRC=0` GDSII), plus `lut5_bijection_spec.fir` (`25` ANDs, depth `5`) $\to$ `lut5_bijection_opt_dom.sv` (`5` ANDs, depth `1`, `DOM_LATENCY_CYC=2` / `DOM_MASK_BITS=5`).
 
 ---
 
