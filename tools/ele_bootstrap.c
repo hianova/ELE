@@ -33,6 +33,7 @@
 #include "flow.h"
 #include "searu.h"
 #include "flow_ir.h"
+#include "flow_ir_io.h"
 #include "ele_fab.h"
 
 #define MAX_CONE_NODES  16
@@ -3056,6 +3057,7 @@ static void emit_fir_sv(FILE *fp, const flow_ir_prog_t *p) {
                 (port_idx < total_ports) ? "," : "");
     }
     fprintf(fp, ");\n");
+    fprintf(fp, "/* verilator lint_off UNUSEDSIGNAL */\n");
 
     for (uint32_t i = 0U; i < p->num_vals; ++i) {
         fprintf(fp, "    logic [%u:0] w_%u;\n", (unsigned)(p->vals[i].width - 1U), (unsigned)i);
@@ -3181,14 +3183,475 @@ static void emit_fir_sv(FILE *fp, const flow_ir_prog_t *p) {
         uint32_t vid = p->outputs[i];
         fprintf(fp, "    assign %s = w_%u;\n", p->vals[vid].name, (unsigned)vid);
     }
+    fprintf(fp, "/* verilator lint_on UNUSEDSIGNAL */\n");
     fprintf(fp, "endmodule\n");
     fprintf(fp, "/* verilator lint_on DECLFILENAME */\n");
     fprintf(fp, "`default_nettype wire\n");
 }
 
+typedef struct {
+    uint32_t val_stage[FLOW_IR_MAX_VALS];
+    uint32_t max_emitted_stage[FLOW_IR_MAX_VALS];
+    uint32_t op_mask_off[FLOW_IR_MAX_OPS];
+    uint32_t total_mask_bits;
+    uint32_t total_lat;
+} ele_dom_ws_t;
+
+static ele_dom_ws_t g_ele_dom_ws;
+
+static bool dom_op_is_supported(uint16_t k) {
+    return (k == FLOW_IR_OP_CONST_U64) || (k == FLOW_IR_OP_SLICE) || (k == FLOW_IR_OP_CONCAT) ||
+           (k == FLOW_IR_OP_XOR_VEC) || (k == FLOW_IR_OP_NOT_VEC) || (k == FLOW_IR_OP_AND_VEC) ||
+           (k == FLOW_IR_OP_CTRL_SEL);
+}
+
+static bool dom_val_is_const(const flow_ir_prog_t *p, uint32_t vid) {
+    if (vid < p->num_inputs) {
+        return false;
+    }
+    uint32_t oi = vid - p->num_inputs;
+    return (oi < p->num_ops) && (p->ops[oi].kind == FLOW_IR_OP_CONST_U64);
+}
+
+static void emit_dom_sv_resized_rhs(FILE *fp, const char *dom_tag, uint32_t vid, uint32_t st,
+                                    uint16_t src_w, uint16_t dst_w) {
+    if (src_w == dst_w) {
+        fprintf(fp, "w_%s_%u_s%u", dom_tag, (unsigned)vid, (unsigned)st);
+    } else if (src_w > dst_w) {
+        fprintf(fp, "w_%s_%u_s%u[%u:0]", dom_tag, (unsigned)vid, (unsigned)st,
+                (unsigned)(dst_w - 1U));
+    } else {
+        fprintf(fp, "{{%u{1'b0}}, w_%s_%u_s%u}", (unsigned)(dst_w - src_w), dom_tag,
+                (unsigned)vid, (unsigned)st);
+    }
+}
+
+static void ensure_dom_stage(FILE *fp, const flow_ir_prog_t *p, uint32_t vid, uint32_t target_st) {
+    uint16_t w = p->vals[vid].width;
+    while (g_ele_dom_ws.max_emitted_stage[vid] < target_st) {
+        uint32_t s_prev = g_ele_dom_ws.max_emitted_stage[vid];
+        uint32_t s_next = s_prev + 1U;
+        if (dom_val_is_const(p, vid)) {
+            fprintf(fp, "    wire [%u:0] w_dom0_%u_s%u = w_dom0_%u_s%u;\n", (unsigned)(w - 1U),
+                    (unsigned)vid, (unsigned)s_next, (unsigned)vid, (unsigned)s_prev);
+            fprintf(fp, "    wire [%u:0] w_dom1_%u_s%u = w_dom1_%u_s%u;\n", (unsigned)(w - 1U),
+                    (unsigned)vid, (unsigned)s_next, (unsigned)vid, (unsigned)s_prev);
+        } else {
+            fprintf(fp,
+                    "    logic [%u:0] dly_dom0_%u_s%u;\n"
+                    "    always_ff @(posedge clk_i or negedge rst_ni) begin\n"
+                    "        if (!rst_ni) dly_dom0_%u_s%u <= '0;\n"
+                    "        else         dly_dom0_%u_s%u <= w_dom0_%u_s%u;\n"
+                    "    end\n"
+                    "    wire [%u:0] w_dom0_%u_s%u = dly_dom0_%u_s%u;\n",
+                    (unsigned)(w - 1U), (unsigned)vid, (unsigned)s_next,
+                    (unsigned)vid, (unsigned)s_next,
+                    (unsigned)vid, (unsigned)s_next, (unsigned)vid, (unsigned)s_prev,
+                    (unsigned)(w - 1U), (unsigned)vid, (unsigned)s_next,
+                    (unsigned)vid, (unsigned)s_next);
+            fprintf(fp,
+                    "    logic [%u:0] dly_dom1_%u_s%u;\n"
+                    "    always_ff @(posedge clk_i or negedge rst_ni) begin\n"
+                    "        if (!rst_ni) dly_dom1_%u_s%u <= '0;\n"
+                    "        else         dly_dom1_%u_s%u <= w_dom1_%u_s%u;\n"
+                    "    end\n"
+                    "    wire [%u:0] w_dom1_%u_s%u = dly_dom1_%u_s%u;\n",
+                    (unsigned)(w - 1U), (unsigned)vid, (unsigned)s_next,
+                    (unsigned)vid, (unsigned)s_next,
+                    (unsigned)vid, (unsigned)s_next, (unsigned)vid, (unsigned)s_prev,
+                    (unsigned)(w - 1U), (unsigned)vid, (unsigned)s_next,
+                    (unsigned)vid, (unsigned)s_next);
+        }
+        g_ele_dom_ws.max_emitted_stage[vid] = s_next;
+    }
+}
+
+static bool emit_fir_dom_sv(FILE *fp, const flow_ir_prog_t *p) {
+    memset(&g_ele_dom_ws, 0, sizeof(g_ele_dom_ws));
+
+    for (uint32_t i = 0U; i < p->num_ops; ++i) {
+        const flow_ir_op_t *op = &p->ops[i];
+        if (!dom_op_is_supported(op->kind)) {
+            fprintf(stderr,
+                    "FATAL: --dom-mask only supports factored F2/AND/SEL graphs (found kind=%u in %s)\n",
+                    (unsigned)op->kind, p->name);
+            return false;
+        }
+        uint32_t oid       = op->out_val;
+        uint32_t max_in_st = 0U;
+        for (uint16_t j = 0U; j < op->num_ins && j < FLOW_IR_MAX_INS; ++j) {
+            uint32_t iv = op->ins[j];
+            if (g_ele_dom_ws.val_stage[iv] > max_in_st) {
+                max_in_st = g_ele_dom_ws.val_stage[iv];
+            }
+        }
+        if (op->kind == FLOW_IR_OP_AND_VEC || op->kind == FLOW_IR_OP_CTRL_SEL) {
+            g_ele_dom_ws.val_stage[oid]   = max_in_st + 2U;
+            g_ele_dom_ws.op_mask_off[i]   = g_ele_dom_ws.total_mask_bits;
+            g_ele_dom_ws.total_mask_bits += (uint32_t)p->vals[oid].width;
+        } else {
+            g_ele_dom_ws.val_stage[oid] = max_in_st;
+        }
+    }
+
+    uint32_t total_lat = 0U;
+    for (uint32_t i = 0U; i < p->num_outputs; ++i) {
+        uint32_t vid = p->outputs[i];
+        if (g_ele_dom_ws.val_stage[vid] > total_lat) {
+            total_lat = g_ele_dom_ws.val_stage[vid];
+        }
+    }
+    g_ele_dom_ws.total_lat = total_lat;
+    uint32_t mask_hi = (g_ele_dom_ws.total_mask_bits > 0U) ? (g_ele_dom_ws.total_mask_bits - 1U) : 0U;
+
+    fprintf(fp, "// SPDX-License-Identifier: MIT\n");
+    fprintf(fp, "// AUTO-GENERATED BY `tools/ele_bootstrap.c --fir-synth --dom-mask` FROM `%s`\n",
+            p->name);
+    fprintf(fp, "`default_nettype none\n");
+    fprintf(fp, "/* verilator lint_off DECLFILENAME */\n\n");
+
+    fprintf(fp,
+            "module ele_dom_and_stage #(\n"
+            "    parameter int unsigned W = 1\n"
+            ") (\n"
+            "    input  logic         clk_i,\n"
+            "    input  logic         rst_ni,\n"
+            "    input  logic [W-1:0] a0_i,\n"
+            "    input  logic [W-1:0] a1_i,\n"
+            "    input  logic [W-1:0] b0_i,\n"
+            "    input  logic [W-1:0] b1_i,\n"
+            "    input  logic [W-1:0] r_ref_i,\n"
+            "    input  logic [W-1:0] z_blind_i,\n"
+            "    output logic [W-1:0] q0_o,\n"
+            "    output logic [W-1:0] q1_o\n"
+            ");\n"
+            "    logic [W-1:0] a0_q, a1_q, hb0_q, hb1_q;\n"
+            "    always_ff @(posedge clk_i or negedge rst_ni) begin\n"
+            "        if (!rst_ni) begin\n"
+            "            a0_q  <= '0;\n"
+            "            a1_q  <= '0;\n"
+            "            hb0_q <= '0;\n"
+            "            hb1_q <= '0;\n"
+            "        end else begin\n"
+            "            a0_q  <= a0_i;\n"
+            "            a1_q  <= a1_i;\n"
+            "            hb0_q <= b0_i ^ r_ref_i;\n"
+            "            hb1_q <= b1_i ^ r_ref_i;\n"
+            "        end\n"
+            "    end\n"
+            "    wire [W-1:0] p00 = a0_q & hb0_q;\n"
+            "    wire [W-1:0] c01 = (a0_q & hb1_q) ^ z_blind_i;\n"
+            "    wire [W-1:0] c10 = (a1_q & hb0_q) ^ z_blind_i;\n"
+            "    wire [W-1:0] p11 = a1_q & hb1_q;\n"
+            "    logic [W-1:0] p00_q, c01_q, c10_q, p11_q;\n"
+            "    always_ff @(posedge clk_i or negedge rst_ni) begin\n"
+            "        if (!rst_ni) begin\n"
+            "            p00_q <= '0;\n"
+            "            c01_q <= '0;\n"
+            "            c10_q <= '0;\n"
+            "            p11_q <= '0;\n"
+            "        end else begin\n"
+            "            p00_q <= p00;\n"
+            "            c01_q <= c01;\n"
+            "            c10_q <= c10;\n"
+            "            p11_q <= p11;\n"
+            "        end\n"
+            "    end\n"
+            "    assign q0_o = p00_q ^ c01_q;\n"
+            "    assign q1_o = c10_q ^ p11_q;\n"
+            "endmodule\n\n");
+
+    fprintf(fp,
+            "`ifdef FORMAL\n"
+            "module %s_dom_atom_qed (\n"
+            "    input logic [7:0] x_a,\n"
+            "    input logic [7:0] y_a,\n"
+            "    input logic [7:0] x_b,\n"
+            "    input logic [7:0] y_b,\n"
+            "    input logic [7:0] m_x,\n"
+            "    input logic [7:0] m_y,\n"
+            "    input logic [7:0] r_ref,\n"
+            "    input logic [7:0] z_m\n"
+            ");\n"
+            "    wire [7:0] a0_A = m_x;\n"
+            "    wire [7:0] a1_A = x_a ^ m_x;\n"
+            "    wire [7:0] b0_A = m_y ^ m_x;\n"
+            "    wire [7:0] b1_A = y_a ^ b0_A;\n"
+            "    wire [7:0] hb0_A = b0_A ^ r_ref;\n"
+            "    wire [7:0] hb1_A = b1_A ^ r_ref;\n"
+            "    wire [7:0] p00_A = a0_A & hb0_A;\n"
+            "    wire [7:0] p01_A = a0_A & hb1_A;\n"
+            "    wire [7:0] c01_A = p01_A ^ z_m;\n"
+            "    wire [7:0] p10_A = a1_A & hb0_A;\n"
+            "    wire [7:0] c10_A = p10_A ^ z_m;\n"
+            "    wire [7:0] p11_A = a1_A & hb1_A;\n"
+            "    wire [7:0] q0_A  = p00_A ^ c01_A;\n"
+            "    wire [7:0] q1_A  = c10_A ^ p11_A;\n"
+            "    wire [7:0] dy     = y_a ^ y_b;\n"
+            "    wire [7:0] zm_B   = z_m ^ (a0_A & dy);\n"
+            "    wire [7:0] b0_B   = m_y ^ m_x;\n"
+            "    wire [7:0] b1_B   = y_b ^ b0_B;\n"
+            "    wire [7:0] hb0_B  = b0_B ^ r_ref;\n"
+            "    wire [7:0] hb1_B  = b1_B ^ r_ref;\n"
+            "    wire [7:0] p00_B  = a0_A & hb0_B;\n"
+            "    wire [7:0] c01_B  = (a0_A & hb1_B) ^ zm_B;\n"
+            "    wire [7:0] q0_B   = p00_B ^ c01_B;\n"
+            "    wire [7:0] p01_Bp = a0_A & (b1_B ^ (r_ref ^ dy));\n"
+            "    wire [7:0] dx     = x_a ^ x_b;\n"
+            "    wire [7:0] mx_C   = m_x ^ dx;\n"
+            "    wire [7:0] a1_C   = x_b ^ mx_C;\n"
+            "    wire [7:0] b0_C   = m_y ^ mx_C;\n"
+            "    wire [7:0] b1_C   = y_b ^ b0_C;\n"
+            "    wire [7:0] rb_C   = r_ref ^ dx ^ dy;\n"
+            "    wire [7:0] hb0_C  = b0_C ^ rb_C;\n"
+            "    wire [7:0] hb1_C  = b1_C ^ rb_C;\n"
+            "    wire [7:0] zm_C   = z_m ^ (a1_A & (hb0_A ^ hb0_C));\n"
+            "    wire [7:0] p11_C  = a1_C & hb1_C;\n"
+            "    wire [7:0] c10_C  = (a1_C & hb0_C) ^ zm_C;\n"
+            "    wire [7:0] q1_C   = c10_C ^ p11_C;\n"
+            "    always_comb begin\n"
+            "        assert((q0_A ^ q1_A) == (x_a & y_a));\n"
+            "        assert((zm_B ^ (a0_A & dy)) == z_m);\n"
+            "        assert(p00_A == p00_B);\n"
+            "        assert(c01_A == c01_B);\n"
+            "        assert(q0_A  == q0_B);\n"
+            "        assert(p01_A == p01_Bp);\n"
+            "        assert(a1_C  == a1_A);\n"
+            "        assert(p11_A == p11_C);\n"
+            "        assert(c10_A == c10_C);\n"
+            "        assert(q1_A  == q1_C);\n"
+            "    end\n"
+            "endmodule\n"
+            "`endif\n\n",
+            p->name);
+
+    fprintf(fp, "module %s_dom (\n", p->name);
+    fprintf(fp, "    input  logic clk_i,\n");
+    fprintf(fp, "    input  logic rst_ni,\n");
+    for (uint32_t i = 0U; i < p->num_inputs; ++i) {
+        uint32_t vid = p->inputs[i];
+        uint16_t w   = p->vals[vid].width;
+        fprintf(fp, "    input  logic [%u:0] %s_dom0_i,\n", (unsigned)(w - 1U), p->vals[vid].name);
+        fprintf(fp, "    input  logic [%u:0] %s_dom1_i,\n", (unsigned)(w - 1U), p->vals[vid].name);
+    }
+    fprintf(fp, "    input  logic [%u:0] r_ref_i,\n", (unsigned)mask_hi);
+    fprintf(fp, "    input  logic [%u:0] z_blind_i,\n", (unsigned)mask_hi);
+    for (uint32_t i = 0U; i < p->num_outputs; ++i) {
+        uint32_t vid = p->outputs[i];
+        uint16_t w   = p->vals[vid].width;
+        const char *comma = (i + 1U < p->num_outputs) ? "," : "";
+        fprintf(fp, "    output logic [%u:0] %s_dom0_o,\n", (unsigned)(w - 1U), p->vals[vid].name);
+        fprintf(fp, "    output logic [%u:0] %s_dom1_o%s\n", (unsigned)(w - 1U), p->vals[vid].name, comma);
+    }
+    fprintf(fp, ");\n");
+    fprintf(fp, "    /* verilator lint_off UNUSEDPARAM */\n");
+    fprintf(fp, "    localparam int unsigned DOM_LATENCY_CYC = %u;\n", (unsigned)total_lat);
+    fprintf(fp, "    localparam int unsigned DOM_MASK_BITS   = %u;\n",
+            (unsigned)g_ele_dom_ws.total_mask_bits);
+    fprintf(fp, "    /* verilator lint_on UNUSEDPARAM */\n\n");
+    fprintf(fp, "    /* verilator lint_off UNUSEDSIGNAL */\n");
+
+    if (total_lat == 0U || g_ele_dom_ws.total_mask_bits == 0U) {
+        fprintf(fp, "    /* verilator lint_off UNUSEDSIGNAL */\n");
+        fprintf(fp, "    wire _unused_dom_ctrl = &{1'b0, clk_i, rst_ni, r_ref_i, z_blind_i};\n");
+        fprintf(fp, "    /* verilator lint_on UNUSEDSIGNAL */\n");
+    }
+
+    for (uint32_t i = 0U; i < p->num_inputs; ++i) {
+        uint32_t vid = p->inputs[i];
+        uint16_t w   = p->vals[vid].width;
+        fprintf(fp, "    wire [%u:0] w_dom0_%u_s0 = %s_dom0_i;\n", (unsigned)(w - 1U),
+                (unsigned)vid, p->vals[vid].name);
+        fprintf(fp, "    wire [%u:0] w_dom1_%u_s0 = %s_dom1_i;\n", (unsigned)(w - 1U),
+                (unsigned)vid, p->vals[vid].name);
+        g_ele_dom_ws.max_emitted_stage[vid] = 0U;
+    }
+
+    for (uint32_t i = 0U; i < p->num_ops; ++i) {
+        const flow_ir_op_t *op = &p->ops[i];
+        uint32_t oid           = op->out_val;
+        uint16_t ow            = p->vals[oid].width;
+        uint16_t k             = op->kind;
+        uint32_t st_out        = g_ele_dom_ws.val_stage[oid];
+        uint32_t max_in_st     = 0U;
+        for (uint16_t j = 0U; j < op->num_ins && j < FLOW_IR_MAX_INS; ++j) {
+            uint32_t iv = op->ins[j];
+            if (g_ele_dom_ws.val_stage[iv] > max_in_st) {
+                max_in_st = g_ele_dom_ws.val_stage[iv];
+            }
+        }
+        for (uint16_t j = 0U; j < op->num_ins && j < FLOW_IR_MAX_INS; ++j) {
+            ensure_dom_stage(fp, p, op->ins[j], max_in_st);
+        }
+
+        if (k == FLOW_IR_OP_CONST_U64) {
+            uint64_t mv = op->p0 & flow_ir_mask_u64(ow);
+            fprintf(fp, "    wire [%u:0] w_dom0_%u_s%u = %u'h%" PRIx64 ";\n", (unsigned)(ow - 1U),
+                    (unsigned)oid, (unsigned)st_out, (unsigned)ow, mv);
+            fprintf(fp, "    wire [%u:0] w_dom1_%u_s%u = %u'h0;\n", (unsigned)(ow - 1U),
+                    (unsigned)oid, (unsigned)st_out, (unsigned)ow);
+        } else if (k == FLOW_IR_OP_SLICE) {
+            uint32_t iv = op->ins[0];
+            uint16_t iw = p->vals[iv].width;
+            uint16_t lo = (uint16_t)op->p0;
+            if (lo + ow <= iw) {
+                fprintf(fp, "    wire [%u:0] w_dom0_%u_s%u = w_dom0_%u_s%u[%u:%u];\n",
+                        (unsigned)(ow - 1U), (unsigned)oid, (unsigned)st_out, (unsigned)iv,
+                        (unsigned)max_in_st, (unsigned)(lo + ow - 1U), (unsigned)lo);
+                fprintf(fp, "    wire [%u:0] w_dom1_%u_s%u = w_dom1_%u_s%u[%u:%u];\n",
+                        (unsigned)(ow - 1U), (unsigned)oid, (unsigned)st_out, (unsigned)iv,
+                        (unsigned)max_in_st, (unsigned)(lo + ow - 1U), (unsigned)lo);
+            } else {
+                fprintf(fp, "    wire [%u:0] w_dom0_%u_s%u = ", (unsigned)(ow - 1U),
+                        (unsigned)oid, (unsigned)st_out);
+                emit_dom_sv_resized_rhs(fp, "dom0", iv, max_in_st, iw, ow);
+                fprintf(fp, ";\n");
+                fprintf(fp, "    wire [%u:0] w_dom1_%u_s%u = ", (unsigned)(ow - 1U),
+                        (unsigned)oid, (unsigned)st_out);
+                emit_dom_sv_resized_rhs(fp, "dom1", iv, max_in_st, iw, ow);
+                fprintf(fp, ";\n");
+            }
+        } else if (k == FLOW_IR_OP_CONCAT) {
+            fprintf(fp, "    wire [%u:0] w_dom0_%u_s%u = {", (unsigned)(ow - 1U), (unsigned)oid,
+                    (unsigned)st_out);
+            for (int32_t j = (int32_t)op->num_ins - 1; j >= 0; --j) {
+                fprintf(fp, "w_dom0_%u_s%u%s", (unsigned)op->ins[j], (unsigned)max_in_st,
+                        (j > 0) ? ", " : "");
+            }
+            fprintf(fp, "};\n");
+            fprintf(fp, "    wire [%u:0] w_dom1_%u_s%u = {", (unsigned)(ow - 1U), (unsigned)oid,
+                    (unsigned)st_out);
+            for (int32_t j = (int32_t)op->num_ins - 1; j >= 0; --j) {
+                fprintf(fp, "w_dom1_%u_s%u%s", (unsigned)op->ins[j], (unsigned)max_in_st,
+                        (j > 0) ? ", " : "");
+            }
+            fprintf(fp, "};\n");
+        } else if (k == FLOW_IR_OP_XOR_VEC) {
+            uint32_t a = op->ins[0], b = op->ins[1];
+            fprintf(fp, "    wire [%u:0] w_dom0_%u_s%u = ", (unsigned)(ow - 1U), (unsigned)oid,
+                    (unsigned)st_out);
+            emit_dom_sv_resized_rhs(fp, "dom0", a, max_in_st, p->vals[a].width, ow);
+            fprintf(fp, " ^ ");
+            emit_dom_sv_resized_rhs(fp, "dom0", b, max_in_st, p->vals[b].width, ow);
+            fprintf(fp, ";\n");
+            fprintf(fp, "    wire [%u:0] w_dom1_%u_s%u = ", (unsigned)(ow - 1U), (unsigned)oid,
+                    (unsigned)st_out);
+            emit_dom_sv_resized_rhs(fp, "dom1", a, max_in_st, p->vals[a].width, ow);
+            fprintf(fp, " ^ ");
+            emit_dom_sv_resized_rhs(fp, "dom1", b, max_in_st, p->vals[b].width, ow);
+            fprintf(fp, ";\n");
+        } else if (k == FLOW_IR_OP_NOT_VEC) {
+            uint32_t a = op->ins[0];
+            fprintf(fp, "    wire [%u:0] w_dom0_%u_s%u = ~(", (unsigned)(ow - 1U), (unsigned)oid,
+                    (unsigned)st_out);
+            emit_dom_sv_resized_rhs(fp, "dom0", a, max_in_st, p->vals[a].width, ow);
+            fprintf(fp, ");\n");
+            fprintf(fp, "    wire [%u:0] w_dom1_%u_s%u = ", (unsigned)(ow - 1U), (unsigned)oid,
+                    (unsigned)st_out);
+            emit_dom_sv_resized_rhs(fp, "dom1", a, max_in_st, p->vals[a].width, ow);
+            fprintf(fp, ";\n");
+        } else if (k == FLOW_IR_OP_AND_VEC) {
+            uint32_t a   = op->ins[0], b = op->ins[1];
+            uint32_t mlo = g_ele_dom_ws.op_mask_off[i];
+            uint32_t mhi = mlo + (uint32_t)ow - 1U;
+            fprintf(fp, "    wire [%u:0] and_a_dom0_%u = ", (unsigned)(ow - 1U), (unsigned)oid);
+            emit_dom_sv_resized_rhs(fp, "dom0", a, max_in_st, p->vals[a].width, ow);
+            fprintf(fp, ";\n");
+            fprintf(fp, "    wire [%u:0] and_a_dom1_%u = ", (unsigned)(ow - 1U), (unsigned)oid);
+            emit_dom_sv_resized_rhs(fp, "dom1", a, max_in_st, p->vals[a].width, ow);
+            fprintf(fp, ";\n");
+            fprintf(fp, "    wire [%u:0] and_b_dom0_%u = ", (unsigned)(ow - 1U), (unsigned)oid);
+            emit_dom_sv_resized_rhs(fp, "dom0", b, max_in_st, p->vals[b].width, ow);
+            fprintf(fp, ";\n");
+            fprintf(fp, "    wire [%u:0] and_b_dom1_%u = ", (unsigned)(ow - 1U), (unsigned)oid);
+            emit_dom_sv_resized_rhs(fp, "dom1", b, max_in_st, p->vals[b].width, ow);
+            fprintf(fp, ";\n");
+            fprintf(fp, "    logic [%u:0] w_dom0_%u_s%u;\n", (unsigned)(ow - 1U), (unsigned)oid,
+                    (unsigned)st_out);
+            fprintf(fp, "    logic [%u:0] w_dom1_%u_s%u;\n", (unsigned)(ow - 1U), (unsigned)oid,
+                    (unsigned)st_out);
+            fprintf(fp,
+                    "    ele_dom_and_stage #(.W(%u)) u_dom_%u (\n"
+                    "        .clk_i(clk_i), .rst_ni(rst_ni),\n"
+                    "        .a0_i(and_a_dom0_%u), .a1_i(and_a_dom1_%u),\n"
+                    "        .b0_i(and_b_dom0_%u), .b1_i(and_b_dom1_%u),\n"
+                    "        .r_ref_i(r_ref_i[%u:%u]), .z_blind_i(z_blind_i[%u:%u]),\n"
+                    "        .q0_o(w_dom0_%u_s%u), .q1_o(w_dom1_%u_s%u)\n"
+                    "    );\n",
+                    (unsigned)ow, (unsigned)oid, (unsigned)oid, (unsigned)oid, (unsigned)oid,
+                    (unsigned)oid, (unsigned)mhi, (unsigned)mlo, (unsigned)mhi, (unsigned)mlo,
+                    (unsigned)oid, (unsigned)st_out, (unsigned)oid, (unsigned)st_out);
+        } else if (k == FLOW_IR_OP_CTRL_SEL) {
+            uint32_t sb = op->ins[0], vf = op->ins[1], vt = op->ins[2];
+            uint32_t mlo = g_ele_dom_ws.op_mask_off[i];
+            uint32_t mhi = mlo + (uint32_t)ow - 1U;
+            if (ow == 1U) {
+                fprintf(fp, "    wire [0:0] sel_rep_dom0_%u = w_dom0_%u_s%u[0:0];\n",
+                        (unsigned)oid, (unsigned)sb, (unsigned)max_in_st);
+                fprintf(fp, "    wire [0:0] sel_rep_dom1_%u = w_dom1_%u_s%u[0:0];\n",
+                        (unsigned)oid, (unsigned)sb, (unsigned)max_in_st);
+            } else {
+                fprintf(fp, "    wire [%u:0] sel_rep_dom0_%u = {%u{w_dom0_%u_s%u[0]}};\n",
+                        (unsigned)(ow - 1U), (unsigned)oid, (unsigned)ow, (unsigned)sb,
+                        (unsigned)max_in_st);
+                fprintf(fp, "    wire [%u:0] sel_rep_dom1_%u = {%u{w_dom1_%u_s%u[0]}};\n",
+                        (unsigned)(ow - 1U), (unsigned)oid, (unsigned)ow, (unsigned)sb,
+                        (unsigned)max_in_st);
+            }
+            fprintf(fp, "    wire [%u:0] sel_diff_dom0_%u = (", (unsigned)(ow - 1U), (unsigned)oid);
+            emit_dom_sv_resized_rhs(fp, "dom0", vf, max_in_st, p->vals[vf].width, ow);
+            fprintf(fp, ") ^ (");
+            emit_dom_sv_resized_rhs(fp, "dom0", vt, max_in_st, p->vals[vt].width, ow);
+            fprintf(fp, ");\n");
+            fprintf(fp, "    wire [%u:0] sel_diff_dom1_%u = (", (unsigned)(ow - 1U), (unsigned)oid);
+            emit_dom_sv_resized_rhs(fp, "dom1", vf, max_in_st, p->vals[vf].width, ow);
+            fprintf(fp, ") ^ (");
+            emit_dom_sv_resized_rhs(fp, "dom1", vt, max_in_st, p->vals[vt].width, ow);
+            fprintf(fp, ");\n");
+            fprintf(fp, "    logic [%u:0] sel_p_dom0_%u;\n", (unsigned)(ow - 1U), (unsigned)oid);
+            fprintf(fp, "    logic [%u:0] sel_p_dom1_%u;\n", (unsigned)(ow - 1U), (unsigned)oid);
+            fprintf(fp,
+                    "    ele_dom_and_stage #(.W(%u)) u_dom_%u (\n"
+                    "        .clk_i(clk_i), .rst_ni(rst_ni),\n"
+                    "        .a0_i(sel_rep_dom0_%u), .a1_i(sel_rep_dom1_%u),\n"
+                    "        .b0_i(sel_diff_dom0_%u), .b1_i(sel_diff_dom1_%u),\n"
+                    "        .r_ref_i(r_ref_i[%u:%u]), .z_blind_i(z_blind_i[%u:%u]),\n"
+                    "        .q0_o(sel_p_dom0_%u), .q1_o(sel_p_dom1_%u)\n"
+                    "    );\n",
+                    (unsigned)ow, (unsigned)oid, (unsigned)oid, (unsigned)oid, (unsigned)oid,
+                    (unsigned)oid, (unsigned)mhi, (unsigned)mlo, (unsigned)mhi, (unsigned)mlo,
+                    (unsigned)oid, (unsigned)oid);
+            ensure_dom_stage(fp, p, vf, st_out);
+            fprintf(fp, "    wire [%u:0] w_dom0_%u_s%u = sel_p_dom0_%u ^ (", (unsigned)(ow - 1U),
+                    (unsigned)oid, (unsigned)st_out, (unsigned)oid);
+            emit_dom_sv_resized_rhs(fp, "dom0", vf, st_out, p->vals[vf].width, ow);
+            fprintf(fp, ");\n");
+            fprintf(fp, "    wire [%u:0] w_dom1_%u_s%u = sel_p_dom1_%u ^ (", (unsigned)(ow - 1U),
+                    (unsigned)oid, (unsigned)st_out, (unsigned)oid);
+            emit_dom_sv_resized_rhs(fp, "dom1", vf, st_out, p->vals[vf].width, ow);
+            fprintf(fp, ");\n");
+        }
+        g_ele_dom_ws.max_emitted_stage[oid] = st_out;
+    }
+
+    for (uint32_t i = 0U; i < p->num_outputs; ++i) {
+        uint32_t vid = p->outputs[i];
+        ensure_dom_stage(fp, p, vid, total_lat);
+        fprintf(fp, "    assign %s_dom0_o = w_dom0_%u_s%u;\n", p->vals[vid].name, (unsigned)vid,
+                (unsigned)total_lat);
+        fprintf(fp, "    assign %s_dom1_o = w_dom1_%u_s%u;\n", p->vals[vid].name, (unsigned)vid,
+                (unsigned)total_lat);
+    }
+    fprintf(fp, "    /* verilator lint_on UNUSEDSIGNAL */\n");
+    fprintf(fp, "endmodule\n");
+    fprintf(fp, "/* verilator lint_on DECLFILENAME */\n");
+    fprintf(fp, "`default_nettype wire\n");
+    return true;
+}
+
 static int run_fir_synth_cmd(const char *fir_path, const char *sv_path,
                              const char *pdk_path, const char *gds_path,
-                             bool verify_fir) {
+                             bool verify_fir, bool dom_mask) {
     if (!flow_ir_load_file(&g_ele_fir_prog, fir_path, g_ele_fir_raw, sizeof(g_ele_fir_raw))) {
         fprintf(stderr, "FATAL: failed to load .fir morphism %s\n", fir_path);
         return 1;
@@ -3199,12 +3662,29 @@ static int run_fir_synth_cmd(const char *fir_path, const char *sv_path,
         return 1;
     }
 
+    flow_ir_dag_stats_t dag_st;
+    if (!flow_ir_analyze_dag(&g_ele_fir_prog, &dag_st)) {
+        fprintf(stderr, "FATAL: flow_ir_analyze_dag failed on %s\n", fir_path);
+        return 1;
+    }
+    printf("  [FLOW-FIR-DAG] mod=%s | ops=%u (affine=%u, non_affine=%u) mult_bits=%u mult_depth=%u\n",
+           g_ele_fir_prog.name, (unsigned)g_ele_fir_prog.num_ops,
+           (unsigned)dag_st.affine_ops, (unsigned)dag_st.non_affine_ops,
+           (unsigned)dag_st.mult_bits, (unsigned)dag_st.mult_depth);
+
     FILE *fp = fopen(sv_path, "w");
     if (!fp) {
         perror("fopen");
         return 1;
     }
-    emit_fir_sv(fp, &g_ele_fir_prog);
+    if (dom_mask) {
+        if (!emit_fir_dom_sv(fp, &g_ele_fir_prog)) {
+            fclose(fp);
+            return 1;
+        }
+    } else {
+        emit_fir_sv(fp, &g_ele_fir_prog);
+    }
     fclose(fp);
 
     if (verify_fir && g_ele_fir_prog.num_inputs <= FLOW_IR_MAX_IO &&
@@ -3399,7 +3879,7 @@ static int run_fab_verify(const char *build_dir) {
 static void usage(const char *prog) {
     fprintf(stderr,
             "Usage: %s [--dsp-count <1..6>] [--max-depth <18..64>] --fir <core.fir> -o <out.sv> [--pdk <pdk.flow> --gds-out <out.gds>]\n"
-            "       %s --fir-synth <in.fir> -o <out.sv> [--pdk <pdk.flow> --gds-out <out.gds>] [--verify-fir]\n"
+            "       %s --fir-synth <in.fir> -o <out.sv> [--pdk <pdk.flow> --gds-out <out.gds>] [--verify-fir] [--dom-mask]\n"
             "       %s --fab-verify <build_dir>\n",
             prog, prog, prog);
 }
@@ -3414,6 +3894,7 @@ int main(int argc, char **argv) {
     const char *fir_path     = NULL;
     const char *fir_synth_p  = NULL;
     bool        verify_fir   = false;
+    bool        dom_mask     = false;
 
     for (int i = 1; i < argc; ++i) {
         if (strcmp(argv[i], "--dsp-count") == 0 && i + 1 < argc) {
@@ -3434,6 +3915,8 @@ int main(int argc, char **argv) {
             fir_synth_p = argv[++i];
         } else if (strcmp(argv[i], "--verify-fir") == 0) {
             verify_fir = true;
+        } else if (strcmp(argv[i], "--dom-mask") == 0) {
+            dom_mask = true;
         } else {
             usage(argv[0]);
             return 1;
@@ -3449,7 +3932,7 @@ int main(int argc, char **argv) {
             usage(argv[0]);
             return 1;
         }
-        return run_fir_synth_cmd(fir_synth_p, out_path, pdk_path, gds_out_path, verify_fir);
+        return run_fir_synth_cmd(fir_synth_p, out_path, pdk_path, gds_out_path, verify_fir, dom_mask);
     }
 
     if (out_path == NULL || fir_path == NULL || dsp_count < 1 || dsp_count > 6 || max_depth < 18 || max_depth > 64) {
