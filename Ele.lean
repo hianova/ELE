@@ -1,11 +1,14 @@
 /-
-  ELE v8.0.0 — Pure Silicon Parameter Config (`import Flow`, 0 Custom Theorems)
+  ELE v8.0.0 — Pure Silicon Parameter Config (`Flow.Core`/`Schema`/`Morphism`/`Canonical`, 0 Custom Theorems)
   ===============================================================================
   SSOT compliance: all formal fiber-bundle/lattice/convex/ABI/Morphism theorems
   and compilers live in domain-free `../FLOW/{core,sdk}/lean/Flow/*.lean`.
   This file configures foundry `PdkSpec` values, `ele_pdk_abi`, and ELE circuits.
 -/
-import Flow
+import Flow.Core
+import Flow.Schema
+import Flow.Morphism
+import Flow.Canonical
 
 set_option maxRecDepth 8192
 
@@ -122,34 +125,6 @@ def flowCoreMorphism : Flow.Morphism.Graph :=
     (b.stagePipe sp.1 w sp.2.2.2.2.2.2.2 p0 (UInt64.ofNat sp.2.2.2.2.2.1) (UInt64.ofNat sp.2.2.2.2.2.2.1)).1) b0
   bFin.build [11, 20, 22, 33]
 
-def gf256SboxMacGraph : Flow.Morphism.Graph :=
-  let b := Flow.Morphism.Builder.init "gf256_sbox_mac" .linear true
-  let (b, a)     := b.input "a" 8
-  let (b, bv)    := b.input "b" 8
-  let (b, c)     := b.input "c" 8
-  let (b, sel)   := b.input "sel" 1
-  let (b, cst63) := b.constU64 "cst63" 8 0x63
-  let (b, invA)  := b.gf2mInv "inv_a" 8 a 0x11B
-  let (b, prod)  := b.gf2mMul "prod" 8 invA bv 0x11B
-  let (b, aff)   := b.xorVec "aff" 8 prod cst63
-  let (b, sum)   := b.add "sum" 8 c aff
-  let (b, y)     := b.ctrlSel "y" 8 sel prod sum
-  b.build [y]
-
-def gf256TowerSpecGraph : Flow.Morphism.Graph :=
-  let (b, a)   := (Flow.Morphism.Builder.init "gf256_tower_spec" .linear true).input "a" 8
-  let (b, inv) := b.gf2mQuadInv "q" 4 a 0x13 0x8
-  let (b, y)   := b.slice "y" 8 inv 0
-  b.build [y]
-
-def lut5BijectionSpecGraph : Flow.Morphism.Graph :=
-  let (b, x) := (Flow.Morphism.Builder.init "lut5_bijection_spec" .linear true).input "x" 5
-  let tbl : List UInt64 := [
-    0x04,0x0b,0x1f,0x14,0x1a,0x15,0x09,0x02,0x1b,0x05,0x08,0x12,0x1d,0x03,0x06,0x1c,
-    0x1e,0x13,0x07,0x0e,0x00,0x0d,0x11,0x18,0x10,0x0c,0x01,0x19,0x16,0x0a,0x0f,0x17 ]
-  let (b, y) := b.op .lut_rom "y" 5 [x] (lutWords := tbl)
-  b.build [y]
-
 def main (args : List String) : IO UInt32 := do
   let outDir : System.FilePath := match args with
     | d :: _ => System.FilePath.mk d
@@ -161,9 +136,9 @@ def main (args : List String) : IO UInt32 := do
       IO.eprintln s!"FATAL: PDK {m.name} failed PdkSpec.wf"
       return 1
   if !(← Flow.Morphism.emitFirChecked (outDir / "ele_core_ir.fir") flowCoreMorphism) then return 1
-  if !(← Flow.Morphism.emitFirChecked (outDir / "gf256_sbox_mac.fir") gf256SboxMacGraph) then return 1
-  if !(← Flow.Morphism.emitFirChecked (outDir / "gf256_tower_spec.fir") gf256TowerSpecGraph) then return 1
-  if !(← Flow.Morphism.emitFirChecked (outDir / "lut5_bijection_spec.fir") lut5BijectionSpecGraph) then return 1
+  if !(← Flow.Morphism.emitFirChecked (outDir / "gf256_sbox_mac.fir") Flow.Canonical.gf256SboxMac) then return 1
+  if !(← Flow.Morphism.emitFirChecked (outDir / "gf256_tower_spec.fir") Flow.Canonical.gf256TowerSpec) then return 1
+  if !(← Flow.Morphism.emitFirChecked (outDir / "lut5_bijection_spec.fir") Flow.Canonical.lut5BijectionSpec) then return 1
   IO.println s!"  [ELE-LEAN] Pure config emitted 3x .flow PDKs, ele_pdk_abi.h & 4x .fir graphs into {outDir} (0 local theorems)"
   return 0
 

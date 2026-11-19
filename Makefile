@@ -13,6 +13,7 @@ FLOW_DIR      := $(abspath ../FLOW)
 FLOW_H        := $(FLOW_DIR)/core/flow.h
 SEARU_H       := $(FLOW_DIR)/core/searu.h
 FLOW_OPT_H    := $(FLOW_DIR)/core/flow_opt_params.h
+FLOW_IR_WIRE_H := $(FLOW_DIR)/sdk/flow_ir_wire.h
 FLOW_IR_H     := $(FLOW_DIR)/sdk/flow_ir.h
 FLOW_IR_IO_H  := $(FLOW_DIR)/sdk/flow_ir_io.h
 FLOW_LEAN     := $(FLOW_DIR)/sdk/lean/Flow.lean
@@ -80,13 +81,13 @@ hygiene-gate: | $(BUILD_DIR)
 	fi
 	@ele_lines="$$(wc -l < Ele.lean | tr -d '[:space:]')"; \
 	if [ "$$ele_lines" -gt 200 ]; then echo "ERROR: Ele.lean exceeds 200 lines ($$ele_lines)" >&2; exit 1; fi
-	@test -f "$(FLOW_H)" && test -f "$(SEARU_H)" && test -f "$(FLOW_OPT_H)" && test -f "$(FLOW_IR_H)" && test -f "$(FLOW_IR_IO_H)" && test -f "$(FLOW_LEAN)"
+	@test -f "$(FLOW_H)" && test -f "$(SEARU_H)" && test -f "$(FLOW_OPT_H)" && test -f "$(FLOW_IR_WIRE_H)" && test -f "$(FLOW_IR_H)" && test -f "$(FLOW_IR_IO_H)" && test -f "$(FLOW_LEAN)"
 	@printf '#include "flow_ir.h"\nint flow_ir_cpp20_probe(void) { return (int)sizeof(flow_ir_prog_t); }\n' | \
 		$(CXX) -x c++ -std=c++20 -Wall -Wextra -Wpedantic -Werror -iquote "$(FLOW_DIR)/core" -iquote "$(FLOW_DIR)/sdk" -c - -o $(BUILD_DIR)/.cpp_ir_gate.o
 	@rm -f $(BUILD_DIR)/.cpp_ir_gate.o
 	@echo "  [PASS] Hygiene + Thin Ele.lean SSOT (<=200 lines, 0 theorems) + FLOW C++20 header cleanliness"
 
-$(BOOTSTRAP_OBJ): tools/ele_bootstrap.c tools/ele_fab.h $(FLOW_H) $(SEARU_H) $(FLOW_OPT_H) $(FLOW_IR_H) $(FLOW_IR_IO_H) $(PDK_ABI_H) | $(BUILD_DIR)
+$(BOOTSTRAP_OBJ): tools/ele_bootstrap.c tools/ele_fab.h $(FLOW_H) $(SEARU_H) $(FLOW_OPT_H) $(FLOW_IR_WIRE_H) $(FLOW_IR_H) $(FLOW_IR_IO_H) $(PDK_ABI_H) | $(BUILD_DIR)
 	@printf '#include "ele_fab.h"\nint ele_cpp20_abi_probe(void) { return (int)sizeof(ele_fab_pdk_t); }\n' | \
 		$(CXX) -x c++ -std=c++20 -Wall -Wextra -Wpedantic -Werror -iquote "$(FLOW_DIR)/core" -iquote "$(FLOW_DIR)/sdk" -I"$(BUILD_DIR)" -Itools -c - -o $(BUILD_DIR)/.cpp_gate.o
 	@rm -f $(BUILD_DIR)/.cpp_gate.o
@@ -102,7 +103,7 @@ $(BOOTSTRAP_BIN): $(BOOTSTRAP_OBJ)
 $(FLOW_OLEAN): $(FLOW_LEAN) $(FLOW_SUB_LEAN)
 	$(MAKE) -C "$(FLOW_DIR)" build/lean/Flow.olean
 
-$(FLOW_BIN): $(FLOW_H) $(SEARU_H) $(FLOW_OPT_H) $(FLOW_IR_H) $(FLOW_IR_IO_H) $(FLOW_DIR)/sdk/searu_mc_gf2.h $(FLOW_DIR)/sdk/flow_ir_synth.h $(FLOW_DIR)/sdk/flow_cli.c
+$(FLOW_BIN): $(FLOW_H) $(SEARU_H) $(FLOW_OPT_H) $(FLOW_IR_WIRE_H) $(FLOW_IR_H) $(FLOW_IR_IO_H) $(FLOW_DIR)/sdk/searu_mc_gf2.h $(FLOW_DIR)/sdk/flow_ir_synth.h $(FLOW_DIR)/sdk/flow_cli.c
 	$(MAKE) -C "$(FLOW_DIR)" build/flow
 
 $(ELE_OLEAN): Ele.lean $(FLOW_OLEAN) | $(BUILD_DIR)
@@ -166,10 +167,8 @@ bootstrap-gate: hygiene-gate lean-pdk-gate $(BOOTSTRAP_BIN)
 		'  printf("  [PASS] Unified gf256_sbox_mac.fir -> SV <-> Yosys Synth <-> Pure-GPR C <-> Verilator 1024-vec 0-ULP + DRC=0 GDSII\\n");' \
 		'  return 0;' \
 		'}' > $(BUILD_DIR)/gf256_cosim.cpp
-	@mkdir -p $(BUILD_DIR)/flow_c_inc
-	@cp "$(FLOW_H)" "$(FLOW_OPT_H)" "$(FLOW_IR_H)" "$(FLOW_IR_IO_H)" $(BUILD_DIR)/flow_c_inc/
 	$(VERILATOR) --cc --exe --build -j 0 -Wall --Mdir $(BUILD_DIR)/verilator_sbox --top-module gf256_sbox_mac \
-		-CFLAGS "-std=c++20 -I$(abspath $(BUILD_DIR)/flow_c_inc)" $(SBOX_SV) "$(abspath $(BUILD_DIR)/gf256_cosim.cpp)" -o Vgf256_sbox_mac
+		-CFLAGS "-std=c++20 -I$(FLOW_DIR)/core -I$(FLOW_DIR)/sdk" $(SBOX_SV) "$(abspath $(BUILD_DIR)/gf256_cosim.cpp)" -o Vgf256_sbox_mac
 	$(BUILD_DIR)/verilator_sbox/Vgf256_sbox_mac
 	./$(BOOTSTRAP_BIN) --fir-synth $(TOWER_SPEC_FIR) -o $(TOWER_SPEC_SV) --verify-fir
 	./$(BOOTSTRAP_BIN) --fir-synth $(TOWER_A32_FIR) -o $(TOWER_A32_SV) --verify-fir
@@ -279,7 +278,7 @@ bootstrap-gate: hygiene-gate lean-pdk-gate $(BOOTSTRAP_BIN)
 		'  return 0;' \
 		'}' > $(BUILD_DIR)/tower_d4_dom_cosim.cpp
 	$(VERILATOR) --cc --exe --build -j 0 -Wall --x-assign unique --x-initial unique --Mdir $(BUILD_DIR)/verilator_tower_dom --top-module gf256_tower_d4_dom \
-		-CFLAGS "-std=c++20 -I$(abspath $(BUILD_DIR)/flow_c_inc)" $(TOWER_D4_DOM_SV) "$(abspath $(BUILD_DIR)/tower_d4_dom_cosim.cpp)" -o Vgf256_tower_d4_dom
+		-CFLAGS "-std=c++20 -I$(FLOW_DIR)/core -I$(FLOW_DIR)/sdk" $(TOWER_D4_DOM_SV) "$(abspath $(BUILD_DIR)/tower_d4_dom_cosim.cpp)" -o Vgf256_tower_d4_dom
 	$(BUILD_DIR)/verilator_tower_dom/Vgf256_tower_d4_dom
 	@echo "  [PASS] Pure-GPR (0 heap/float/blr/FPU) Univalent RTL + .fir SV/GDSII + 3-PDK OPC/GDSII Sign-Off verified"
 
