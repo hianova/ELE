@@ -104,7 +104,7 @@ $(FLOW_OLEAN): $(FLOW_LEAN) $(FLOW_SUB_LEAN)
 	$(MAKE) -C "$(FLOW_DIR)" build/lean/Flow.olean
 
 $(FLOW_BIN): $(FLOW_H) $(SEARU_H) $(FLOW_OPT_H) $(FLOW_IR_WIRE_H) $(FLOW_IR_H) $(FLOW_IR_IO_H) $(FLOW_DIR)/sdk/searu_mc_gf2.h $(FLOW_DIR)/sdk/flow_ir_synth.h $(FLOW_DIR)/sdk/flow_cli.c
-	$(MAKE) -C "$(FLOW_DIR)" build/flow
+	$(MAKE) -C "$(FLOW_DIR)" CC="$(CC)" CXX="$(CXX)" build/flow
 
 $(ELE_OLEAN): Ele.lean $(FLOW_OLEAN) | $(BUILD_DIR)
 	LEAN_PATH="$(FLOW_OLEAN_DIR):$(BUILD_DIR)" $(LEAN) -DwarningAsError=true -o $@ Ele.lean
