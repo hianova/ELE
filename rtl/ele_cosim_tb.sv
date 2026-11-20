@@ -2854,7 +2854,7 @@ module ele_cosim_tb;
                 for (int w = 0; w < 8; w++) heal_st[w] = heal_out[w];
                 heal_rc = ele_dpi_searu_heal(heal_arena, 64'd15, heal_st, 64'sd0, target_x_q16,
                                              heal_seed, heal_ep, heal_chart_w);
-                if ((heal_rc != 8'd0) || (heal_ep != 32'd1)) begin
+                if ((heal_rc != 8'd0) || (heal_ep != 32'd1) || (heal_seed != 64'h0000_0000_0000_7777)) begin
                     $fatal(1, "FAIL [SEARU-HEAL]: moving state falsely triggered searu_heal_and_swap!");
                 end
 
@@ -2886,7 +2886,7 @@ module ele_cosim_tb;
                 // 3. Synthesize healed chart via `searu_heal_and_swap` (`searu.h`) & commit via live `CMD_SWAP`
                 heal_rc = ele_dpi_searu_heal(heal_arena, 64'd15, heal_st, 64'sd0, target_x_q16,
                                              heal_seed, heal_ep, heal_chart_w);
-                if ((heal_rc != 8'd1) || (heal_ep <= 32'd1)) begin
+                if ((heal_rc != 8'd1) || (heal_ep <= 32'd1) || (heal_seed == 64'h0000_0000_0000_7777)) begin
                     $fatal(1, "FAIL [SEARU-HEAL]: ele_dpi_searu_heal failed to heal barrier (rc=%0d, ep=%0d)!",
                            heal_rc, heal_ep);
                 end
@@ -4678,7 +4678,7 @@ module ele_cosim_tb;
                 if (!rtl_st[384] && (rtl_st[319:256] == 64'd0) && !healed_once) begin
                     heal_rc = ele_dpi_searu_heal(c_arena, 64'd3, c_st, 64'sd0, 64'sd241664,
                                                  heal_seed, heal_epoch, heal_chart);
-                    if (heal_rc != 8'd1) $fatal(1, "FAIL [GFM-SEARU]: heal failed at fault barrier!");
+                    if ((heal_rc != 8'd1) || (heal_seed == 64'h9E37_79B9_7F4A_7C15)) $fatal(1, "FAIL [GFM-SEARU]: heal failed at fault barrier!");
                     cand_healed = pack_cell(heal_chart[0], heal_chart[1], heal_chart[2], heal_chart[3],
                                             heal_chart[4], heal_chart[5], heal_chart[6], heal_chart[7]);
                     top_try_swap(8'd1, heal_epoch, cand_healed, sw_acc, sw_cyc);
