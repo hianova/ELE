@@ -1,0 +1,11 @@
+# ELE v9.0.0 Benchmark: 800V AI-Rack / EV Laminated Copper Busbar
+length_m = 0.20
+width_m = 0.04
+thickness_m = 0.002
+sep_m = 0.001
+er = 4.2
+sigma_s_m = 5.8e7
+f_start_hz = 1e6
+f_stop_hz = 1e8
+n_freq = 41
+z0_ohm = 50.0

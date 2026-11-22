@@ -1,9 +1,10 @@
 export PATH := $(HOME)/.elan/bin:/opt/homebrew/opt/llvm/bin:/opt/homebrew/bin:/usr/local/bin:$(PATH)
 
 YOSYS     ?= yosys
-VERILATOR ?= verilator
-CXX       ?= clang++
-PYTHON    ?= python3
+VERILATOR      ?= verilator
+CXX            ?= clang++
+PYTHON         ?= python3
+VERILATOR_JOBS ?= 2
 
 RTL_SRCS  := ../rtl/ele_primordial.sv ../rtl/ele_power_phy.sv ele_sscb800_ip.sv
 BUILD     := build
@@ -37,7 +38,7 @@ synth-fpga: | $(BUILD)
 	@$(PYTHON) gen_datasheet.py --parse-fpga $(BUILD)/ice40_synth.log $(BUILD)/xilinx_synth.log --fpga-out $(FPGA_TXT)
 
 $(SIM_BIN): $(RTL_SRCS) tb_sscb800_windtunnel.cpp | $(BUILD)
-	$(VERILATOR) --cc --exe --build -j 0 -Wall --x-assign unique --x-initial unique \
+	$(VERILATOR) --cc --exe --build -j $(VERILATOR_JOBS) -Wall --x-assign unique --x-initial unique \
 		--top-module ele_sscb800_ip -Mdir $(SIM_DIR) \
 		-CFLAGS "-std=c++20 -O2" \
 		$(RTL_SRCS) tb_sscb800_windtunnel.cpp

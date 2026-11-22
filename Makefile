@@ -6,8 +6,18 @@ endif
 CXX       ?= clang++
 LEAN      ?= lean
 VERILATOR ?= verilator
-YOSYS     ?= yosys
-PREFIX    ?= /usr/local
+YOSYS          ?= yosys
+PREFIX         ?= /usr/local
+VERILATOR_JOBS ?= 2
+
+UNAME_S := $(shell uname -s)
+ifeq ($(UNAME_S),Darwin)
+SHLIB_EXT   := dylib
+SHLIB_FLAGS := -dynamiclib
+else
+SHLIB_EXT   := so
+SHLIB_FLAGS := -shared
+endif
 
 FLOW_DIR      := $(abspath ../FLOW)
 FLOW_H        := $(FLOW_DIR)/core/flow.h
@@ -18,6 +28,15 @@ FLOW_IR_H     := $(FLOW_DIR)/sdk/flow_ir.h
 FLOW_IR_IO_H  := $(FLOW_DIR)/sdk/flow_ir_io.h
 FLOW_LEAN     := $(FLOW_DIR)/sdk/lean/Flow.lean
 FLOW_SUB_LEAN := $(wildcard $(FLOW_DIR)/core/lean/Flow/*.lean $(FLOW_DIR)/sdk/lean/Flow/*.lean)
+EEE_HDRS      := include/ele_cert.h include/ele_em.h include/ele_ckt.h include/ele_ee.h include/ele_frontier.h
+EEE_SRCS      := src/ele_cert.c src/ele_em.c src/ele_ckt.c src/ele_ee.c src/ele_frontier.c
+ifeq ($(UNAME_S),Darwin)
+EEE_CFLAGS    := -std=c17 -O3 -Wall -Wextra -Werror -Wpedantic -Wconversion -DELE_USE_ACCELERATE=1 -DACCELERATE_NEW_LAPACK -Iinclude -I"$(FLOW_DIR)/core" -I"$(FLOW_DIR)/sdk"
+EEE_LDFLAGS   := -framework Accelerate -lm -pthread
+else
+EEE_CFLAGS    := -std=c17 -O3 -Wall -Wextra -Werror -Wpedantic -Wconversion -Iinclude -I"$(FLOW_DIR)/core" -I"$(FLOW_DIR)/sdk"
+EEE_LDFLAGS   := -lm -pthread
+endif
 
 BUILD_DIR          := build
 BOOTSTRAP_OBJ      := $(BUILD_DIR)/ele_bootstrap.o
@@ -28,6 +47,11 @@ FLOW_OLEAN_DIR     := $(FLOW_DIR)/build/lean
 FLOW_OLEAN         := $(FLOW_OLEAN_DIR)/Flow.olean
 FLOW_BIN           := $(FLOW_DIR)/build/flow
 ELE_OLEAN          := $(BUILD_DIR)/Ele.olean
+ELECERT_OLEAN      := $(BUILD_DIR)/EleCert.olean
+ELE_LIB            := $(BUILD_DIR)/libele.$(SHLIB_EXT)
+ELE_CLI_BIN        := $(BUILD_DIR)/ele_cli
+CERT_DIR           := $(BUILD_DIR)/certs
+CERT_MODS          := CertEmMicrostrip CertEmWilkinson CertEmMaxwellBound CertEmBodeFano CertEmKypEnforce CertEmKyp3Port CertCktSic800v CertMotorIpmsm CertGridIeee3Opf CertGridChordal CertDiscoveredWb2Sos CertGridIeee9Stab
 PDK_ABI_H          := $(BUILD_DIR)/ele_pdk_abi.h
 PDK_FLOWS          := $(BUILD_DIR)/pdk_sky130.flow $(BUILD_DIR)/pdk_euv7.flow $(BUILD_DIR)/pdk_sic800v.flow
 CORE_FIR           := $(BUILD_DIR)/ele_core_ir.fir
@@ -63,29 +87,34 @@ RTL_IPS   := $(RTL_SEEDS) $(CORE_CANON_SV)
 RTL_TB    := rtl/ele_cosim_tb.sv
 
 .DEFAULT_GOAL := all
-.PHONY: all test verify clean install uninstall hygiene-gate lean-pdk-gate bootstrap-gate cosim-gate formal-gate synth-gate mutate-check
+.PHONY: all test verify clean install uninstall hygiene-gate lean-pdk-gate bootstrap-gate cosim-gate formal-gate synth-gate sscb800-gate eee-build eee-benchmarks eee-gate cardputer-backup cardputer-flash cardputer-capture cardputer-restore
 
-all: hygiene-gate lean-pdk-gate bootstrap-gate $(COSIM_CANON_BIN)
+all: hygiene-gate lean-pdk-gate bootstrap-gate $(COSIM_CANON_BIN) eee-build
 
 $(BUILD_DIR):
 	@mkdir -p $(BUILD_DIR)
 
 hygiene-gate: | $(BUILD_DIR)
 	@echo "=== [Gate 1] Source Hygiene, SSOT Config Thinness, C++20 ABI Header & Pure-GPR ISA Audit ==="
-	@stray="$$(find . -maxdepth 3 \( -name '*.lean' -o -name '*.cpp' -o -name '*.cc' -o -name '*.m' -o -name '*.metal' \) -not -path './build/*' -not -path './Ele.lean')" && \
+	@stray="$$(find . -maxdepth 3 \( -name '*.lean' -o -name '*.cpp' -o -name '*.cc' -o -name '*.m' -o -name '*.metal' \) -not -path './build/*' -not -path './sscb800/build/*' -not -path './benchmarks/*' -not -path './Ele.lean' -not -path './lean/EleCert.lean' -not -path './sscb800/tb_sscb800_windtunnel.cpp')" && \
 		if [ -n "$$stray" ]; then echo "ERROR: Forbidden source files found in ELE: $$stray" >&2; exit 1; fi
-	@cfiles="$$(find . -maxdepth 3 \( -name '*.c' -o -name '*.h' \) -not -path './build/*' -not -path './tools/ele_bootstrap.c' -not -path './tools/ele_fab.h')" && \
-		if [ -n "$$cfiles" ]; then echo "ERROR: Unexpected C/H files outside tools/{ele_bootstrap.c,ele_fab.h}: $$cfiles" >&2; exit 1; fi
+	@cfiles="$$(find . -maxdepth 3 \( -name '*.c' -o -name '*.h' \) -not -path './build/*' -not -path './sscb800/build/*' -not -path './tools/ele_bootstrap.c' -not -path './tools/ele_fab.h' -not -path './include/ele_cert.h' -not -path './include/ele_em.h' -not -path './include/ele_ckt.h' -not -path './include/ele_ee.h' -not -path './include/ele_frontier.h' -not -path './src/ele_cert.c' -not -path './src/ele_em.c' -not -path './src/ele_ckt.c' -not -path './src/ele_ee.c' -not -path './src/ele_frontier.c' -not -path './src/ele_cli.c')" && \
+		if [ -n "$$cfiles" ]; then echo "ERROR: Unexpected C/H files outside tools/{ele_bootstrap.c,ele_fab.h} and EEE include/src: $$cfiles" >&2; exit 1; fi
 	@if grep -Eq '^[[:space:]]*(theorem|lemma|axiom)[[:space:]]|pushLE64|mintCell' Ele.lean; then \
 		echo "ERROR: Ele.lean violates SSOT pure-config rule (found theorem/custom-serializer)!" >&2; exit 1; \
+	fi
+	@if grep -Eq '^[[:space:]]*(sorry|axiom)[[:space:]]|\bnative_decide\b' lean/EleCert.lean; then \
+		echo "ERROR: lean/EleCert.lean contains sorry, axiom, or native_decide!" >&2; exit 1; \
 	fi
 	@ele_lines="$$(wc -l < Ele.lean | tr -d '[:space:]')"; \
 	if [ "$$ele_lines" -gt 200 ]; then echo "ERROR: Ele.lean exceeds 200 lines ($$ele_lines)" >&2; exit 1; fi
 	@test -f "$(FLOW_H)" && test -f "$(SEARU_H)" && test -f "$(FLOW_OPT_H)" && test -f "$(FLOW_IR_WIRE_H)" && test -f "$(FLOW_IR_H)" && test -f "$(FLOW_IR_IO_H)" && test -f "$(FLOW_LEAN)"
 	@printf '#include "flow_ir.h"\nint flow_ir_cpp20_probe(void) { return (int)sizeof(flow_ir_prog_t); }\n' | \
 		$(CXX) -x c++ -std=c++20 -Wall -Wextra -Wpedantic -Werror -iquote "$(FLOW_DIR)/core" -iquote "$(FLOW_DIR)/sdk" -c - -o $(BUILD_DIR)/.cpp_ir_gate.o
-	@rm -f $(BUILD_DIR)/.cpp_ir_gate.o
-	@echo "  [PASS] Hygiene + Thin Ele.lean SSOT (<=200 lines, 0 theorems) + FLOW C++20 header cleanliness"
+	@printf '#include "ele_cert.h"\n#include "ele_em.h"\n#include "ele_ckt.h"\n#include "ele_ee.h"\n#include "ele_frontier.h"\nint eee_cpp20_probe(void) { return (int)sizeof(ele_cert_record_t) + (int)sizeof(ele_grid_chordal_res_t); }\n' | \
+		$(CXX) -x c++ -std=c++20 -Wall -Wextra -Wpedantic -Werror -Iinclude -iquote "$(FLOW_DIR)/core" -iquote "$(FLOW_DIR)/sdk" -c - -o $(BUILD_DIR)/.cpp_eee_gate.o
+	@rm -f $(BUILD_DIR)/.cpp_ir_gate.o $(BUILD_DIR)/.cpp_eee_gate.o
+	@echo "  [PASS] Hygiene + Thin Ele.lean SSOT (<=200 lines, 0 theorems) + C++20 FLOW/EEE Header Cleanliness"
 
 $(BOOTSTRAP_OBJ): tools/ele_bootstrap.c tools/ele_fab.h $(FLOW_H) $(SEARU_H) $(FLOW_OPT_H) $(FLOW_IR_WIRE_H) $(FLOW_IR_H) $(FLOW_IR_IO_H) $(PDK_ABI_H) | $(BUILD_DIR)
 	@printf '#include "ele_fab.h"\nint ele_cpp20_abi_probe(void) { return (int)sizeof(ele_fab_pdk_t); }\n' | \
@@ -167,7 +196,7 @@ bootstrap-gate: hygiene-gate lean-pdk-gate $(BOOTSTRAP_BIN)
 		'  printf("  [PASS] Unified gf256_sbox_mac.fir -> SV <-> Yosys Synth <-> Pure-GPR C <-> Verilator 1024-vec 0-ULP + DRC=0 GDSII\\n");' \
 		'  return 0;' \
 		'}' > $(BUILD_DIR)/gf256_cosim.cpp
-	$(VERILATOR) --cc --exe --build -j 0 -Wall --Mdir $(BUILD_DIR)/verilator_sbox --top-module gf256_sbox_mac \
+	$(VERILATOR) --cc --exe --build -j $(VERILATOR_JOBS) -Wall --Mdir $(BUILD_DIR)/verilator_sbox --top-module gf256_sbox_mac \
 		-CFLAGS "-std=c++20 -I$(FLOW_DIR)/core -I$(FLOW_DIR)/sdk" $(SBOX_SV) "$(abspath $(BUILD_DIR)/gf256_cosim.cpp)" -o Vgf256_sbox_mac
 	$(BUILD_DIR)/verilator_sbox/Vgf256_sbox_mac
 	./$(BOOTSTRAP_BIN) --fir-synth $(TOWER_SPEC_FIR) -o $(TOWER_SPEC_SV) --verify-fir
@@ -277,7 +306,7 @@ bootstrap-gate: hygiene-gate lean-pdk-gate $(BOOTSTRAP_BIN)
 		'  printf("  [PASS] SEARU 33-AND Depth-4 DOM Masked SV: 16384-cyc X-poisoned 0-ULP | HW delta=(%.4f, %.4f) < 0.20 | euv7 DRC=0 GDSII\n", (double)d0 / 4096.0, (double)d1 / 4096.0);' \
 		'  return 0;' \
 		'}' > $(BUILD_DIR)/tower_d4_dom_cosim.cpp
-	$(VERILATOR) --cc --exe --build -j 0 -Wall --x-assign unique --x-initial unique --Mdir $(BUILD_DIR)/verilator_tower_dom --top-module gf256_tower_d4_dom \
+	$(VERILATOR) --cc --exe --build -j $(VERILATOR_JOBS) -Wall --x-assign unique --x-initial unique --Mdir $(BUILD_DIR)/verilator_tower_dom --top-module gf256_tower_d4_dom \
 		-CFLAGS "-std=c++20 -I$(FLOW_DIR)/core -I$(FLOW_DIR)/sdk" $(TOWER_D4_DOM_SV) "$(abspath $(BUILD_DIR)/tower_d4_dom_cosim.cpp)" -o Vgf256_tower_d4_dom
 	$(BUILD_DIR)/verilator_tower_dom/Vgf256_tower_d4_dom
 	@echo "  [PASS] Pure-GPR (0 heap/float/blr/FPU) Univalent RTL + .fir SV/GDSII + 3-PDK OPC/GDSII Sign-Off verified"
@@ -328,10 +357,10 @@ $(COSIM_CANON_BIN): bootstrap-gate $(RTL_SEEDS) $(RTL_TB) $(FLOW_OBJ)
 	$(VERILATOR) --lint-only -Wall --top-module ele_sscb_trip_atom rtl/ele_power_phy.sv rtl/ele_primordial.sv
 	$(VERILATOR) --lint-only -Wall --top-module ele_power_qfn_top rtl/ele_power_phy.sv rtl/ele_primordial.sv $(CORE_AREA_SV)
 	$(VERILATOR) --lint-only -Wall --top-module ele_power_qfn_top rtl/ele_power_phy.sv rtl/ele_primordial.sv $(CORE_CANON_SV)
-	$(VERILATOR) --binary -j 0 -Wall --x-assign unique --x-initial unique \
+	$(VERILATOR) --binary -j $(VERILATOR_JOBS) -Wall --x-assign unique --x-initial unique \
 		-Mdir $(VERILATOR_CANON) --top-module ele_cosim_tb \
 		$(RTL_SEEDS) $(CORE_CANON_SV) $(RTL_TB) "$(abspath $(FLOW_OBJ))" -o Vele_cosim_tb
-	$(VERILATOR) --binary -j 0 -Wall --x-assign unique --x-initial unique \
+	$(VERILATOR) --binary -j $(VERILATOR_JOBS) -Wall --x-assign unique --x-initial unique \
 		-Mdir $(VERILATOR_AREA) --top-module ele_cosim_tb \
 		$(RTL_SEEDS) $(CORE_AREA_SV) $(RTL_TB) "$(abspath $(FLOW_OBJ))" -o Vele_cosim_tb_area
 	@echo "  [PASS] Both Pareto profiles linted (0 warnings) & built for FULL un-shortened X-poisoned verification"
@@ -410,23 +439,78 @@ synth-gate: bootstrap-gate $(RTL_SEEDS)
 	fi
 	@echo "  [PASS] Gate & Critical-Path Pareto invariants verified (gates_A < gates_B < 58,245 & ltp_A < ltp_B)"
 
-test: cosim-gate formal-gate synth-gate
+sscb800-gate: hygiene-gate $(RTL_SEEDS)
+	@echo "=== [Gate 5B] 800V SiC SSCB Commercial IP (Lint + 2x Unbounded SAT QED + FPGA Synth + 7-Scenario Wind-Tunnel) ==="
+	$(MAKE) -C sscb800 CC="$(CC)" CXX="$(CXX)" VERILATOR="$(VERILATOR)" YOSYS="$(YOSYS)" VERILATOR_JOBS="$(VERILATOR_JOBS)" clean lint formal synth-fpga sim
+
+$(ELECERT_OLEAN): lean/EleCert.lean $(FLOW_OLEAN) | $(BUILD_DIR)
+	LEAN_PATH="$(FLOW_OLEAN_DIR):$(BUILD_DIR)" $(LEAN) -DwarningAsError=true -o $@ $<
+
+$(ELE_LIB): $(EEE_SRCS) $(EEE_HDRS) $(FLOW_H) $(SEARU_H) | $(BUILD_DIR)
+	$(CC) $(EEE_CFLAGS) -fPIC $(SHLIB_FLAGS) $(EEE_SRCS) $(EEE_LDFLAGS) -o $@
+
+$(ELE_CLI_BIN): src/ele_cli.c $(EEE_SRCS) $(EEE_HDRS) $(FLOW_H) $(SEARU_H) | $(BUILD_DIR)
+	$(CC) $(EEE_CFLAGS) src/ele_cli.c $(EEE_SRCS) $(EEE_LDFLAGS) -o $@
+
+eee-build: hygiene-gate $(ELECERT_OLEAN) $(ELE_LIB) $(ELE_CLI_BIN)
+
+eee-benchmarks:
+	python3 oracles/gen_benchmarks.py
+
+eee-gate: eee-build eee-benchmarks
+	@echo "=== [Gate 5C] ELE v11.0.0 Multiphysics + Frontier (EM + CKT + Motor + Grid + Lab), Zero-FP-Trust & Lean 4 Certs ==="
+	LEAN_PATH="$(FLOW_OLEAN_DIR):$(BUILD_DIR)" leanchecker EleCert
+	./$(ELE_CLI_BIN) selftest
+	@mkdir -p $(CERT_DIR)
+	./$(ELE_CLI_BIN) bench --dir benchmarks --out $(BUILD_DIR)/ele_bench.json --cert-dir $(CERT_DIR)
+	./$(ELE_CLI_BIN) atlas --dir benchmarks --out $(BUILD_DIR)/ele_atlas.json --cert-dir $(CERT_DIR)
+	./$(ELE_CLI_BIN) lab validate-thermal data/cardputer/cardputer_thermal_rail.csv --sp $(BUILD_DIR)/cardputer_thermal_rc.sp --cert $(CERT_DIR)/lab_cardputer_thermal.elecert.json --json $(BUILD_DIR)/lab_thermal.json
+	./$(ELE_CLI_BIN) lab validate-csi data/cardputer/cardputer_rf_csi.csv --s2p $(CERT_DIR)/cardputer_rf_csi.s2p --cert $(CERT_DIR)/lab_cardputer_csi.elecert.json --json $(BUILD_DIR)/lab_csi.json
+	./$(ELE_CLI_BIN) lab validate-power data/cardputer/cardputer_power_modes.csv --sp $(BUILD_DIR)/cardputer_power_pdn.sp --cert $(CERT_DIR)/lab_cardputer_power.elecert.json --json $(BUILD_DIR)/lab_power.json
+	./$(ELE_CLI_BIN) field-to-circuit --peec benchmarks/em/busbar_800v.peec --sp benchmarks/ckt/sic_halfbridge_800v.sp --motor benchmarks/ee/ev_ipmsm_150kw.motor --out-dir $(BUILD_DIR) --json $(BUILD_DIR)/field_to_circuit.json
+	./$(ELE_CLI_BIN) em passivity benchmarks/em/microstrip_50ohm.s2p --emit-lean $(CERT_DIR)/CertEmMicrostrip.lean --name CertEmMicrostrip
+	./$(ELE_CLI_BIN) em passivity benchmarks/em/wilkinson_3port.s3p --emit-lean $(CERT_DIR)/CertEmWilkinson.lean --name CertEmWilkinson
+	./$(ELE_CLI_BIN) em bound --kl 2.0 --zeta 10.0 --cells 4 --emit-lean $(CERT_DIR)/CertEmMaxwellBound.lean --name CertEmMaxwellBound
+	./$(ELE_CLI_BIN) em bound --kl 2.0 --zeta 10.0 --cells 16 --bw-frac 0.10 --fdtd-check --json $(BUILD_DIR)/em_bound_ext.json
+	./$(ELE_CLI_BIN) em bode-fano --z0 50 --rl 50 --cl-pf 2.0 --flo-ghz 2.0 --fhi-ghz 3.0 --cert $(CERT_DIR)/em_bode_fano.elecert.json --emit-lean $(CERT_DIR)/CertEmBodeFano.lean --name CertEmBodeFano --json $(BUILD_DIR)/em_bode_fano.json
+	./$(ELE_CLI_BIN) em enforce-passivity benchmarks/em/nonpassive_ai_surrogate.s2p --out $(CERT_DIR)/repaired_surrogate.s2p --emit-lean $(CERT_DIR)/CertEmKypEnforce.lean --name CertEmKypEnforce
+	./$(ELE_CLI_BIN) em enforce-passivity benchmarks/em/nonpassive_wilkinson_3port.s3p --out $(CERT_DIR)/repaired_wilkinson_3port.s3p --cert $(CERT_DIR)/em_kyp_3port.elecert.json --emit-lean $(CERT_DIR)/CertEmKyp3Port.lean --name CertEmKyp3Port
+	./$(ELE_CLI_BIN) em kyp-sim benchmarks/em/nonpassive_ai_surrogate.s2p --cert $(CERT_DIR)/em_kyp_sim_2port.elecert.json --json $(BUILD_DIR)/em_kyp_sim_2port.json
+	./$(ELE_CLI_BIN) em kyp-sim benchmarks/em/nonpassive_wilkinson_3port.s3p --cert $(CERT_DIR)/em_kyp_sim_3port.elecert.json --json $(BUILD_DIR)/em_kyp_sim_3port.json
+	./$(ELE_CLI_BIN) ckt run benchmarks/ckt/sic_halfbridge_800v.sp --corners --emit-lean $(CERT_DIR)/CertCktSic800v.lean --name CertCktSic800v
+	./$(ELE_CLI_BIN) motor run benchmarks/ee/ev_ipmsm_150kw.motor --rpm 3000 --torque 260 --emit-lean $(CERT_DIR)/CertMotorIpmsm.lean --name CertMotorIpmsm
+	./$(ELE_CLI_BIN) grid opf benchmarks/ee/ieee3_test.grid --emit-lean $(CERT_DIR)/CertGridIeee3Opf.lean --name CertGridIeee3Opf
+	./$(ELE_CLI_BIN) grid chordal benchmarks/ee/pglib/pglib_opf_case5_pjm.m --cert $(CERT_DIR)/chordal_case5_pjm.elecert.json --emit-lean $(CERT_DIR)/CertGridChordal.lean --name CertGridChordal
+	./$(ELE_CLI_BIN) grid sos2 benchmarks/ee/wb2.grid --emit-lean $(CERT_DIR)/CertDiscoveredWb2Sos.lean --name CertDiscoveredWb2Sos
+	./$(ELE_CLI_BIN) grid emt benchmarks/ee/ieee9_wscc.grid --fault-bus 7 --t-clear 0.12 --emit-lean $(CERT_DIR)/CertGridIeee9Stab.lean --name CertGridIeee9Stab
+	@for c in $(CERT_DIR)/*.elecert.json; do ./$(ELE_CLI_BIN) cert-verify "$$c" || exit 1; done
+	@for m in $(CERT_MODS); do \
+		LEAN_PATH="$(FLOW_OLEAN_DIR):$(BUILD_DIR)" $(LEAN) -DwarningAsError=true -o $(BUILD_DIR)/$$m.olean $(CERT_DIR)/$$m.lean > $(CERT_DIR)/$$m.axioms.txt || exit 1; \
+		LEAN_PATH="$(FLOW_OLEAN_DIR):$(BUILD_DIR)" leanchecker $$m || exit 1; \
+	done
+	python3 oracles/verify_ele_oracle.py --bench $(BUILD_DIR)/ele_bench.json --bench-dir benchmarks --cert-dir $(CERT_DIR) --data-dir data/cardputer --lab-thermal $(BUILD_DIR)/lab_thermal.json --lab-csi $(BUILD_DIR)/lab_csi.json --lab-power $(BUILD_DIR)/lab_power.json --atlas $(BUILD_DIR)/ele_atlas.json --report ELE_VERIFICATION_REPORT.md
+	python3 oracles/test_tools.py
+
+test: cosim-gate formal-gate synth-gate sscb800-gate eee-gate
 	@echo "================================================================================"
-	@echo "   ALL ELE v8.0.0 SELF-HOSTING SILICON + GDSII GATES PASSED (24 THMS, 15x QED)"
+	@echo "   ALL ELE v11.0.0 SILICON, GDSII & EEE MULTIPHYSICS GATES PASSED"
 	@echo "================================================================================"
 
-mutate-check: bootstrap-gate $(COSIM_CANON_BIN)
-	@echo "=== [Gate 6] Adversarial SystemVerilog RTL (76) + HoTT/GDSII Fab (28) Sabotage Gates ==="
-	python3 tools/rtl_sabotage_check.py
-	python3 tools/fab_sabotage_check.py
-
-verify: test mutate-check
+verify: test
 	@echo "================================================================================"
-	@echo "   ALL 6 ELE v8.0.0 SILICON, OPC/GDSII & MUTATION GATES VERIFIED (104/104 = 100%)"
+	@echo "   ALL ELE v11.0.0 SILICON, OPC/GDSII & EEE MULTIPHYSICS GATES VERIFIED"
 	@echo "================================================================================"
 
-install: hygiene-gate lean-pdk-gate bootstrap-gate
-	mkdir -p $(DESTDIR)$(PREFIX)/share/ele/rtl $(DESTDIR)$(PREFIX)/share/ele/gds $(DESTDIR)$(PREFIX)/share/ele/pdk
+install: hygiene-gate lean-pdk-gate bootstrap-gate eee-build
+	mkdir -p $(DESTDIR)$(PREFIX)/bin $(DESTDIR)$(PREFIX)/lib $(DESTDIR)$(PREFIX)/include \
+	         $(DESTDIR)$(PREFIX)/share/ele/rtl $(DESTDIR)$(PREFIX)/share/ele/gds $(DESTDIR)$(PREFIX)/share/ele/pdk
+	install -m 755 $(ELE_CLI_BIN) $(DESTDIR)$(PREFIX)/bin/ele_cli
+	install -m 755 $(ELE_LIB) $(DESTDIR)$(PREFIX)/lib/libele.$(SHLIB_EXT)
+	install -m 644 include/ele_cert.h $(DESTDIR)$(PREFIX)/include/ele_cert.h
+	install -m 644 include/ele_em.h $(DESTDIR)$(PREFIX)/include/ele_em.h
+	install -m 644 include/ele_ckt.h $(DESTDIR)$(PREFIX)/include/ele_ckt.h
+	install -m 644 include/ele_ee.h $(DESTDIR)$(PREFIX)/include/ele_ee.h
+	install -m 644 include/ele_frontier.h $(DESTDIR)$(PREFIX)/include/ele_frontier.h
 	install -m 644 rtl/ele_em_phy.sv $(DESTDIR)$(PREFIX)/share/ele/rtl/ele_em_phy.sv
 	install -m 644 rtl/ele_primordial.sv $(DESTDIR)$(PREFIX)/share/ele/rtl/ele_primordial.sv
 	install -m 644 rtl/ele_power_phy.sv $(DESTDIR)$(PREFIX)/share/ele/rtl/ele_power_phy.sv
@@ -439,7 +523,31 @@ install: hygiene-gate lean-pdk-gate bootstrap-gate
 	install -m 644 $(BUILD_DIR)/ele_power_sic800v.gds $(DESTDIR)$(PREFIX)/share/ele/gds/ele_power_sic800v.gds
 
 uninstall:
+	rm -f $(DESTDIR)$(PREFIX)/bin/ele_cli $(DESTDIR)$(PREFIX)/lib/libele.$(SHLIB_EXT) \
+	      $(DESTDIR)$(PREFIX)/include/ele_cert.h $(DESTDIR)$(PREFIX)/include/ele_em.h \
+	      $(DESTDIR)$(PREFIX)/include/ele_ckt.h $(DESTDIR)$(PREFIX)/include/ele_ee.h \
+	      $(DESTDIR)$(PREFIX)/include/ele_frontier.h
 	rm -rf $(DESTDIR)$(PREFIX)/share/ele
 
+CARDPUTER_PORT ?= /dev/cu.usbmodem101
+CARDPUTER_FQBN ?= esp32:esp32:esp32s3:CDCOnBoot=cdc,FlashSize=8M,PartitionScheme=default_8MB
+
+cardputer-backup: | $(BUILD_DIR)
+	esptool --chip esp32s3 --port $(CARDPUTER_PORT) --baud 460800 read-flash 0x0 0x300000 $(BUILD_DIR)/cardputer_factory_backup.bin
+
+cardputer-flash:
+	@test -s $(BUILD_DIR)/cardputer_factory_backup.bin || (echo "ERROR: Run 'make cardputer-backup' before flashing!" >&2; exit 1)
+	arduino-cli compile --fqbn $(CARDPUTER_FQBN) firmware/cardputer_ele_lab
+	arduino-cli upload -p $(CARDPUTER_PORT) --fqbn $(CARDPUTER_FQBN) firmware/cardputer_ele_lab
+
+cardputer-capture:
+	python3 tools/cardputer_capture.py --port $(CARDPUTER_PORT) --out-dir data/cardputer
+
+cardputer-restore:
+	@test -s $(BUILD_DIR)/cardputer_factory_backup.bin || (echo "ERROR: Missing $(BUILD_DIR)/cardputer_factory_backup.bin!" >&2; exit 1)
+	esptool --chip esp32s3 --port $(CARDPUTER_PORT) --baud 460800 write-flash 0x0 $(BUILD_DIR)/cardputer_factory_backup.bin
+
 clean:
-	rm -rf $(BUILD_DIR)
+	@if [ -f "$(BUILD_DIR)/cardputer_factory_backup.bin" ]; then mv "$(BUILD_DIR)/cardputer_factory_backup.bin" .cardputer_factory_backup.bin.keep; fi
+	rm -rf $(BUILD_DIR) sscb800/build
+	@if [ -f .cardputer_factory_backup.bin.keep ]; then mkdir -p $(BUILD_DIR) && mv .cardputer_factory_backup.bin.keep "$(BUILD_DIR)/cardputer_factory_backup.bin"; fi

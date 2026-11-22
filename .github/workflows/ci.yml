@@ -46,17 +46,17 @@ jobs:
           fi
           echo "$HOME/.elan/bin" >> "$GITHUB_PATH"
 
-      - name: Install Clang, Verilator & Yosys (Linux)
+      - name: Install Clang, Verilator, Yosys & ngspice (Linux)
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y clang verilator yosys
+          sudo apt-get install -y clang verilator yosys ngspice
 
-      - name: Install Verilator & Yosys (macOS)
+      - name: Install Verilator, Yosys & ngspice (macOS)
         if: runner.os == 'macOS'
         run: |
-          brew install verilator yosys
+          brew install verilator yosys ngspice
 
-      - name: Run All ELE v8.0.0 Silicon, OPC/GDSII & Formal Sign-Off Gates
+      - name: Run All ELE v11.0.0 Silicon, OPC/GDSII, Formal & EEE Sign-Off Gates
         run: |
           make -C ELE clean && make -C ELE test

@@ -1,160 +1,155 @@
-# ELE v8.0.0 — Unified HoTT Front-End + Back-End Silicon Platform (`RTL` + `576B .flow PDK` + `.fir` $\to$ `GDSII v6.0`)
+# ELE v11.0.0 — Certified Multiphysics Electronics, Electrical Engineering & Electromagnetics Platform (`EM` + `CKT` + `EE` + `Silicon/Power IP`)
 
-**Self-Hosting `SEARU × FLOW` Symbiotic 2-Jet Silicon & Univalent Photomask Compiler (`Flow.lean` SSOT + pure-config `Ele.lean` + `tools/ele_bootstrap.c` + `tools/ele_fab.h` $\to$ Pure Synthesizable IEEE 1800 SystemVerilog + Verified Binary `.gds` GDSII v6.0): `FLOW v8.0.0` Lean 4 SSOT (`0 sorryAx`, auto-generated `ele_pdk_abi.h` with `0` bit-punning, `3× 576B` `.flow` PDK Atlases for `sky130` / `euv7` / `sic800v`, QTT `.fir` morphisms `ele_core_ir.fir` & `gf256_sbox_mac.fir`), Univalent Logic-to-Physical Co-Evolution (Proved `euv7` Repeater Split `146,724 ps -> 136,309 ps`), Abacus + 3-Layer Kan `RSMT` + `2-Jet` Optical Diffraction `OPC/ILT` (`<= 6 nm` EPE), 4-Tier Physical Hierarchy (`42`/`44`/`141`/`157`-Pin), `<0.7V` AI GPU VPD, `<1 µs` `800V DC` SiC SSCB, `1.20 p.u.` `GFM`, `ASIL-D` BMS, `12×` Yosys SAT `QED`, `0-ULP` Co-Sim, and `28 / 28` (`100.0%`) Fab/GDSII + `76 / 76` (`100.0%`) RTL Sabotage Audits.**
+**Certified Multiphysics Simulation, Lasserre/Chordal/Poynting/KYP Dual Certificates (`ELECERT-1.0` + `12×` Lean 4 `EleCert.lean` `E1–E20` incl. `E13b`), and Univalent Silicon/Power IP Compilation built on [`FLOW`](../FLOW/README.md):**
+
+- **Electromagnetics (`em`)**: 2D TMz Yee FDTD dielectric-slab waveguide (`cfl_ok = 1`, `fc = 9.3685 GHz`, `min S11 = -33.4698 dB`, `max S21 = -0.2607 dB`, `max_energy_sum = 0.980571`), 3D/2.5D PEEC laminated 800V busbar extractor (`L_loop = 12.87 nH`, `C_bus = 313.0 pF`, `R_ac/R_dc = 302.6x`), Touchstone `.sNp` I/O (`microstrip`, `wilkinson`), Zero-FP-Trust multi-port passivity & reciprocity certification + non-passive 2-port/3-port AI-surrogate vetoes (`nonpassive_ai_surrogate.s2p` `sigma_max = 1.0350`, `nonpassive_wilkinson_3port.s3p` `sigma_max = 1.0675`, `recip_err = 1.456e-2` $\to$ `VETOED`), **KYP Bounded-Real LMI Passivity Enforcement + Causal Tustin Closed-Loop Instability Contrast (`em enforce-passivity` + `em kyp-sim`: 2-port `1.0350 -> 0.9920` cuts passive-load blowup `1.120e+07 -> 1.27e-11`, 3-port `1.0675 -> 0.9920` cuts blowup `2.193e+08 -> 2.54e-06` with monotonic discrete Lyapunov decay, `CertEmKypEnforce` + `CertEmKyp3Port`)**, **Multi-Frequency Maxwell-Poynting Dual Bounds + Independent 2D TMz Yee FDTD Verification (`em bound --bw-frac 0.10 --fdtd-check`: `SEARU = 22.776 <= FDTD = 23.195 <= LocalCert = 23.767 <= Global = 33.686`)**, **Real `R || C` LC-Ladder Bode-Fano Closure (`em bode-fano`: `max |S11| = -15.57 dB >= BF = -43.43 dB`, `I/I_max = 0.4250`, `CertEmBodeFano`)**, and `SEARU × FLOW 2-Jet` phased-array & broadband matching synthesis.
+- **Electronics & Circuits (`ckt`)**: SPICE `.sp` netlist parser (`R, L, C, K, V, I, D, M, E, G, T`), `Gmin`-stepping + Newton-Raphson nonlinear DC (`Vd = 0.635491 V`, KCL residual `5.00e-15 A`), AC small-signal (`RC -3dB = 159.00 Hz`) & PDN impedance (`Z_max = 0.07435 Ohm < 0.25 Ohm`), energy-stable Trapezoidal transient + 5-corner PVT SOA enclosure (`800V` SiC half-bridge `wc = [677.78, 935.23] V` inside `[-20, 1150] V`), coupled RLGC PCB crosstalk & `SEARU` worst-case SI eye (`PDA = SEARU = 0.311102 V`).
+- **Electrical Engineering (`ee`)**: Nonlinear cross-saturated EV traction IPMSM (`ev_ipmsm_150kw.motor`, MTPA at `3000 rpm` `T = 260.00 Nm` `eff = 96.20%`, flux-weakening at `10000 rpm` `Id = -346.41 A` `eff = 97.85%`, `40 kHz` FOC + Lean 4 cert), Multi-bus Power Grid (`wb2/3/5`, `ieee3`, `ieee9`, `ieee14` + official IEEE PES PGLib-OPF v23.07 `case3_lmbd`, `case5_pjm`, `case14`, `case30` / `__api` / `__sad`, `case57`, `case118` MATPOWER `.m` sparse CSR `Y_bus`) Polar NR AC-PF (`<= 1.80e-12 p.u.`) + `N-1` screening, Certified Shor-1 AC-OPF, **Sparse Per-Clique Chordal Decomposition + Lean `E13b` (`grid chordal --emit-lean`: `case118_ieee` 109 cliques / `tw <= 4` gap `14.2958%`, `case30_ieee__api` `5.5488%`, `case14_ieee` `0.1349%`, standalone `CertGridChordal.lean` kernel-verified)**, **Clique-Sparse Lasserre Moment-SOS-2 Tightening (`grid sos2`: `wb2` `1.9485% -> 0.0727%`, `case3_lmbd` `0.5065% -> 0.1877%`, multi-gen `case5_pjm` `5.5581% -> 4.3025%` (`+$220.94/h`), Lean `E18` + `has_chordal: 1`)**, **Certified Grid Observable Envelopes (`grid observable`: `vm2` & `pflow`)**, and Kron-reduced / `1.200 p.u.` GFM EMT swing transient + PEBS Lyapunov margin.
+- **In-Process `ctypes` Discovery Engine (`EleFastSession`) & Reproducible Experiments (`experiments/`)**: Zero-reload persistent C grid session + 6 pure-stdlib discovery experiments ([ELE_DISCOVERY_REPORT.md](experiments/ELE_DISCOVERY_REPORT.md)).
+- **Real M5Stack Cardputer-Adv Hardware Lab (`lab`, `firmware/cardputer_ele_lab/`, `data/cardputer/`)**: Live USB CDC instrumentation on ESP32-S3 (`rev=2`, anonymized `mac_sha8=02c9b474`) capturing 2.4 GHz OFDM Wi-Fi CSI (`40` frames, `ch1` `2412 MHz`, `RSSI = -53.4 dBm`, `SNR = 43.6 dB`, `tau_rms = 99.1 ns`, certified passive `.s2p` `sigma_max = 0.10038`), silicon self-heating/cooling + rail droop (`N = 220`, `dT = +4.50 C`, `Rth = 6.14 K/W`, `tau = 1.24 s`, `droop = 1.4 mV`, Cauer SPICE transient `RMSE = 0.5209 C`), **5-mode ESP32-S3 DVFS/FPU/Wi-Fi Power & Causal Thevenin PDN SPICE Fit (`N = 240`, `80M_IDLE -> 240M_IDLE -> 240M_FPU -> 240M_WIFI -> 80M_RECOV`, `V_min = 4130 mV`, `dT_peak = +6.40 C`, `V_oc = 4.1489 V`, `R_pdn = 0.0200 Ohm`, `C_bulk = 0.70 F`, SPICE transient `RMSE = 8.582 mV <= 30 mV`, `CERTIFIED`)**, and calibrated 12-bit GPIO10/GPIO1 ADC/RC telemetry (`N = 200+40`).
+- **Cross-Pillar `field-to-circuit` Coupling**: PEEC busbar extraction (`12.87 nH`) $\to$ coupled SiC half-bridge Transient SOA (`[683.4, 932.4] V`, `PASS`) $\to$ DC-link-derated traction IPMSM envelope check (`4000 rpm`, `260 Nm`, `eff = 97.09%`).
+- **Preserved Silicon, Power IP & Univalent GDSII v6.0 Backends (`Ele.lean`, `rtl/`, `tools/`, `sscb800/`)**: Pure-config `Ele.lean` (`<= 200` lines, `0` theorems), 3× `576B` `.flow` PDKs (`sky130`, `euv7`, `sic800v`), 6 shared `.fir` graphs (byte-identical to `../QUA/qcc/build/`), `42`/`44`/`141`/`157`-pin RTL & `2-Jet` OPC/GDSII v6.0, 11-probe `0-ULP` Verilator wind-tunnel (`40,960` core vectors + `<0.7V` VPD + `200 ns` `800V` SiC SSCB + `1.20 p.u.` `GFM` + `ASIL-D` LFP BMS), and `12×` Yosys SAT `QED`.
 
 ---
 
-## Unified HoTT / `SEARU × FLOW 2-Jet` Logic-to-Lithography Architecture
+## Repository Boundaries Across Sibling Projects
 
-`ELE v8.0.0` eliminates both the front-end/back-end wall and downstream DSL duplication: SystemVerilog RTL, Abacus placement, 3-layer Manhattan Steiner routing (`M1`/`VIA12`/`M2`/`VIA23`/`M3`), IR-drop, `2-Jet` Inverse Lithography (`OPC/ILT`), and binary `.gds` photomasks compile from domain-free `Flow.Schema` ABI & `Flow.Morphism` (`.fir`) compilers governed by **[`FLOW v8.0.0`](../FLOW/sdk/lean/Flow.lean)**:
+| Repository | Scope & Responsibility | Explicit Non-Overlap with `ELE v11.0.0` |
+| :--- | :--- | :--- |
+| **`FLOW`** | Domain-free Lean 4 math (`Flow.Interval`, `Flow.Bundle`, `Flow.Schema`, `Flow.Morphism`), Pure-GPR `flow.h` / `searu.h`, `.fir` synthesizer | Provides math & optimizer primitives only; no EM/CKT/EE/Silicon physics |
+| **`ELE`** (**This Repo**) | **Applied Electronics (`ckt`), Electrical Engineering (`ee`), Electromagnetics (`em`), `field-to-circuit`, `EleCert` formal witnesses, and RTL/GDSII/Power silicon backends** | Does NOT duplicate `PHY`'s Lagrangian/gauge/QFT PDEs or `CHEM`'s DFT/MD |
+| **`PHY`** | Fundamental theoretical physics (analytical mechanics, electrodynamics covariance, SM/GR/CMT) | `ELE` owns applied engineering solvers (FDTD waveguide, PEEC, SPICE MNA, IPMSM, AC-OPF, grid EMT, VLSI/Power) |
+| **`CHEM`** | Computational chemistry & materials (`DFT`, `MD`, `SM` thermo) | Supplies material constants externally; `ELE` consumes macroscopic `sigma`, `er`, device/line parameters |
+| **`QUA`** | Quantum compiler & fault-tolerant circuits | Shares byte-identical SEARU-synthesized GF256/LUT5 `.fir` hardware primitives |
+
+---
+
+## Architecture Overview (`3 + 1` Pillars)
 
 ```text
-  FLOW v8.0.0 Pure-Math & SDK SSOT (../FLOW/core/{flow.h,searu.h,flow_opt_params.h,lean/Flow/*.lean},
-                                     ../FLOW/sdk/{flow_ir.h,flow_ir_io.h,searu_mc_gf2.h,flow_ir_synth.h,lean/Flow*.lean})
+  FLOW Pure-Math & Optimizer SSOT (../FLOW/core/{flow.h,searu.h,lean/Flow/Interval.lean}, ../FLOW/sdk/lean/Flow.lean)
         │
-        ├──► Ele.lean (Pure Silicon Parameter Config: <=200 lines, 0 theorems, 0 custom serialization)
-        │      • Configures PdkSpec (pdkSky130, pdkEuv7, pdkSic800v) + Flow.Morphism.Builder circuits
-        │      └──► Emits build/ele_pdk_abi.h + 3× 576B .flow PDKs + ele_core_ir.fir + gf256_sbox_mac.fir + tower/lut5 specs
+        ├──► Lean 4 Formal Verification Layer (lean/EleCert.lean — imports ONLY Flow.Interval, 0 sorryAx, 0 ofReduceBool)
+        │      • Core Algebra   : E1 sdd_quadratic_form_nonneg, E2 cholesky_sdd_certified_psd, E3 checkCholeskySDD_sound
+        │      • EM / CKT / EE  : E4–E12 passivity, FDTD, reciprocity, Tellegen, Trap, SOA/Eye, IPMSM, OPF, EMT
+        │      • Frontier E13–20: Chordal clique, thermal/angle dual, observable, Poynting bound, KYP, SOS-2, 3-cycle, Bode-Fano
         │
-        ├──► Build-Time Symbiotic HLS + Univalent Fab Compiler (tools/ele_bootstrap.c + tools/ele_fab.h)
-        │      • Pure-GPR C17 / C++20-clean (-mgeneral-regs-only -fno-jump-tables, 0 heap/float)
-        │      • Typed Schema ABI       : #include "ele_pdk_abi.h" (FNV-1a hash + bounds check, 0 bit-punning)
-        │      • Front-End HLS & .fir   : --fir core SSA retiming + --fir-synth linear .fir -> SV + 1024-vec Verilator
-        │      • Univalent Co-Evolution : Monotonic 2-Pass SEARU × FLOW 2-Jet repeater-insertion & placement
-        │      • Legalizer & Kan Router : Abacus row alignment + 3-layer Kan RSMT + Chart-2 IR-drop
-        │      • 2-Jet OPC & GDSII v6.0 : Local-ROI 2D aerial diffraction serifs + 1nm DBU Excess-64 .gds
-        │                                 + independent raw-byte GDSII DRC / 3D Union-Find LVS verifier
-        ▼
-  ELE v8.0.0 Synthesizable Silicon IPs, GDSII Photomasks & Verification Gates (Ele.lean, rtl/, tools/)
-  ├── rtl/ele_primordial.sv        : Primordial Physical Seed Atoms
-  │   ├── ele_mul33_atom           : Operand-isolated 33x33 -> 66 signed DSP slice (0 idle flips)
-  │   ├── ele_rad2_step_atom       : Unified 1-subtractor radix-2 slice shared by isqrt & udiv
-  │   └── ele_sram_1rw64           : True synchronous 1RW 64-bit Chart Arena SRAM ($mem_v2)
-  ├── rtl/ele_em_phy.sv            : Charge-Minimal Pad PHY, Ternary MAC & Manifold QFN-48 Top
-  │   ├── ele_bus_invert65         : 65-wire on-die Bus-Invert PHY (<= 32/65 flips + idle CSA isolation)
-  │   ├── ele_bus_invert17         : 17-wire narrow ASIC pad PHY (<= 8/17 SSO + idle CSA isolation)
-  │   ├── ele_ternary_mac_dualrail : Glitch-free dual monotonic rail 1.58b ternary MAC + negator gating
-  │   └── ele_flow_qfn_top         : Tier 3A — 42-pin 6x6 mm QFN-48 Charge-Minimal Manifold ASIC
-  ├── rtl/ele_power_phy.sv         : Switched-Power Actuators, 800V SiC SSCB & Power-QFN48 ASIC
-  │   ├── ele_dpwm_multiphase      : 4-phase 90-deg interleaved HR-DPWM, 4->1 phase shedding, >=1-cyc
-  │   │                              dead-time clamp (0 shoot-through k-inductive QED), 0-cyc fault_kill
-  │   ├── ele_sscb_trip_atom       : 800V DC SiC Solid-State Breaker (<1 us 2-Jet dI/dt + d^2I/dt^2
-  │   │                              concavity discriminator + adiabatic I^2*t fuse & 0-A re-arm latch)
-  │   └── ele_power_qfn_top        : Tier 3B — 44-pin QFN-48 Closed-Loop VPD + 800V SiC SSCB ASIC
-  │                                  (5-wire BI5 host link <= 2/5 SSO + dual 12b ADC + 0-cyc reflex)
-  ├── rtl/ele_flow_core.sv         : SEARU × FLOW Synthesized 64-Bit Streaming Engine & Atlas NoC Top
-  │   ├── ele_flow_core            : Tier 1 — 141-pin 0-ULP 512-bit 2-Jet manifold core macro
-  │   └── ele_flow_atlas_top       : Tier 2 — 157-pin 64b NoC macro + Bound-Cache + Shadow-SRAM @swap
-  ├── rtl/ele_cosim_tb.sv          : Full 11-probe dual-profile 0-ULP DPI-C wind-tunnel (VPD, SSCB,
-  │                                  GFM inverter, LFP BMS, QFN-48 BI17/BI5, 2^-120/2^-124, SEARU heal)
-  ├── tools/ele_fab.h              : Pure-GPR .flow PDK decoder, Univalent Fab compiler, 2-Jet OPC &
-  │                                  raw-byte GDSII v6.0 DRC + 3D Union-Find LVS checker
-  ├── tools/fab_sabotage_check.py  : 28-mutant parallel C17/Fab/DRC/LVS/OPC/GDSII sabotage gate (100%)
-  └── tools/rtl_sabotage_check.py  : 76-mutant parallel SV single-fault RTL sabotage gate (100%)
+        ├──► Pure ISO C17 EEE Library & CLI (include/ele_{cert,em,ckt,ee,frontier}.h, src/ele_{cert,em,ckt,ee,frontier,cli}.c)
+        │      • [1] Electromagnetics (`em`) : .sNp, Cholesky+SDD passivity/veto, KYP LMI repair, Maxwell-Poynting bound, FDTD, PEEC
+        │      • [2] Electronics (`ckt`)     : .sp parser, Gmin+NR DC, AC/PDN, Trap tran + 5-corner PVT SOA, RLGC + SEARU eye
+        │      • [3] Electrical Eng. (`ee`)  : Saturated IPMSM, Polar NR AC-PF, Shor-1, Chordal SDP, SOS-2 Newton, Observable, EMT
+        │      • Zero-FP-Trust JSON (`ELECERT-1.0` + `has_chordal: 1`) + FIPS-180-4 SHA-256 + Lean 4 Cert Emitter (`Cert*.lean`)
+        │
+        ├──► Independent Python Stdlib Oracle & SDK (oracles/{gen_benchmarks,ele_sdk,verify_ele_oracle,test_tools}.py)
+        │      • Pure stdlib (`0` numpy/scipy): EleEngine + ctypes EleFastSession + Int/Chordal SDD + Atlas Audit -> Report
+        │
+        └──► Preserved Silicon, Power IP & GDSII v6.0 Backend (Ele.lean <=200 lines, tools/{ele_bootstrap.c,ele_fab.h}, rtl/, sscb800/)
+               • Build artifacts kept 100% compatible: build/ele_bootstrap, build/pdk_*.flow, 6x *.fir, RTL/GDSII/SSCB800 gates
 ```
 
-### 4-Tier Physical Packaging & Pinout Hierarchy
+---
 
-| Hierarchy Tier | Module | Physical Pins | Target Integration & I/O Architecture |
+## Verified EEE Multiphysics & Lean 4 Certification Results (`ELE_VERIFICATION_REPORT.md`)
+
+All metrics below match live execution of `ele_cli bench` and independent pure-Python oracle audit in [ELE_VERIFICATION_REPORT.md](ELE_VERIFICATION_REPORT.md):
+
+| Pillar | Benchmark | Key Measured Engine Metric | Independent Oracle / Witness Status |
 | :--- | :--- | :--- | :--- |
-| **Tier 1 (Core Macro)** | `ele_flow_core` | **`141` pins** | Hardened 64-bit streaming 2-Jet manifold compute block (`0` SRAM) |
-| **Tier 2 (On-Die NoC)** | `ele_flow_atlas_top` | **`157` pins** | Wide 64-bit SoC/FPGA macro with `1× $mem_v2` 1RW SRAM + coherent bound cache + Shadow-SRAM `@swap` |
-| **Tier 3A (Manifold ASIC)** | `ele_flow_qfn_top` | **`42` pins** | **`6×6 mm` QFN-48 chip** (`42` signal + `6` VDD/VSS) with 17-wire BI17 Rx/Tx PHY (`<= 8/17` SSO) |
-| **Tier 3B (Power/SSCB ASIC)** | **`ele_power_qfn_top`** | **`44` pins** | **`6×6 mm` QFN-48 Digital Power & SiC Protection chip** (`ele_flow_atlas_top` + `ele_dpwm_multiphase` `301` cells / `32` DFFs + `ele_sscb_trip_atom` `2,730` cells / `74` DFFs + 5-wire BI5 `<= 2/5` SSO + 12b dual ADC + `SSCB -> DPWM` 0-cycle kill) |
+| **`em`** | `microstrip_50ohm.s2p` | `sigma_max = 0.979608`, `recip_err = 0.0`, `mu_cert = 403,203,116` | Oracle `sigma_max` residual `2.89e-11`, `CERTIFIED` |
+| **`em`** | `wilkinson_3port.s3p` | `sigma_max = 0.964712`, `recip_err = 0.0`, `mu_cert = 692,328,261` | Oracle `sigma_max` residual `1.20e-10`, `CERTIFIED` |
+| **`em`** | `nonpassive_ai_surrogate.s2p` | `sigma_max = 1.035000`, `passive = 0`, `mu_cert = -712,662,217` | Correctly **`VETOED`** (`0.00e+00` diff) |
+| **`em`** | `busbar_800v.peec` | `L_loop = 12.87 nH`, `C_bus = 313.0 pF`, `Rac/Rdc = 302.6x` | Synthesized `.s2p` `sigma_max = 0.99995`, `CERTIFIED` |
+| **`em`** | `fdtd_wg_slab` (2D TMz + PML) | `fc = 9.3685 GHz`, `minS11 = -33.47 dB`, `sum = 0.9806` | `cfl_ok = 1`, `fc` rel err `0.00e+00`, `CERTIFIED` |
+| **`em`** | `searu_phased_array` | `nom = -29.51 dB`, `wc_tol = -22.54 dB` (vs `-13.15 dB` unif.) | `9.38 dB` worst-case SLL suppression gain |
+| **`em`** | `searu_broadband_match` | `nom = -24.60 dB`, `wc_tol = -16.34 dB` (vs `-6.02 dB` raw) | `10.32 dB` worst-case matching gain |
+| **`ckt`** | `rc_lowpass.sp` | `fc = 158.996 Hz`, `v(RC) = 0.63027 V` | Analytic `159.155 Hz` / `0.63212 V` (`2.92e-3` rel err) |
+| **`ckt`** | `rlc_pdn.sp` | `Zmax = 0.07435 Ohm` at `8.62 MHz` | Strictly below `0.25 Ohm` mask (`pdn_pass = 1`) |
+| **`ckt`** | `diode_rectifier.sp` | `Vd = 0.635491 V`, KCL residual `5.00e-15 A` | Shockley NR `2.82e-10 V`; `ngspice 47` `0.635540 V` (`4.89e-05 V`) |
+| **`ckt`** | `rc_lowpass.sp` / `rlc_pdn.sp` vs `ngspice 47` | `fc = 159.00 Hz`, `Zmax = 0.07435 Ohm` | `ngspice 47`: `159.16 Hz` (`2.92e-03`), `0.07440 Ohm` (`5.02e-05 Ohm`) |
+| **`ckt`** | `sic_halfbridge_800v.sp` | 5-corner PVT SOA `wc = [677.78, 935.23] V` | Strictly inside `[-20, 1150] V` (`214.77 V` margin), `CERTIFIED` |
+| **`ckt`** | `diff_pair_si.sp` | Coupled 8-section RLGC eye `PDA = SEARU = 0.3111 V` | Explicit worst-case pattern matches PDA (`0.00e+00` diff) |
+| **`ee`** | `ev_ipmsm_150kw.motor` | `3krpm`: `260.00 Nm` (`eff=96.20%`); `10krpm FW`: `eff=97.85%`; `40kHz FOC` | Torque oracle residual `4.44e-07 Nm`, `CERTIFIED` |
+| **`ee`** | `ieee3 / ieee9 / ieee14` AC-PF | Polar NR mismatch `2.94e-15` / `1.69e-14` / `1.06e-14 p.u.` | Complex `Y_bus` KCL oracle: `5.83e-15` / `3.60e-14` / `2.28e-14 pu` |
+| **`ee`** | PGLib `case14 / case30 / case57 / case118` AC-PF | Sparse CSR `mis`: `9.53e-15` / `1.47e-14` / `1.80e-12` / `6.15e-14 pu` | Complex `Y_bus` KCL oracle: `<= 1.80e-12 pu` across all 4 grids |
+| **`ee`** | `ieee3_test.grid` AC-OPF | Certified bracket `[3269.80, 3270.32] $/h` (`mu_psd = -932,007`) | **Gap = `0.0161%`** (`< 1%`), `CERTIFIED` |
+| **`ee`** | `ieee9_wscc.grid` AC-OPF | Certified bracket `[5292.84, 5297.58] $/h` (`mu_psd = -48,968,474`) | **Gap = `0.0895%`** (`< 5%`), `CERTIFIED` |
+| **`ee`** | PGLib `case14 / case30` AC-OPF | `case14`: `[2126.62, 2356.04] $/h`; `case30`: `[4206.21, 8288.42] $/h` | `case14` gap `9.7373%`; `case30` congested `C_LB <= C_UB`, `CERTIFIED` |
+| **`ee`** | `ieee9_wscc.grid` EMT + GFM | `V_post = 0.4272 < V_crit = 0.7033`, `CCT = 0.2140 s`, `Igfm = 1.200 pu` | PEBS Lyapunov basin verified, `CERTIFIED` |
+| **`lab`** | Cardputer `cardputer_thermal_rail.csv` | `N=220`, `dT=4.50 C`, `Rth=6.14 K/W`, `tau=1.24 s`, `droop=1.4 mV` | `ESP32-S3 rev=2 id=02c9b474`, Cauer SPICE `RMSE=0.5209 C`, `CERTIFIED` |
+| **`lab`** | Cardputer `cardputer_rf_csi.csv` | `40` frames `ch1` (`2412 MHz`), `RSSI=-53.4 dBm`, `tau_rms=99.1 ns` | Synthesized `.s2p` `sigma_max=0.10038`, `recip=0.0e+00`, `CERTIFIED` |
+| **`lab`** | Cardputer `cardputer_gpio_rc_adc.csv` | `GPIO10 = 4150.5 +- 8.7 mV` (`200` samp), `GPIO1 = 3160 mV` (`40` samp) | Manifest SHA-256 + privacy check verified (`PASS`) |
+
+### Standalone Lean 4 Kernel Certificates (`leanchecker` Verified, `0 sorryAx`, `0 Lean.ofReduceBool`)
+
+| Module | Certified Theorems (from [EleCert.lean](lean/EleCert.lean)) | Verified Axiom Dependencies |
+| :--- | :--- | :--- |
+| `CertEmMicrostrip` | `passivity_psd_sound`, `multiport_passivity_certified`, `reciprocity_certified` | `[propext, Classical.choice, Quot.sound]` / `[propext, Quot.sound]` |
+| `CertEmWilkinson` | `passivity_psd_sound`, `multiport_passivity_certified`, `reciprocity_certified` | `[propext, Classical.choice, Quot.sound]` / `[propext, Quot.sound]` |
+| `CertEmMaxwellBound` | `maxwell_psd_sound`, `maxwell_poynting_bound_certified` | `[propext, Classical.choice, Quot.sound]` |
+| `CertEmBodeFano` | `bode_fano_match_certified` | `[propext, Classical.choice, Quot.sound]` |
+| `CertEmKypEnforce` | `kyp_passivity_certified` | `[propext, Classical.choice, Quot.sound]` |
+| `CertEmKyp3Port` | `kyp_passivity_certified` | `[propext, Classical.choice, Quot.sound]` |
+| `CertCktSic800v` | `soa_corner_certified` | `[propext, Classical.choice, Quot.sound]` |
+| `CertMotorIpmsm` | `ipmsm_certified` | **No axioms (`0` axioms)** |
+| `CertGridIeee3Opf` | `ac_opf_psd_sound`, `ac_opf_bracket_certified` | `[propext, Classical.choice, Quot.sound]` |
+| `CertGridChordal` | `grid_chordal_certified` (`E13b`) | `[propext, Classical.choice, Quot.sound]` |
+| `CertDiscoveredWb2Sos` | `sos2_psd_sound`, `sos2_hierarchy_certified` | `[propext, Classical.choice, Quot.sound]` |
+| `CertGridIeee9Stab` | `grid_stability_certified` | `[propext, Classical.choice, Quot.sound]` |
+
+See [experiments/ELE_DISCOVERY_REPORT.md](experiments/ELE_DISCOVERY_REPORT.md) for full v11.0.0 discovery sweeps across all 11 power grids (`wb2/3/5`, `case3_lmbd`, `case5_pjm`, `case14`, `case30/__api/__sad`, `case57`, `case118`), `EleFastSession` `Vmax`/`Smax` bifurcation sweeps, 2D FDTD vs Maxwell-Poynting + `R||C` Bode-Fano closure, 2-port/3-port Tustin transient KYP contrast, and live ESP32-S3 Cardputer-Adv power/PDN SPICE validation.
 
 ---
 
-## Measured Silicon Audit (`Yosys 0.70` + `ABC` + `ltp -noff`)
+## Preserved Silicon, Power IP & GDSII v6.0 Signoff (`v8.0.0` Hardware Backend)
 
-| Metric | Legacy Hand-Written SV | **Profile A (`--dsp-count 1 --max-depth 22`)** | **Profile B (`--dsp-count 3 --max-depth 36`, Canonical)** |
-| :--- | :--- | :--- | :--- |
-| **Physical Pins (`qfn` / `pwr_qfn` / `core` / `atlas`)** | `2,761` / — / `2,226` / `2,761` | **`42` / `44` / `141` / `157` (QFN-48)** | **`42` / `44` / `141` / `157` (QFN-48)** |
-| **Chart Arena Storage (`1RW SRAM`)** | `8,192` loose DFFs | **`1× $mem_v2` 1RW 64b SRAM (`0` steady reads on cache hit)** | **`1× $mem_v2` 1RW 64b SRAM (`0` steady reads on cache hit)** |
-| **External Pad SSO Noise (`flow_qfn` / `pwr_qfn`)** | Unbounded `100%` flips | **`<= 8/17` (`-20.6%`) / `<= 2/5` (`-63.8%`)** | **`<= 8/17` (`-22.7%`) / `<= 2/5` (`-63.8%`)** |
-| **DSP / Radix-2 Hardware** | `1× 65×65` + 2 subtractors | `1× 33×33` DSP + `1×` Radix-2 (`K_rad=1`) | `3× 33×33` DSP + `2×` Radix-2 (`K_rad=2`) |
-| **Pipeline-Cut Bits (`VIRTUAL -> SHARED`)** | Unshared (`2,459` / `933` bits) | **`429` bits (`-82.6%` SEARU colored, `955b` mux)** | **`262` bits (`-71.9%` SEARU colored, `33` uniq DSP ops)** |
-| **Internal Core Datapath DFF Bits** | Unshared (`> 2,500` bits) | **`925` bits (`-97` reclaimed DFFs)** | **`756` bits (`-97` reclaimed DFFs)** |
-| **Flattened Core CMOS Cells (`ele_flow_core`)** | `58,245` cells | **`33,277` cells (`-42.9%` vs legacy)** | **`47,954` cells (`-17.7%` vs legacy)** |
-| **Power & Protection Atom Area** | None | **`301` cells (`ele_dpwm_multiphase`) + `2,730` cells (`ele_sscb_trip_atom`)** | **`301` cells (`ele_dpwm_multiphase`) + `2,730` cells (`ele_sscb_trip_atom`)** |
-| **Critical Path (`ltp -noff`)** | Unbounded `65×65` cone | **`237` CMOS gate levels (`-40.2%` vs Profile B)** | **`396` CMOS gate levels** |
-| **Step Latency (`quad / lin / idle`)** | `143 / 70 / 4` cyc | `155 / 83 / 8` cyc (`20` idle flips, **`-99.2%`**) | **`73 / 38 / 3` cyc (`10` idle flips, **`-98.9%`**)** |
+Every hardware artifact, simulation harness, and formal proof from `v8.0.0` remains 100% intact and green inside `make test` and `make verify`:
 
----
+- **4-Tier Physical RTL Hierarchy (`rtl/`)**: `ele_flow_core` (`141` pins: `33,277` cells / `237` lvls Profile A; `47,954` cells / `396` lvls canonical Profile B), `ele_flow_atlas_top` (`157` pins + `1× $mem_v2` 1RW SRAM), `ele_flow_qfn_top` (`42`-pin QFN-48, BI17 `<= 8/17`), `ele_power_qfn_top` (`44`-pin QFN-48 + `ele_dpwm_multiphase` `301` cells + `ele_sscb_trip_atom` `2,730` cells + BI5 `<= 2/5`).
+- **`576B` `.flow` PDKs & Univalent `2-Jet` OPC/GDSII v6.0 (`Ele.lean` + `tools/ele_fab.h`)**: `pdk_sky130.flow` (`124,086 B` GDS, `11,253 ps`, `0` DRC / `0` LVS), `pdk_euv7.flow` (`126,774 B` GDS, `2` repeaters cutting critical path `146,724 -> 136,309 ps`), `pdk_sic800v.flow` (`124,150 B` GDS, `4,971 ps`), plus 6 `.fir` graphs byte-identical to `../QUA/qcc/build/`.
+- **11-Probe `0-ULP` Verilator Wind-Tunnel (`rtl/ele_cosim_tb.sv`) & `sscb800/`**: `40,960` core `0-ULP` vectors, `<0.7V` 4-phase GPU VPD (`49.6 mV` undershoot saving `43.2%` MLCC vs PID), `800V DC` SiC SSCB (`200 ns` short trip, `0` hot-swap false trips), `1.20 p.u.` `GFM` ride-through (`max |I| = 1.198 p.u.`, `4 ms` resync vs `satSEP`), and `ASIL-D` LFP BMS (`0.00%` SoC secular drift).
+- **Formal & Oracle Assurance**: `12×` Yosys unbounded `k`-induction SAT `QED`, `12×` Lean 4 `leanchecker` certificates (`0 sorryAx`, `0 Lean.ofReduceBool`), `ELECERT-1.0` + `has_chordal: 1` `__int128` SHA-256 witnesses, pure-stdlib independent physics oracle + optional `ngspice 47` cross-check + atlas audit ([verify_ele_oracle.py](oracles/verify_ele_oracle.py)), and `EleEngine` + `EleFastSession` SDK & `12/12` certificate tamper-rejection tests ([test_tools.py](oracles/test_tools.py)).
 
-## Unified HoTT Front-End + Back-End Fab Signoff ([`Flow.lean`](../FLOW/sdk/lean/Flow.lean) + [`Ele.lean`](Ele.lean) $\to$ `576B .flow` + `.fir` $\to$ `GDSII v6.0`)
+### Real M5Stack Cardputer-Adv Hardware Workflow & Factory Restore
 
-[`core/lean/Flow/`](../FLOW/core/lean/Flow/) & [`sdk/lean/Flow/`](../FLOW/sdk/lean/Flow/) serve as the sole domain-free Lean 4 SSOT (`0 sorryAx`, `-DwarningAsError=true`) certifying midpoint-split quadratic reduction (`Flow.Bundle`), constructive lattice clearance / snap-grid / box geometry (`Flow.Interval`), `Flow.Schema` (`ele_pdk_abi.h`), QTT `.fir` morphism graphs (`Flow.Morphism`), and shared canonical `.linear` specs (`Flow.Canonical`). Thin [`Ele.lean`](Ele.lean) (`0` local theorems) configures `pdkSky130`, `pdkEuv7`, and `pdkSic800v` into `3× 576B` `.flow` Atlases + `ele_core_ir.fir` + single-source `Flow.Canonical` (`gf256_sbox_mac.fir`, `gf256_tower_spec.fir`, `lut5_bijection_spec.fir`), consumed by [`tools/ele_fab.h`](tools/ele_fab.h) & [`tools/ele_bootstrap.c`](tools/ele_bootstrap.c):
+The factory firmware image is backed up at `build/cardputer_factory_backup.bin` (`3,145,728` bytes, preserved automatically across `make clean`):
 
-| Process Atlas (`576B .flow`) | GDSII Hash & Size | Polygons | Repeaters | Crit Path | Wirelength | Max IR-Drop | `2-Jet` OPC EPE | Binary DRC / LVS |
-| :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
-| **`sky130`** (`pdk_sky130.flow`) | `0x7B2A077904419EFE` (`124,086 B`) | `1,908` | `0` | `11,253 ps` | `6,364 µm` | `49 mV` | `42 -> 2 nm` (`104` serifs) | **`0` DRC / `0`-open / `0`-short** |
-| **`euv7`** (`pdk_euv7.flow`) | `0x709DF7462226CE05` (`126,774 B`) | `1,950` | **`2`** | `136,309 ps` | `671 µm` | `43 mV` | `3 -> 1 nm` (`108` serifs) | **`0` DRC / `0`-open / `0`-short** |
-| **`sic800v`** (`pdk_sic800v.flow`) | `0xA19E0DE21B3540C3` (`124,150 B`) | `1,909` | `0` | `4,971 ps` | `20,416 µm` | `67 mV` | `46 -> 6 nm` (`104` serifs) | **`0` DRC / `0`-open / `0`-short** |
+```sh
+# Flash custom ELE lab firmware, capture real measurements into data/cardputer/, and validate
+make cardputer-flash
+make cardputer-capture
+./build/ele_cli lab validate-thermal data/cardputer/cardputer_thermal_rail.csv --sp build/cardputer_thermal_rc.sp --cert build/lab_thermal.elecert.json
+./build/ele_cli lab validate-csi data/cardputer/cardputer_rf_csi.csv --s2p build/cardputer_rf_csi.s2p --cert build/lab_csi.elecert.json
+./build/ele_cli lab validate-power data/cardputer/cardputer_power_modes.csv --sp build/cardputer_power_pdn.sp --cert build/lab_power.elecert.json
 
-- **Machine-Checked Univalent Split Ablation (`euv7`)**: Locked front-end (`reps = 0`) traps placement/routing at `crit = 146,724 ps` (`E = 587,894`), whereas Univalent HoTT Co-Evolution inserts `2` repeaters across the front-end/back-end boundary to achieve **`crit = 136,309 ps` (`E = 546,331`, both delay & closure improved)**.
-- **Shared Cross-Domain `.fir` Projection (`gf256_sbox_mac.fir`)**: Byte-identical to `../QUA/qcc/build/gf256_sbox_mac.fir`, compiled via `--fir-synth` into Verilator `0-ULP` SV (`1,024`-vector lockstep vs Pure-GPR `flow_ir_eval_u64`), latch-free Yosys netlist, and `124,022 B` `sky130` GDSII (`DRC=0, LVS=0`).
-- **SEARU `.fir` Multiplicative-Complexity & 1st-Order DOM Masking (`gf256_tower_*`, `lut5_bijection_opt`)**: Compresses `gf256_tower_spec.fir` (`96` ANDs, depth `5`, `122` Yosys cells) via `FLOW fir-synth` into `gf256_tower_a32.fir` (`32` ANDs, depth `5`, `124` cells, DOM `10` cyc / `32` masks) and `gf256_tower_d4.fir` (`33` ANDs, depth `4`, `121` cells, `gf256_tower_d4_dom` `1,097` cells at `DOM_LATENCY_CYC=8` / `DOM_MASK_BITS=33`, `16,384`-cyc X-poisoned `0-ULP` + HW $\Delta=(0.0085, 0.0164) < 0.20$ + `euv7` `DRC=0` GDSII), plus `lut5_bijection_spec.fir` (`25` ANDs, depth `5`) $\to$ `lut5_bijection_opt_dom.sv` (`5` ANDs, depth `1`, `DOM_LATENCY_CYC=2` / `DOM_MASK_BITS=5`).
-
----
-
-## Dual-Profile 11-Probe Wind-Tunnel, `12×` Formal `QED` & `100.0%` Dual Sabotage Gate
-
-**Both** Area Profile A (`--dsp-count 1 --max-depth 22`) and Canonical Profile B (`--dsp-count 3 --max-depth 36`) execute the **100% full, un-shortened** 11-probe X-poisoned co-simulation suite (`Verilator 5.054` `-Wall --x-assign unique --x-initial unique`, zero smoke shortcuts):
-
-### High-Leverage Electricity Domains (Probes 9–11)
-
-- **Probe 9 (`44`-Pin `ele_power_qfn_top` — AI GPU `<0.7V` 4-Phase VPD Transient & `800V DC` SiC SSCB)**:
-  - **9A (`<0.7V` VPD `1,500 A/µs` GPU Load Slam `80A <-> 1,080A`, `4` Coupled Phases `L_ph=12 nH, C_out=18 mF`)**:
-    - **Canonical Profile B**: **`ELE` undershoot `49.6 mV` / overshoot `90.8 mV`** (Schmitt `1 <-> 4` phase boost, `0` light-load phase-2 switches) vs Digital Type-III PID **`87.5 mV` / `455.5 mV`** — **`43.2%` (`7,776 µF`) equivalent MLCC output capacitance saved**!
-    - **Area Profile A**: **`ELE` undershoot `55.1 mV` / overshoot `88.3 mV`** vs PID **`87.5 mV` / `455.5 mV`** — **`37.0%` (`6,660 µF`) equivalent MLCC saved**!
-    - Verified continuously on every `2 ns` tick: `0` shoot-through events, `0` dead-time violations, `90°` quadrature phase interleaving, 0-cycle `fault_kill_i`, and `max_tx5_flips = 2 / 5` (`<= 2`, `-63.8%` wire toggles: `34` vs `94`).
-  - **9B (`800V DC` SiC Solid-State Circuit Breaker)**:
-    - **Bolted Short-Circuit (`200 A/µs`)**: Trips in **`200 ns` (`0.20 µs`)** via 2-Jet $dI/dt + d^2I/dt^2$ discriminator (`I_peak = 140 A` vs `972 A` `900 A + 400 ns` baseline, **`> 10×` lower $\int I^2 dt$ let-through energy**) AND simultaneously shuts off VRM DrMOS gates in **0 clock cycles**.
-    - **Capacitive Hot-Swap Inrush (`560V -> 800V` RC/RLC Precharge)**: Concave $d^2I/dt^2 < 0$ rollover rides through with **`0` false trips** (vs `1` false trip on fixed-$dI/dt$ comparator).
-    - Verified zero-current re-arm interlock (`sscb_clr_i` rejected under live current `50 A`, accepted at `0 A`), adiabatic $\int I^2 dt$ overload trip (`cause = 3'b100`), and `0`-cycle hard-OCP trip (`cause = 3'b001`).
-
-- **Probe 10 (Grid-Forming `GFM` Inverter `1.20 p.u.` Saturation & `satSEP` Anti-Lock-In Ride-Through)**:
-  - Deep `0.15 p.u.` grid sag + `-32°` phase jump over `150 ms` on `ele_flow_atlas_top` (`0-ULP` 512-bit lockstep vs `flow_step_atlas` across all `140` EMT steps):
-  - Triggers live `searu_heal_and_swap` (`ele_dpi_searu_heal`) + hardware `CMD_SWAP` on $\Delta < 0$ grid-strength bifurcation, holds **`max |I| = 1.198 p.u.` (`<= 1.200 p.u.`)** across fault + clearance, and resynchronizes in **`4 ms` (`0.065°` final error)** with strictly bounded EMT hardware WCET (`5..81` cyc on Profile B, `10..163` cyc on Profile A).
-  - Conventional Clamped-PI baseline overshoots to `1.500 p.u.` transient current and locks irreversibly into **`satSEP` (`168.323°` final angle error)**.
-
-- **Probe 11 (ISO 26262 `ASIL-D` LFP `LiFePO4` `32 mV` Hysteresis & Lossless $2^{-49}$ BMS Observer)**:
-  - `1,024` sub-LSB dynamic EV drive/regen micro-pulses over `ele_flow_atlas_top` (`0-ULP` C17 lockstep): **`0.00%` SoC secular drift (`0` sub-LSB bits lost)** vs **`1.92%` SoC drift** on naive truncated Coulomb counter and **`14.08%` SoC error** on hysteresis-blind plateau EKF (`0.35 mV/%` plateau fooled by `±16 mV` hysteresis).
-  - Verified **`2` chatter-free Schmitt Charge <-> Discharge branch transitions** and **`16 / 16` `KanLock` EMI glitch rejections**.
-
-### Foundational Silicon, Formal `12× QED` & Adversarial Sabotage Gates (Probes 1–8, Gates 4–6)
-
-- **Probe 1 (`0-ULP` 512-Bit Differential)**: `20,480 / 20,480` vectors on Profile B + `20,480 / 20,480` vectors on Profile A (`40,960` total) bit-identical across `w0..w7` (`0` defects).
-- **Probe 2 (Gauge Parity & $2^{-49}$ Fiber)**: `1,024` odd-mirror pairs (`0` asymmetries) + `2,048`-gen autonomous fiber (`0-ULP` drift).
-- **Probe 3 (`ele_sram_1rw64` Atlas, Coherent Cache & `@swap` Firewall)**: Hardware `cap_mask` slot clamping, `10` adversarial `@swap` firewall rejections, Shadow-SRAM `@swap` commit, and active-slot `bound_cache` invalidation.
-- **Probe 4 (CMOS Switching-Energy Telemetry)**: `-99.2%` (Profile A) / `-98.9%` (Profile B) idle-vs-active core DFF flips (`20` / `10` idle flips), `ele_bus_invert65` (`-14.7%`), and `ele_ternary_mac_dualrail` (`-8.2%` + zero-skip).
-- **Probe 5 (Analytical $2^{-120}$ / $2^{-124}$ Cross-Limb Knife-Edges)**: `3,688` multipole knife-edges + `12` exact boundary cliffs = `3,700` vectors/profile (`0-ULP`).
-- **Probe 6 (`SEARU` Crucible + Live `searu_heal_and_swap`)**: `4,096` closed-loop steps + `256` `@swap` firewall checks + live $\Delta < 0$ hardware barrier healing (`CONVERGED = 1, x = 241,664`).
-- **Probe 7 (FSM Bubble Chaos, Busy Hammering & Mid-Flight `rst_n` Recovery)**: `0..17`-cycle bubbles, hostile busy writes across `ele_flow_core` & `ele_flow_atlas_top`, and exhaustive cycle-by-cycle `rst_n` abort/recovery.
-- **Probe 8 (`42`-Pin `ele_flow_qfn_top` Lockstep & `ele_bus_invert17`)**: `256` multi-chart steps + `32` `@swap` checks at `0-ULP`, capping pad SSO at `<= 8 / 17` wires (`-22.7%` Profile B / `-20.6%` Profile A).
-- **Gate 4 — `12×` Yosys Formal SAT / Unbounded k-Induction `QED` (`make formal-gate`)**:
-  All `9` original manifold/PHY proofs (`ele_bus_invert65`, `ele_bus_invert17`, `ele_ternary_mac_dualrail`, `ele_mul33_atom`, `ele_rad2_step_atom`, `ele_flow_core (dsp=3)`, `ele_flow_core (dsp=1)`, `ele_flow_atlas_top`, `ele_flow_qfn_top`) PLUS **`3` new power/protection unbounded `k`-induction proofs**:
-  - `ele_dpwm_multiphase` (unconditional `0` shoot-through, `>= 1`-cycle dead-time separation, `0`-cycle `fault_kill_i`, shed phase High-Z)
-  - `ele_sscb_trip_atom` (`0`-cycle hard OCP, concave hot-swap ride-through, sticky trip latch under live current, monotonic saturating $\int I^2 dt$)
-  - `ele_power_qfn_top` (`44`-pin QFN-48 reset safety, pin-level `0` shoot-through, `SSCB -> DPWM` 0-cycle reflex, busy write-ignore, `<= 2/5` BI5 SSO ceiling)
-- **Gate 6 — Dual Adversarial Sabotage Audit (`make mutate-check` / `make verify`, `104 / 104 = 100.0%`)**:
-  - [`tools/rtl_sabotage_check.py`](tools/rtl_sabotage_check.py): Injects **`76`** stratified single-fault SV mutations (`8` phy/qfn + `12` power/sscb + `10` primordial + `46` core/top), verifying unique match, clean Verilator compilation, and dynamic runtime kill: **`76 / 76 = 100.0%` (`0` survivors)**.
-  - [`tools/fab_sabotage_check.py`](tools/fab_sabotage_check.py): Injects **`28`** single-fault C17/Fab mutations across `5` categories (`6` `drc_pitch_width_grid` + `6` `lvs_open_short_pad` + `6` `univalent_coevolution` + `5` `litho_2jet_opc` + `5` `gdsii_binary_framing`): **`28 / 28 = 100.0%` (`0` survivors)**.
+# Restore M5Stack Cardputer-Adv back to original factory firmware
+make cardputer-restore
+# Or directly with esptool:
+esptool --chip esp32s3 --port /dev/cu.usbmodem101 --baud 460800 write-flash 0x0 build/cardputer_factory_backup.bin
+```
 
 ---
 
 ## Quick Start
 
-Requires sibling [`FLOW v8.0.0`](../FLOW/README.md) (`../FLOW`), Lean 4 (`lean` / `elan`), a C17/C++20 compiler (`clang`/`gcc`), `verilator` ($\ge 5.0$), `yosys`, and `python3`:
+Requires sibling [`FLOW`](../FLOW/README.md) (`../FLOW`), Lean 4 (`lean` / `leanchecker` / `elan`), a C17/C++20 compiler (`clang`/`gcc`), `verilator` ($\ge 5.0$), `yosys`, and `python3` (stdlib only):
 
 ```sh
-# Lean 4 SSOT PDK + ABI + .fir emission (Flow.lean + Ele.lean -> build/{ele_pdk_abi.h,pdk_*.flow,*.fir})
-make clean && make lean-pdk-gate
+# Build the EEE multiphysics CLI/SDK, Lean EleCert kernel, and hardware bootstrap
+make clean && make eee-build
 
-# Fast 5-gate sign-off (Hygiene/SSOT, Lean PDK/ABI, 3-PDK GDSII + .fir Silicon/Verilator, 11-Probe Co-Sim, 12x SAT QED, QFN Audit)
+# Run the EEE multiphysics gate alone (selftest + bench + field-to-circuit + 6x Lean4 certs + Oracle + SDK/tamper tests)
+make eee-gate
+
+# Use the CLI or Python SDK directly
+./build/ele_cli selftest
+./build/ele_cli field-to-circuit --peec benchmarks/em/busbar_800v.peec \
+  --sp benchmarks/ckt/sic_halfbridge_800v.sp --motor benchmarks/ee/ev_ipmsm_150kw.motor
+python3 -c 'from oracles.ele_sdk import EleEngine; print(EleEngine().grid_opf("benchmarks/ee/ieee3_test.grid"))'
+
+# Run ALL silicon + GDSII + SSCB800 + EEE verification gates
 make clean && make test
 
-# Full 6-gate sign-off including 76 RTL + 28 Fab/GDSII parallel sabotage kill-rate audits (104/104 = 100.0%)
+# Run ALL silicon, GDSII, SSCB800 & EEE verification gates
 make clean && make verify
 ```
 

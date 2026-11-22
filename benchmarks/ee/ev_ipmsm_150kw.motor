@@ -1,0 +1,17 @@
+# ELE v9.0.0 Benchmark: 800V 150kW EV Traction IPMSM (Cross-Saturated + 85C)
+poles = 8
+rs_ohm = 0.018
+ld0_h = 0.00018
+lq0_h = 0.00042
+psi_pm0_wb = 0.145
+sat_d = 1.2e-6
+sat_q = 2.8e-6
+sat_cross = 0.8e-6
+alpha_pm = -0.0012
+i_max_a = 400.0
+v_dc_v = 800.0
+j_kgm2 = 0.045
+b_viscous = 0.015
+k_core = 0.0012
+temp_c = 85.0
+rpm_max = 14000.0

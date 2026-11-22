@@ -1,0 +1,31 @@
+{
+  "experiment": "exp6_cardputer_power_pdn",
+  "board": "M5Stack Cardputer-Adv",
+  "chip": "ESP32-S3",
+  "mac_sha8": "02c9b474",
+  "csv_sha256": "742b8e3d2c78ef8d04c4a781587bd53f60ec5fd95460bb96e8f8f0663cfc3986",
+  "pdn_validation": {
+    "n_samples": 240,
+    "v_80_idle_mv": 4148.05,
+    "v_240_idle_mv": 4147.7,
+    "v_240_fpu_mv": 4148.383,
+    "v_240_wifi_mv": 4147.217,
+    "v_80_recov_mv": 4149.95,
+    "t_80_idle_c": 26.9,
+    "t_240_idle_c": 27.425,
+    "t_240_fpu_c": 28.7,
+    "t_240_wifi_c": 32.45,
+    "t_80_recov_c": 30.15,
+    "min_v_mv": 4130.0,
+    "max_v_mv": 4158.0,
+    "max_droop_mv": 0.833,
+    "delta_t_c": 6.4,
+    "v_oc_v": 4.14885,
+    "r_pdn_ohm": 0.02,
+    "c_bulk_f": 0.700002,
+    "tau_pdn_s": 0.014,
+    "analytic_rmse_mv": 8.577629,
+    "spice_rmse_mv": 8.581782,
+    "status": "CERTIFIED"
+  }
+}

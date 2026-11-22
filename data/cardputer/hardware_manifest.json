@@ -1,0 +1,23 @@
+{
+  "board": "M5Stack Cardputer-Adv",
+  "chip": "ESP32-S3",
+  "rev": "2",
+  "cpu_mhz": 240,
+  "mac_sha8": "02c9b474",
+  "captured_utc": "2026-11-21T22:58:31.797737+00:00",
+  "counts": {
+    "scan_aps": 16,
+    "csi_frames": 40,
+    "thermal_samples": 220,
+    "adc_samples": 200,
+    "rc_samples": 40,
+    "grove_i2c_devices": 0,
+    "power_samples": 240
+  },
+  "files": {
+    "cardputer_rf_csi.csv": "a2d5684a0cc00bbc85c408d3ce7beb6e24341b5c8c763a79fe8037d7ee6bf070",
+    "cardputer_thermal_rail.csv": "6c3bd15c5b72545865a4baf513059f802b21209467b5f002af69ae217ee9173d",
+    "cardputer_gpio_rc_adc.csv": "24aa702002674614213a7d3cb0338a78037cf40ee6837f20c4aff6937be8c22a",
+    "cardputer_power_modes.csv": "742b8e3d2c78ef8d04c4a781587bd53f60ec5fd95460bb96e8f8f0663cfc3986"
+  }
+}
