@@ -1,7 +1,7 @@
 /-
   EleCert — Formal Zero-FP-Trust Verification Layer for ELE v10.0.0
   ==================================================================
-  Imports ONLY `Flow.Interval` (domain-free, zero IO, zero `sorryAx`,
+  Imports `Flow.CholeskySDD` and `Flow.Interval` (domain-free, zero IO, zero `sorryAx`,
   zero `Lean.ofReduceBool`) to certify across all three EEE pillars:
     - Core Linear Algebra:
       E1  `sdd_quadratic_form_nonneg`
@@ -28,31 +28,32 @@
       E18 `moment_sos_hierarchy_exactness` & `certified_sos2_lower_bound`
       E19 `cycle_phase_rank_obstruction`
 -/
+import Flow.CholeskySDD
 import Flow.Interval
 
 namespace EleCert
 
 open Flow.Interval
 
-/-! ## 0. Self-Contained Exact Integer Summation & Linear Algebra -/
+export Flow.FiniteSum (absInt absInt_nonneg int_sq_nonneg sumFin sumFin_congr sumFin_zero
+  sumFin_zero_eq sumFin_succ sumFin_nonneg sumFin_add sumFin_sub sumFin_neg sumFin_const
+  sumFin_swap sumFin_single_hit sumFin_add_split sumFin_le_sumFin sumFin_split_at)
+export Flow.CholeskySDD (vecNormSq vecNormSq_nonneg matQuad gramLLt IsSDD
+  sdd_quadratic_form_nonneg gramLLt_psd cholesky_sdd_certified_psd matAt triAt
+  allFinB allFinB_true checkCholeskySDD checkCholeskySDD_sound)
 
-def absInt (x : Int) : Int :=
-  if x < 0 then -x else x
+theorem sumFin_mul_left (n : Nat) (c : Int) (f : Fin n → Int) :
+    c * sumFin n f = sumFin n (fun i => c * f i) :=
+  (Flow.FiniteSum.sumFin_mul_left n c f).symm
+
+theorem sumFin_mul_right (n : Nat) (f : Fin n → Int) (c : Int) :
+    sumFin n f * c = sumFin n (fun i => f i * c) :=
+  (Flow.FiniteSum.sumFin_mul_right n f c).symm
+
+/-! ## 1. Vector Norms, Quadratic Forms & Integer Cholesky + SDD (`Flow.CholeskySDD` + `negPart`) -/
 
 def negPart (x : Int) : Int :=
   if x < 0 then x else 0
-
-theorem absInt_nonneg (x : Int) : 0 ≤ absInt x := by
-  unfold absInt
-  split <;> omega
-
-theorem int_sq_nonneg (x : Int) : 0 ≤ x * x := by
-  by_cases hx : 0 ≤ x
-  · exact Int.mul_nonneg hx hx
-  · have hnx : 0 ≤ -x := by omega
-    have hsq : (-x) * (-x) = x * x := Int.neg_mul_neg x x
-    rw [← hsq]
-    exact Int.mul_nonneg hnx hnx
 
 theorem negPart_le (x : Int) : negPart x ≤ x := by
   unfold negPart
@@ -61,460 +62,6 @@ theorem negPart_le (x : Int) : negPart x ≤ x := by
 theorem negPart_nonpos (x : Int) : negPart x ≤ 0 := by
   unfold negPart
   split <;> omega
-
-def sumFin : (n : Nat) → (Fin n → Int) → Int
-  | 0, _ => 0
-  | n + 1, f => sumFin n (fun i => f i.castSucc) + f ⟨n, Nat.lt_succ_self n⟩
-
-theorem sumFin_congr {n : Nat} {f g : Fin n → Int} (h : ∀ i, f i = g i) :
-    sumFin n f = sumFin n g := by
-  induction n with
-  | zero => rfl
-  | succ k ih =>
-    simp only [sumFin]
-    have ih1 : sumFin k (fun i => f i.castSucc) = sumFin k (fun i => g i.castSucc) :=
-      ih (fun i => h i.castSucc)
-    rw [ih1, h ⟨k, Nat.lt_succ_self k⟩]
-
-theorem sumFin_zero (n : Nat) : sumFin n (fun _ => 0) = 0 := by
-  induction n with
-  | zero => rfl
-  | succ k ih => simp only [sumFin, ih]; omega
-
-theorem sumFin_nonneg (n : Nat) (f : Fin n → Int) (h : ∀ i, 0 ≤ f i) :
-    0 ≤ sumFin n f := by
-  induction n with
-  | zero => simp [sumFin]
-  | succ k ih =>
-    simp only [sumFin]
-    have h1 := ih (fun i => f i.castSucc) (fun i => h i.castSucc)
-    have h2 := h ⟨k, Nat.lt_succ_self k⟩
-    omega
-
-theorem sumFin_add (n : Nat) (f g : Fin n → Int) :
-    sumFin n (fun i => f i + g i) = sumFin n f + sumFin n g := by
-  induction n with
-  | zero => simp [sumFin]
-  | succ k ih =>
-    simp only [sumFin]
-    rw [ih (fun i => f i.castSucc) (fun i => g i.castSucc)]
-    omega
-
-theorem sumFin_sub (n : Nat) (f g : Fin n → Int) :
-    sumFin n (fun i => f i - g i) = sumFin n f - sumFin n g := by
-  induction n with
-  | zero => simp [sumFin]
-  | succ k ih =>
-    simp only [sumFin]
-    rw [ih (fun i => f i.castSucc) (fun i => g i.castSucc)]
-    omega
-
-theorem sumFin_neg (n : Nat) (f : Fin n → Int) :
-    sumFin n (fun i => -f i) = -sumFin n f := by
-  induction n with
-  | zero => simp [sumFin]
-  | succ k ih =>
-    simp only [sumFin]
-    rw [ih (fun i => f i.castSucc)]
-    omega
-
-theorem sumFin_mul_left (n : Nat) (c : Int) (f : Fin n → Int) :
-    c * sumFin n f = sumFin n (fun i => c * f i) := by
-  induction n with
-  | zero => simp [sumFin]
-  | succ k ih =>
-    simp only [sumFin]
-    rw [Int.mul_add, ih (fun i => f i.castSucc)]
-
-theorem sumFin_mul_right (n : Nat) (f : Fin n → Int) (c : Int) :
-    sumFin n f * c = sumFin n (fun i => f i * c) := by
-  induction n with
-  | zero => simp [sumFin]
-  | succ k ih =>
-    simp only [sumFin]
-    rw [Int.add_mul, ih (fun i => f i.castSucc)]
-
-theorem sumFin_swap {m n : Nat} (f : Fin m → Fin n → Int) :
-    sumFin m (fun i => sumFin n (fun j => f i j)) =
-      sumFin n (fun j => sumFin m (fun i => f i j)) := by
-  induction m with
-  | zero =>
-    simp only [sumFin]
-    exact (sumFin_zero n).symm
-  | succ k ih =>
-    simp only [sumFin]
-    rw [ih (fun i j => f i.castSucc j)]
-    rw [← sumFin_add n (fun j => sumFin k (fun i => f i.castSucc j))
-          (fun j => f ⟨k, Nat.lt_succ_self k⟩ j)]
-
-theorem sumFin_single_hit (n : Nat) (i : Fin n) (c : Int) :
-    sumFin n (fun j => if j = i then c else 0) = c := by
-  induction n with
-  | zero => exact Fin.elim0 i
-  | succ k ih =>
-    simp only [sumFin]
-    by_cases hk : i.val = k
-    · have hi : i = ⟨k, Nat.lt_succ_self k⟩ := Fin.ext hk
-      subst hi
-      have hsub : sumFin k (fun j : Fin k => if j.castSucc = ⟨k, Nat.lt_succ_self k⟩ then c else 0) = 0 := by
-        have hzero : (fun j : Fin k => if j.castSucc = ⟨k, Nat.lt_succ_self k⟩ then c else 0) = (fun _ => 0) := by
-          funext j
-          have hne : j.castSucc ≠ ⟨k, Nat.lt_succ_self k⟩ := by
-            intro h
-            have hv := congrArg Fin.val h
-            exact Nat.ne_of_lt j.isLt hv
-          simp [hne]
-        rw [hzero, sumFin_zero]
-      simp [hsub]
-    · have hilt : i.val < k := Nat.lt_of_le_of_ne (Nat.lt_succ_iff.mp i.isLt) hk
-      let i' : Fin k := ⟨i.val, hilt⟩
-      have hi : i = i'.castSucc := Fin.ext rfl
-      have hlast : (if (⟨k, Nat.lt_succ_self k⟩ : Fin (k + 1)) = i then c else 0) = 0 := by
-        have hne : (⟨k, Nat.lt_succ_self k⟩ : Fin (k + 1)) ≠ i := by
-          intro h
-          have hv := congrArg Fin.val h
-          exact hk hv.symm
-        simp [hne]
-      have hsub : (fun j : Fin k => if j.castSucc = i then c else 0) =
-          (fun j : Fin k => if j = i' then c else 0) := by
-        funext j
-        by_cases hj : j = i'
-        · subst hj; simp [hi]
-        · have hne : j.castSucc ≠ i := by
-            intro h
-            apply hj
-            apply Fin.ext
-            have hv : (j.castSucc : Nat) = i.val := congrArg Fin.val h
-            exact hv
-          simp [hj, hne]
-      rw [hsub, ih i', hlast]
-      omega
-
-theorem sumFin_add_split (a b : Nat) (f : Fin (a + b) → Int) :
-    sumFin (a + b) f =
-      sumFin a (fun i => f ⟨i.val, Nat.lt_of_lt_of_le i.isLt (Nat.le_add_right a b)⟩) +
-      sumFin b (fun j => f ⟨a + j.val, Nat.add_lt_add_left j.isLt a⟩) := by
-  induction b with
-  | zero =>
-    have h1 : sumFin a f = sumFin a (fun i => f ⟨i.val, Nat.lt_of_lt_of_le i.isLt (Nat.le_add_right a 0)⟩) := by
-      apply sumFin_congr; intro i; rfl
-    change sumFin a f = _
-    rw [h1]
-    simp [sumFin]
-  | succ k ih =>
-    have hsplit : sumFin (a + (k + 1)) f =
-        sumFin (a + k) (fun i => f i.castSucc) + f ⟨a + k, Nat.lt_succ_self (a + k)⟩ := rfl
-    rw [hsplit, ih (fun i => f i.castSucc)]
-    have hleft :
-        sumFin a (fun i => f (Fin.castSucc ⟨i.val, Nat.lt_of_lt_of_le i.isLt (Nat.le_add_right a k)⟩)) =
-        sumFin a (fun i => f ⟨i.val, Nat.lt_of_lt_of_le i.isLt (Nat.le_add_right a (k + 1))⟩) := by
-      apply sumFin_congr; intro i; rfl
-    have hright :
-        sumFin k (fun j => f (Fin.castSucc ⟨a + j.val, Nat.add_lt_add_left j.isLt a⟩)) =
-        sumFin k (fun j => f (⟨a + j.val, Nat.add_lt_add_left (Nat.lt_succ_of_lt j.isLt) a⟩ : Fin (a + (k + 1)))) := by
-      apply sumFin_congr; intro j; rfl
-    have hright2 :
-        sumFin k (fun j => f (⟨a + j.val, Nat.add_lt_add_left (Nat.lt_succ_of_lt j.isLt) a⟩ : Fin (a + (k + 1)))) =
-        sumFin k (fun j => f ⟨a + j.castSucc.val, Nat.add_lt_add_left j.castSucc.isLt a⟩) := by
-      apply sumFin_congr; intro j; rfl
-    have htail : f ⟨a + k, Nat.lt_succ_self (a + k)⟩ =
-        f ⟨a + k, Nat.add_lt_add_left (Nat.lt_succ_self k) a⟩ := rfl
-    change _ = sumFin a (fun i => f ⟨i.val, Nat.lt_of_lt_of_le i.isLt (Nat.le_add_right a (k + 1))⟩) +
-      (sumFin k (fun j => f ⟨a + j.castSucc.val, Nat.add_lt_add_left j.castSucc.isLt a⟩) +
-       f ⟨a + k, Nat.add_lt_add_left (Nat.lt_succ_self k) a⟩)
-    rw [hleft, hright, hright2, htail]
-    omega
-
-theorem sumFin_le_sumFin (n : Nat) (f g : Fin n → Int) (h : ∀ i, f i ≤ g i) :
-    sumFin n f ≤ sumFin n g := by
-  have hd : 0 ≤ sumFin n (fun i => g i - f i) := sumFin_nonneg n _ (fun i => by have := h i; omega)
-  rw [sumFin_sub] at hd
-  omega
-
-/-! ## 1. Vector Norms, Quadratic Forms & Integer Cholesky + SDD (Theorems E1–E3) -/
-
-def vecNormSq (n : Nat) (v : Fin n → Int) : Int :=
-  sumFin n (fun i => v i * v i)
-
-theorem vecNormSq_nonneg (n : Nat) (v : Fin n → Int) : 0 ≤ vecNormSq n v := by
-  unfold vecNormSq
-  exact sumFin_nonneg n _ (fun i => int_sq_nonneg (v i))
-
-def matQuad (n : Nat) (A : Fin n → Fin n → Int) (v : Fin n → Int) : Int :=
-  sumFin n (fun i => sumFin n (fun j => v i * A i j * v j))
-
-def gramLLt (n : Nat) (L : Fin n → Fin n → Int) (i j : Fin n) : Int :=
-  sumFin n (fun k => L i k * L j k)
-
-def IsSDD (n : Nat) (E : Fin n → Fin n → Int) : Prop :=
-  (∀ i j, E i j = E j i) ∧
-  (∀ i, sumFin n (fun j => if j = i then 0 else absInt (E i j)) ≤ E i i)
-
-private theorem sdd_pair_nonneg (a x y : Int) :
-    0 ≤ absInt a * (x * x) + 2 * (a * (x * y)) + absInt a * (y * y) := by
-  by_cases ha : a < 0
-  · have habs : absInt a = -a := by unfold absInt; simp [ha]
-    rw [habs]
-    have hna : 0 ≤ -a := by omega
-    have hsq : 0 ≤ (x - y) * (x - y) := int_sq_nonneg (x - y)
-    have hid : (-a) * ((x - y) * (x - y)) = (-a) * (x * x) + 2 * (a * (x * y)) + (-a) * (y * y) := by
-      grind
-    rw [← hid]
-    exact Int.mul_nonneg hna hsq
-  · have habs : absInt a = a := by unfold absInt; simp [ha]
-    rw [habs]
-    have hpa : 0 ≤ a := by omega
-    have hsq : 0 ≤ (x + y) * (x + y) := int_sq_nonneg (x + y)
-    have hid : a * ((x + y) * (x + y)) = a * (x * x) + 2 * (a * (x * y)) + a * (y * y) := by
-      grind
-    rw [← hid]
-    exact Int.mul_nonneg hpa hsq
-
-/-- Theorem E1 (SDD Quadratic Form Nonnegativity):
-    Every symmetric diagonally dominant integer matrix has nonnegative quadratic form. -/
-theorem sdd_quadratic_form_nonneg (n : Nat) (E : Fin n → Fin n → Int) (hSDD : IsSDD n E) :
-    ∀ v : Fin n → Int, 0 ≤ matQuad n E v := by
-  intro v
-  rcases hSDD with ⟨hSymm, hDom⟩
-  let offDiag : Fin n → Int := fun i => sumFin n (fun j => if j = i then 0 else absInt (E i j))
-  let diagSum : Int := sumFin n (fun i => (E i i - offDiag i) * (v i * v i))
-  let offSqI : Int := sumFin n (fun i => offDiag i * (v i * v i))
-  let pairSum : Int :=
-    sumFin n (fun i => sumFin n (fun j =>
-      if j = i then 0 else absInt (E i j) * (v i * v i) + 2 * (E i j * (v i * v j)) + absInt (E i j) * (v j * v j)))
-  have h1 : matQuad n E v = diagSum + offSqI + sumFin n (fun i => sumFin n (fun j => if j = i then 0 else E i j * (v i * v j))) := by
-    have hA : matQuad n E v =
-        sumFin n (fun i => E i i * (v i * v i) + sumFin n (fun j => if j = i then 0 else E i j * (v i * v j))) := by
-      unfold matQuad
-      apply sumFin_congr
-      intro i
-      have hSplit :
-          (fun j : Fin n => v i * E i j * v j) =
-            (fun j : Fin n => (if j = i then E i i * (v i * v i) else 0) + (if j = i then 0 else E i j * (v i * v j))) := by
-        funext j
-        by_cases hj : j = i
-        · subst hj; grind
-        · simp [hj]; grind
-      rw [hSplit, sumFin_add, sumFin_single_hit]
-    rw [hA, sumFin_add]
-    have hD : sumFin n (fun i => E i i * (v i * v i)) = diagSum + offSqI := by
-      have hSplit : (fun i => E i i * (v i * v i)) = (fun i => (E i i - offDiag i) * (v i * v i) + offDiag i * (v i * v i)) := by
-        funext i; grind
-      rw [hSplit, sumFin_add]
-    rw [hD]
-  have hOff1 : offSqI = sumFin n (fun i => sumFin n (fun j => if j = i then 0 else absInt (E i j) * (v i * v i))) := by
-    unfold offSqI
-    apply sumFin_congr
-    intro i
-    change sumFin n (fun j => if j = i then 0 else absInt (E i j)) * (v i * v i) = _
-    rw [sumFin_mul_right]
-    apply sumFin_congr
-    intro j
-    by_cases hj : j = i <;> simp [hj]
-  have hOff2 : offSqI = sumFin n (fun i => sumFin n (fun j => if j = i then 0 else absInt (E i j) * (v j * v j))) := by
-    rw [hOff1]
-    have hSw := sumFin_swap (fun i j : Fin n => if j = i then 0 else absInt (E i j) * (v i * v i))
-    rw [hSw]
-    apply sumFin_congr
-    intro i
-    apply sumFin_congr
-    intro j
-    by_cases hji : j = i
-    · subst hji; rfl
-    · have hij' : i ≠ j := fun h => hji h.symm
-      simp only [hji, hij', ↓reduceIte]
-      rw [hSymm j i]
-  have hPairEq :
-      2 * offSqI + 2 * sumFin n (fun i => sumFin n (fun j => if j = i then 0 else E i j * (v i * v j))) = pairSum := by
-    have hCross :
-        2 * sumFin n (fun i => sumFin n (fun j => if j = i then 0 else E i j * (v i * v j))) =
-          sumFin n (fun i => sumFin n (fun j => if j = i then 0 else 2 * (E i j * (v i * v j)))) := by
-      rw [sumFin_mul_left]
-      apply sumFin_congr
-      intro i
-      rw [sumFin_mul_left]
-      apply sumFin_congr
-      intro j
-      by_cases hj : j = i <;> simp [hj]
-    have hSumOff :
-        offSqI + offSqI =
-          sumFin n (fun i => sumFin n (fun j =>
-            if j = i then 0 else absInt (E i j) * (v i * v i) + absInt (E i j) * (v j * v j))) := by
-      calc offSqI + offSqI
-          = sumFin n (fun i => sumFin n (fun j => if j = i then 0 else absInt (E i j) * (v i * v i))) +
-              sumFin n (fun i => sumFin n (fun j => if j = i then 0 else absInt (E i j) * (v j * v j))) := by
-                rw [← hOff1, ← hOff2]
-        _ = sumFin n (fun i =>
-              sumFin n (fun j => if j = i then 0 else absInt (E i j) * (v i * v i)) +
-              sumFin n (fun j => if j = i then 0 else absInt (E i j) * (v j * v j))) := by
-                rw [sumFin_add]
-        _ = sumFin n (fun i => sumFin n (fun j =>
-              if j = i then 0 else absInt (E i j) * (v i * v i) + absInt (E i j) * (v j * v j))) := by
-                apply sumFin_congr; intro i
-                rw [← sumFin_add]
-                apply sumFin_congr; intro j
-                by_cases hj : j = i <;> simp [hj]
-    have h2 : 2 * offSqI = offSqI + offSqI := by omega
-    rw [h2, hSumOff, hCross]
-    unfold pairSum
-    rw [← sumFin_add]
-    apply sumFin_congr
-    intro i
-    rw [← sumFin_add]
-    apply sumFin_congr
-    intro j
-    by_cases hj : j = i <;> simp [hj] <;> omega
-  have h2Quad : 2 * matQuad n E v = 2 * diagSum + pairSum := by
-    omega
-  have hDiagNonneg : 0 ≤ diagSum := by
-    apply sumFin_nonneg
-    intro i
-    have hd : 0 ≤ E i i - offDiag i := by have := hDom i; grind
-    exact Int.mul_nonneg hd (int_sq_nonneg (v i))
-  have hPairNonneg : 0 ≤ pairSum := by
-    apply sumFin_nonneg
-    intro i
-    apply sumFin_nonneg
-    intro j
-    by_cases hj : j = i
-    · simp [hj]
-    · simp only [hj, ↓reduceIte]
-      exact sdd_pair_nonneg (E i j) (v i) (v j)
-  omega
-
-private theorem gramLLt_psd (n : Nat) (L : Fin n → Fin n → Int) (v : Fin n → Int) :
-    0 ≤ matQuad n (gramLLt n L) v := by
-  have hEq : matQuad n (gramLLt n L) v =
-      sumFin n (fun k => (sumFin n (fun i => v i * L i k)) * (sumFin n (fun j => v j * L j k))) := by
-    unfold matQuad gramLLt
-    calc
-      sumFin n (fun i => sumFin n (fun j => v i * sumFin n (fun k => L i k * L j k) * v j))
-          = sumFin n (fun i => sumFin n (fun j => sumFin n (fun k => (v i * L i k) * (v j * L j k)))) := by
-            apply sumFin_congr; intro i
-            apply sumFin_congr; intro j
-            rw [sumFin_mul_left, sumFin_mul_right]
-            apply sumFin_congr; intro k; grind
-      _ = sumFin n (fun i => sumFin n (fun k => sumFin n (fun j => (v i * L i k) * (v j * L j k)))) := by
-            apply sumFin_congr; intro i; exact sumFin_swap _
-      _ = sumFin n (fun k => sumFin n (fun i => sumFin n (fun j => (v i * L i k) * (v j * L j k)))) :=
-            sumFin_swap _
-      _ = sumFin n (fun k => sumFin n (fun i => (v i * L i k) * sumFin n (fun j => v j * L j k))) := by
-            apply sumFin_congr; intro k
-            apply sumFin_congr; intro i
-            exact (sumFin_mul_left n (v i * L i k) (fun j => v j * L j k)).symm
-      _ = sumFin n (fun k => sumFin n (fun i => v i * L i k) * sumFin n (fun j => v j * L j k)) := by
-            apply sumFin_congr; intro k
-            exact (sumFin_mul_right (f := fun i => v i * L i k) n (sumFin n (fun j => v j * L j k))).symm
-  rw [hEq]
-  apply sumFin_nonneg
-  intro k
-  exact int_sq_nonneg _
-
-/-- Theorem E2 (Integer Cholesky + SDD Certified Eigenvalue Lower Bound):
-    If `E = A - mu*I - L*L^T` is symmetric diagonally dominant, then `mu * ||v||^2 ≤ v^T A v`. -/
-theorem cholesky_sdd_certified_psd (n : Nat) (A L : Fin n → Fin n → Int) (mu : Int)
-    (hSDD : IsSDD n (fun i j => A i j - (if i = j then mu else 0) - gramLLt n L i j)) :
-    ∀ v : Fin n → Int, mu * vecNormSq n v ≤ matQuad n A v := by
-  intro v
-  let E : Fin n → Fin n → Int := fun i j => A i j - (if i = j then mu else 0) - gramLLt n L i j
-  have hNonneg : 0 ≤ matQuad n E v := sdd_quadratic_form_nonneg n E hSDD v
-  have hGram : 0 ≤ matQuad n (gramLLt n L) v := gramLLt_psd n L v
-  have hDecomp : matQuad n E v = matQuad n A v - mu * vecNormSq n v - matQuad n (gramLLt n L) v := by
-    have hD : sumFin n (fun i => sumFin n (fun j => v i * (if i = j then mu else 0) * v j)) = mu * vecNormSq n v := by
-      unfold vecNormSq
-      rw [sumFin_mul_left]
-      apply sumFin_congr
-      intro i
-      have hSub : (fun j : Fin n => v i * (if i = j then mu else 0) * v j) =
-          (fun j : Fin n => if j = i then mu * (v i * v i) else 0) := by
-        funext j
-        by_cases hj : j = i
-        · subst hj; simp; grind
-        · have hij : i ≠ j := fun h => hj h.symm
-          simp [hj, hij]
-      rw [hSub, sumFin_single_hit]
-    unfold matQuad E
-    calc
-      sumFin n (fun i => sumFin n (fun j => v i * (A i j - (if i = j then mu else 0) - gramLLt n L i j) * v j))
-          = sumFin n (fun i => sumFin n (fun j =>
-              (v i * A i j * v j - v i * (if i = j then mu else 0) * v j) - v i * gramLLt n L i j * v j)) := by
-            apply sumFin_congr; intro i
-            apply sumFin_congr; intro j; grind
-      _ = sumFin n (fun i => sumFin n (fun j => v i * A i j * v j) -
-              sumFin n (fun j => v i * (if i = j then mu else 0) * v j) -
-              sumFin n (fun j => v i * gramLLt n L i j * v j)) := by
-            apply sumFin_congr; intro i
-            rw [sumFin_sub, sumFin_sub]
-      _ = matQuad n A v -
-            sumFin n (fun i => sumFin n (fun j => v i * (if i = j then mu else 0) * v j)) -
-            matQuad n (gramLLt n L) v := by
-            rw [sumFin_sub, sumFin_sub]; rfl
-      _ = matQuad n A v - mu * vecNormSq n v - matQuad n (gramLLt n L) v := by
-            rw [hD]
-  omega
-
-def matAt {n : Nat} (rows : List (List Int)) (i j : Fin n) : Int :=
-  (rows.getD i.val []).getD j.val 0
-
-def triAt {n : Nat} (rows : List (List Int)) (i k : Fin n) : Int :=
-  if k.val ≤ i.val then matAt rows i k else 0
-
-private def allFinAux (n : Nat) (p : Fin n → Bool) : (k : Nat) → k ≤ n → Bool
-  | 0, _ => true
-  | k + 1, hk => allFinAux n p k (Nat.le_of_lt hk) && p ⟨k, hk⟩
-
-def allFinB (n : Nat) (p : Fin n → Bool) : Bool :=
-  allFinAux n p n (Nat.le_refl n)
-
-private theorem allFinAux_true (n : Nat) (p : Fin n → Bool) :
-    ∀ k (hk : k ≤ n), allFinAux n p k hk = true → ∀ j (hj : j < k), p ⟨j, Nat.lt_of_lt_of_le hj hk⟩ = true
-  | 0, _, _, _, hj => by omega
-  | k + 1, hk, hall, j, hj => by
-    simp only [allFinAux, Bool.and_eq_true] at hall
-    by_cases hjk : j = k
-    · subst hjk; exact hall.2
-    · have hjlt : j < k := by omega
-      exact allFinAux_true n p k (Nat.le_of_lt hk) hall.1 j hjlt
-
-theorem allFinB_true (n : Nat) (p : Fin n → Bool) (h : allFinB n p = true) :
-    ∀ i : Fin n, p i = true := by
-  intro i
-  exact allFinAux_true n p n (Nat.le_refl n) h i.val i.isLt
-
-def checkCholeskySDD (n : Nat) (A L : List (List Int)) (mu : Int) : Bool :=
-  let E : Fin n → Fin n → Int := fun i j =>
-    matAt A i j - (if i = j then mu else 0) - gramLLt n (triAt L) i j
-  let symOk := allFinB n (fun i => allFinB n (fun j => decide (matAt A i j = matAt A j i)))
-  let domOk := allFinB n (fun i =>
-    decide (sumFin n (fun j => if j = i then 0 else absInt (E i j)) ≤ E i i))
-  symOk && domOk
-
-/-- Theorem E3 (Kernel-Checked Integer Cholesky + SDD Soundness):
-    If `checkCholeskySDD n A L mu = true`, then `mu * ||v||^2 ≤ v^T A v` for all `v`. -/
-theorem checkCholeskySDD_sound (n : Nat) (A L : List (List Int)) (mu : Int)
-    (hCheck : checkCholeskySDD n A L mu = true) :
-    ∀ v : Fin n → Int, mu * vecNormSq n v ≤ matQuad n (matAt A) v := by
-  unfold checkCholeskySDD at hCheck
-  simp only [Bool.and_eq_true] at hCheck
-  have hSymmMat : ∀ i j : Fin n, matAt A i j = matAt A j i := by
-    intro i j
-    have hi := allFinB_true n _ hCheck.1 i
-    have hj := allFinB_true n _ hi j
-    exact of_decide_eq_true hj
-  have hDomE : ∀ i : Fin n,
-      sumFin n (fun j => if j = i then 0 else absInt (matAt A i j - (if i = j then mu else 0) - gramLLt n (triAt L) i j)) ≤
-        matAt A i i - (if i = i then mu else 0) - gramLLt n (triAt L) i i := by
-    intro i
-    simpa using of_decide_eq_true (allFinB_true n _ hCheck.2 i)
-  refine cholesky_sdd_certified_psd n (matAt A) (triAt L) mu ⟨?_, hDomE⟩
-  intro i j
-  have hg : gramLLt n (triAt L) i j = gramLLt n (triAt L) j i := by
-    unfold gramLLt
-    apply sumFin_congr; intro k; exact Int.mul_comm _ _
-  by_cases hij : i = j
-  · subst hij; rfl
-  · have hji : j ≠ i := fun h => hij h.symm
-    simp only [hij, hji, ↓reduceIte, hSymmMat i j, hg]
 
 /-! ## 2. Pillar 1 — Electromagnetics Theorems (Theorems E4–E6) -/
 
@@ -1049,16 +596,19 @@ private theorem sumFin_one_add (k : Nat) (f : Fin (1 + k) → Int) :
       sumFin k (fun j => f ⟨1 + j.val, Nat.add_lt_add_left j.isLt 1⟩) := by
   induction k with
   | zero =>
-    change 0 + f ⟨0, Nat.add_pos_left Nat.zero_lt_one 0⟩ =
-      f ⟨0, Nat.add_pos_left Nat.zero_lt_one 0⟩ + 0
+    rw [sumFin_succ 0 f, sumFin_zero_eq, sumFin_zero_eq]
+    have hz : (⟨0, Nat.lt_succ_self 0⟩ : Fin (1 + 0)) = ⟨0, Nat.add_pos_left Nat.zero_lt_one 0⟩ := rfl
+    rw [hz]
     omega
   | succ m ih =>
     have hstep : sumFin (1 + (m + 1)) f =
-        sumFin (1 + m) (fun i => f i.castSucc) + f ⟨1 + m, Nat.add_lt_add_left (Nat.lt_succ_self m) 1⟩ := rfl
+        sumFin (1 + m) (fun i => f i.castSucc) + f ⟨1 + m, Nat.add_lt_add_left (Nat.lt_succ_self m) 1⟩ :=
+      sumFin_succ (1 + m) f
     rw [hstep, ih (fun i => f i.castSucc)]
     have hrhs : sumFin (m + 1) (fun j : Fin (m + 1) => f ⟨1 + j.val, Nat.add_lt_add_left j.isLt 1⟩) =
         sumFin m (fun j : Fin m => f ⟨1 + j.val, Nat.add_lt_add_left (Nat.lt_succ_of_lt j.isLt) 1⟩) +
-        f ⟨1 + m, Nat.add_lt_add_left (Nat.lt_succ_self m) 1⟩ := rfl
+        f ⟨1 + m, Nat.add_lt_add_left (Nat.lt_succ_self m) 1⟩ :=
+      sumFin_succ m (fun j : Fin (m + 1) => f ⟨1 + j.val, Nat.add_lt_add_left j.isLt 1⟩)
     rw [hrhs]
     have h0 : f (⟨0, Nat.add_pos_left Nat.zero_lt_one m⟩ : Fin (1 + m)).castSucc =
         f ⟨0, Nat.add_pos_left Nat.zero_lt_one (m + 1)⟩ := rfl
@@ -1326,9 +876,9 @@ theorem bode_fano_energy_limit_sound
     searuMetric ≤ globalBound ∧ 0 ≤ globalBound - searuMetric := by
   have hSum : sumFin nCells cellResp ≤ Int.ofNat nCells * cellCap := by
     induction nCells with
-    | zero => simp [sumFin]
+    | zero => simp [sumFin_zero_eq]
     | succ k ih =>
-      simp only [sumFin]
+      rw [sumFin_succ]
       have h1 := ih (fun i => cellResp i.castSucc) (fun i => hCell i.castSucc)
       have h2 := hCell ⟨k, Nat.lt_succ_self k⟩
       have hCast : Int.ofNat (k + 1) * cellCap = Int.ofNat k * cellCap + cellCap := by

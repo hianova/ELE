@@ -16,7 +16,7 @@
 
 | Repository | Scope & Responsibility | Explicit Non-Overlap with `ELE v11.0.0` |
 | :--- | :--- | :--- |
-| **`FLOW`** | Domain-free Lean 4 math (`Flow.Interval`, `Flow.Bundle`, `Flow.Schema`, `Flow.Morphism`), Pure-GPR `flow.h` / `searu.h`, `.fir` synthesizer | Provides math & optimizer primitives only; no EM/CKT/EE/Silicon physics |
+| **`FLOW`** | Domain-free Lean 4 math (`Flow.Interval`, `Flow.CholeskySDD`, `Flow.Bundle`, `Flow.Schema`, `Flow.Morphism`), Pure-GPR `flow.h` / `searu.h` / `flow_cholesky_sdd.h` / `flow_sha256_io.h`, `.fir` synthesizer (`v9.0.0`) | Provides math, crypto & optimizer primitives only; no EM/CKT/EE/Silicon physics |
 | **`ELE`** (**This Repo**) | **Applied Electronics (`ckt`), Electrical Engineering (`ee`), Electromagnetics (`em`), `field-to-circuit`, `EleCert` formal witnesses, and RTL/GDSII/Power silicon backends** | Does NOT duplicate `PHY`'s Lagrangian/gauge/QFT PDEs or `CHEM`'s DFT/MD |
 | **`PHY`** | Fundamental theoretical physics (analytical mechanics, electrodynamics covariance, SM/GR/CMT) | `ELE` owns applied engineering solvers (FDTD waveguide, PEEC, SPICE MNA, IPMSM, AC-OPF, grid EMT, VLSI/Power) |
 | **`CHEM`** | Computational chemistry & materials (`DFT`, `MD`, `SM` thermo) | Supplies material constants externally; `ELE` consumes macroscopic `sigma`, `er`, device/line parameters |
@@ -27,7 +27,7 @@
 ## Architecture Overview (`3 + 1` Pillars)
 
 ```text
-  FLOW Pure-Math & Optimizer SSOT (../FLOW/core/{flow.h,searu.h,lean/Flow/Interval.lean}, ../FLOW/sdk/lean/Flow.lean)
+  FLOW Pure-Math & Optimizer SSOT (../FLOW/core/{flow.h,searu.h,flow_cholesky_sdd.h,lean/Flow/{Interval,CholeskySDD}.lean}, ../FLOW/sdk/{flow_sha256_io.h,lean/Flow.lean})
         │
         ├──► Lean 4 Formal Verification Layer (lean/EleCert.lean — imports ONLY Flow.Interval, 0 sorryAx, 0 ofReduceBool)
         │      • Core Algebra   : E1 sdd_quadratic_form_nonneg, E2 cholesky_sdd_certified_psd, E3 checkCholeskySDD_sound
