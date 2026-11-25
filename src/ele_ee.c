@@ -766,6 +766,12 @@ int ele_grid_build_ybus_csr(const ele_grid_t *g, int skip_branch_idx,
     for (int t = 0; t < nt; ++t) ++row_cnt[r_arr[t]];
     for (int k = 0; k < N; ++k) offs[k + 1] = offs[k] + row_cnt[k];
     int *cursor = (int *)malloc((size_t)N * sizeof(int));
+    if (!cursor) {
+        free(r_arr); free(c_arr); free(gv); free(bv); free(row_cnt);
+        free(row_ptr); free(col_idx); free(g_val); free(b_val);
+        free(bin_c); free(bin_g); free(bin_b); free(offs);
+        return -1;
+    }
     memcpy(cursor, offs, (size_t)N * sizeof(int));
     for (int t = 0; t < nt; ++t) {
         int r = r_arr[t];

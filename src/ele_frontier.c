@@ -3104,6 +3104,11 @@ int ele_grid_acopf_sos2_cert(const ele_grid_t *g, const char *cert_out_path,
 
     /* Build CSR sparse representation of A_op for fast Newton steps */
     int *row_off = (int *)calloc((size_t)(n_rows + 1), sizeof(int));
+    if (!row_off) {
+        free(ms); free(mgens); free(eq_polys); free(ineq_polys); free(therm4); free(rlt4);
+        free(A_op); free(C_rhs); free(G_norm);
+        return -1;
+    }
     int nnz = 0;
     for (int r = 0; r < n_rows; ++r) {
         row_off[r] = nnz;
@@ -3115,7 +3120,7 @@ int ele_grid_acopf_sos2_cert(const ele_grid_t *g, const char *cert_out_path,
     row_off[n_rows] = nnz;
     int *nz_col = (int *)malloc((size_t)(nnz > 0 ? nnz : 1) * sizeof(int));
     double *nz_val = (double *)malloc((size_t)(nnz > 0 ? nnz : 1) * sizeof(double));
-    if (!row_off || !nz_col || !nz_val) {
+    if (!nz_col || !nz_val) {
         free(ms); free(mgens); free(eq_polys); free(ineq_polys); free(therm4); free(rlt4);
         free(A_op); free(C_rhs); free(G_norm); free(row_off); free(nz_col); free(nz_val);
         return -1;
