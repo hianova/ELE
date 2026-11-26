@@ -53,11 +53,11 @@ module ele_huber_median3_atom (
         end else begin
             med_o = x_i;
         end
-
-        abs_diff_c  = (x_i >= med_o) ? (x_i - med_o) : (med_o - x_i);
-        spike_rej_o = rst_n & en_i & emi_guard_en_i & sample_valid_i &
-                      (warm_q == 2'd2) & (abs_diff_c > spike_tol_i);
     end
+
+    assign abs_diff_c  = (x_i >= med_o) ? (x_i - med_o) : (med_o - x_i);
+    assign spike_rej_o = rst_n & en_i & emi_guard_en_i & sample_valid_i &
+                         (warm_q == 2'd2) & (abs_diff_c > spike_tol_i);
 
     always_ff @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
@@ -178,16 +178,15 @@ module ele_sscb800_ip (
         .spike_rej_o    (spike_rej_w)
     );
 
+    assign trip_any_q     = atom_trip_w | desat_latched_q;
+    assign autozero_cmd_c = csr_wr_i & (csr_addr_i[5:2] == 4'h1) & csr_wdata_i[2];
+    assign clr_rearm_c    = csr_wr_i & (csr_addr_i[5:2] == 4'h1) & csr_wdata_i[3];
+
     always_comb begin
         // Thermal zero-point offset removal (autozero_cmd captures Hall baseline while open)
         i_corr_c        = (i_filt_w > i_offset_q) ? (i_filt_w - i_offset_q) : 16'd0;
         rearm_band_ok_c = (i_corr_c <= {8'd0, rearm_band_q});
         i_atom_c        = rearm_band_ok_c ? 16'd0 : i_corr_c;
-
-        autozero_cmd_c  = csr_wr_i & (csr_addr_i[5:2] == 4'h1) & csr_wdata_i[2];
-        clr_rearm_c     = csr_wr_i & (csr_addr_i[5:2] == 4'h1) & csr_wdata_i[3];
-
-        trip_any_q      = atom_trip_w | desat_latched_q;
         rearm_success_c = trip_any_q & clr_rearm_c & rearm_band_ok_c;
     end
 
