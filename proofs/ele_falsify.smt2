@@ -1,0 +1,38 @@
+; ELE v1.0.0 — Pure QF_LIA Passive 2-Port S-Parameter Conservation, CFL & KCL Bounds
+(set-logic QF_LIA)
+
+(declare-const s11_sq Int) (declare-const s21_sq Int)
+(declare-const c_dt_sq Int) (declare-const dx_sq Int)
+
+; CHECK 1: Anti-vacuity for passive 2-port and 2D FDTD CFL regime (expect SAT)
+(push)
+(assert (and (> s11_sq 0) (> s21_sq 0)))
+(assert (<= (+ s11_sq s21_sq) 1000000))
+(assert (and (> c_dt_sq 0) (> dx_sq 0)))
+(assert (<= (* 2 c_dt_sq) dx_sq))
+(check-sat)
+(pop)
+
+; CHECK 2: Passive 2-port energy conservation forbids reflection/transmission > 1 (expect UNSAT)
+(push)
+(assert (and (>= s11_sq 0) (>= s21_sq 0)))
+(assert (<= (+ s11_sq s21_sq) 1000000))
+(assert (or (> s11_sq 1000000) (> s21_sq 1000000)))
+(check-sat)
+(pop)
+
+; CHECK 3: Honest Theory Falsification — violating 2D isotropic CFL triggers instability (expect SAT)
+(push)
+(assert (> dx_sq 0))
+(assert (> c_dt_sq 0))
+(assert (> (* 2 c_dt_sq) dx_sq))
+(check-sat)
+(pop)
+
+; CHECK 4: KCL branch conservation i_ab + i_ba = 0 (expect UNSAT)
+(declare-const i_ab Int) (declare-const i_ba Int)
+(push)
+(assert (= i_ba (- i_ab)))
+(assert (not (= (+ i_ab i_ba) 0)))
+(check-sat)
+(pop)

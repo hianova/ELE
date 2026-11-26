@@ -1,0 +1,16 @@
+# FLOW v10.0.0 ArenaSchema: 64-byte ELE FDTD & Passivity Wire Cell
+arena 2 ele_wire build/ele_wire.h ele_wire_cell_t ele_wire_map_t ele_wire_arena_t
+
+layout ele_fdtd_wire ele_fdtd_wire_t
+  field c_dt_sq_scaled 0 i64 1
+  field dx_sq_scaled 64 i64 1
+  field dy_sq_scaled 128 i64 1
+  field s11_sq_q32 192 u64 1
+  field s21_sq_q32 256 u64 1
+  field energy_sum_q32 320 u64 1
+  field nx 384 u32 1
+  field ny 416 u32 1
+  field nt 448 u32 1
+  field cfl_ok 480 u32 1
+
+region fdtd 0 2 ele_fdtd_wire ELE_SLOT_FDTD -
