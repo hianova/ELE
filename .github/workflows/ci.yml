@@ -62,4 +62,8 @@ jobs:
           export PATH="$HOME/.elan/bin:$PATH"
           make -C FLOW all lean CC=clang CXX=clang++
           make -C ELE clean
-          make -C ELE test CC=clang CXX=clang++
+          if [ "$(uname -s)" = "Linux" ]; then
+            make -C ELE test CC=clang CXX=g++
+          else
+            make -C ELE test CC=clang CXX=clang++
+          fi
