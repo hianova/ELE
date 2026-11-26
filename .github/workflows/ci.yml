@@ -1,0 +1,65 @@
+name: CI
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+on:
+  push:
+    branches: [ main, "feat/**", "refactor/**" ]
+    tags: [ "v*" ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  verify-ele:
+    name: ELE Silicon, RTL Co-Sim, Lean 4 PDK/Certs & EEE Multiphysics (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ ubuntu-latest, macos-latest ]
+    steps:
+      - name: Checkout FLOW (main)
+        uses: actions/checkout@v6
+        with:
+          repository: hianova/FLOW
+          ref: main
+          path: FLOW
+
+      - name: Checkout ELE
+        uses: actions/checkout@v6
+        with:
+          path: ELE
+
+      - name: Cache Lean 4 Toolchain
+        uses: actions/cache@v5
+        with:
+          path: ~/.elan
+          key: ${{ runner.os }}-${{ runner.arch }}-elan-lean-4.36.0
+
+      - name: Install Lean 4 Toolchain
+        run: |
+          set -euo pipefail
+          if ! "$HOME/.elan/bin/lean" --version >/dev/null 2>&1; then
+            curl --retry 5 -sSfL https://elan.lean-lang.org/elan-init.sh -o /tmp/elan-init.sh
+            sh /tmp/elan-init.sh -y --default-toolchain leanprover/lean4:v4.36.0
+          fi
+          echo "$HOME/.elan/bin" >> "$GITHUB_PATH"
+
+      - name: Install Clang, Verilator, Yosys & ngspice (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang verilator yosys ngspice
+
+      - name: Install Verilator, Yosys & ngspice (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          brew install verilator yosys ngspice
+
+      - name: Build FLOW & Run ELE Full Silicon + EEE Sign-Off Gates
+        run: |
+          export PATH="$HOME/.elan/bin:$PATH"
+          make -C FLOW all lean CC=clang CXX=clang++
+          make -C ELE clean
+          make -C ELE test CC=clang CXX=clang++
