@@ -135,19 +135,19 @@ Generated automatically by pure-stdlib [verify_ele_oracle.py](oracles/verify_ele
 
 | Frontier Case | Bound / Gap Result | Bracket / Reference | Extra Margin | Status |
 | --- | --- | --- | --- | --- |
-| grid:ieee3_test (3b, tw<=2) | Shor1=0.0157%, Chordal=0.0120%, SOS2=0.0157% | [3269.90, 3270.29] $/h | cliques=1, t=0.012s | PASS |
-| grid:ieee9_wscc (9b, tw<=2) | Shor1=0.0278%, Chordal=0.0293%, SOS2=N/A | [5296.16, 5297.71] $/h | cliques=7, t=0.033s | PASS |
+| grid:ieee3_test (3b, tw<=2) | Shor1=0.0157%, Chordal=0.0120%, SOS2=0.0157% | [3269.90, 3270.29] $/h | cliques=1, t=0.011s | PASS |
+| grid:ieee9_wscc (9b, tw<=2) | Shor1=0.0278%, Chordal=0.0293%, SOS2=N/A | [5296.16, 5297.71] $/h | cliques=7, t=0.032s | PASS |
 | grid:wb2 (2b, tw<=1) | Shor1=1.9485%, Chordal=1.9485%, SOS2=0.0727% | [888.08, 905.73] $/h | cliques=1, t=0.004s | PASS |
-| grid:wb3 (3b, tw<=2) | Shor1=0.0174%, Chordal=0.0143%, SOS2=0.0174% | [1155.24, 1155.41] $/h | cliques=1, t=0.012s | PASS |
-| grid:wb5 (5b, tw<=2) | Shor1=0.0237%, Chordal=0.0286%, SOS2=0.0237% | [2313.70, 2314.36] $/h | cliques=3, t=0.024s | PASS |
-| grid:case3_lmbd (3b, tw<=2) | Shor1=0.5065%, Chordal=4.0054%, SOS2=0.1877% | [5789.86, 6031.45] $/h | cliques=1, t=0.013s | PASS |
-| grid:case5_pjm (5b, tw<=2) | Shor1=5.5581%, Chordal=7.1185%, SOS2=4.3025% | [16616.30, 17889.80] $/h | cliques=3, t=0.024s | PASS |
-| grid:case14_ieee (14b, tw<=2) | Shor1=0.4402%, Chordal=0.1349%, SOS2=N/A | [2175.60, 2178.54] $/h | cliques=12, t=0.064s | PASS |
-| grid:case30_ieee (30b, tw<=3) | Shor1=6.7052%, Chordal=11.0239%, SOS2=N/A | [7315.90, 8222.32] $/h | cliques=26, t=0.180s | PASS |
-| grid:case30_api (30b, tw<=3) | Shor1=16.2855%, Chordal=5.5488%, SOS2=N/A | [17101.60, 18106.28] $/h | cliques=26, t=0.184s | PASS |
-| grid:case30_sad (30b, tw<=3) | Shor1=6.4806%, Chordal=11.0790%, SOS2=N/A | [7311.35, 8222.29] $/h | cliques=26, t=0.185s | PASS |
-| grid:case57_ieee (57b, tw<=5) | Shor1=N/A, Chordal=7.2147%, SOS2=N/A | [36033.40, 38835.26] $/h | cliques=52, t=0.686s | PASS |
-| grid:case118_ieee (118b, tw<=4) | Shor1=N/A, Chordal=14.2958%, SOS2=N/A | [96712.91, 112844.97] $/h | cliques=109, t=10.317s | PASS |
+| grid:wb3 (3b, tw<=2) | Shor1=0.0174%, Chordal=0.0143%, SOS2=0.0174% | [1155.24, 1155.41] $/h | cliques=1, t=0.011s | PASS |
+| grid:wb5 (5b, tw<=2) | Shor1=0.0237%, Chordal=0.0286%, SOS2=0.0237% | [2313.70, 2314.36] $/h | cliques=3, t=0.023s | PASS |
+| grid:case3_lmbd (3b, tw<=2) | Shor1=0.5065%, Chordal=4.0054%, SOS2=0.1877% | [5789.86, 6031.45] $/h | cliques=1, t=0.016s | PASS |
+| grid:case5_pjm (5b, tw<=2) | Shor1=5.5581%, Chordal=7.1185%, SOS2=4.3025% | [16616.30, 17889.80] $/h | cliques=3, t=0.025s | PASS |
+| grid:case14_ieee (14b, tw<=2) | Shor1=0.4402%, Chordal=0.1349%, SOS2=N/A | [2175.60, 2178.54] $/h | cliques=12, t=0.067s | PASS |
+| grid:case30_ieee (30b, tw<=3) | Shor1=6.7052%, Chordal=11.0239%, SOS2=N/A | [7315.90, 8222.32] $/h | cliques=26, t=0.154s | PASS |
+| grid:case30_api (30b, tw<=3) | Shor1=16.2855%, Chordal=5.5488%, SOS2=N/A | [17101.60, 18106.28] $/h | cliques=26, t=0.151s | PASS |
+| grid:case30_sad (30b, tw<=3) | Shor1=6.4806%, Chordal=11.0790%, SOS2=N/A | [7311.35, 8222.29] $/h | cliques=26, t=0.151s | PASS |
+| grid:case57_ieee (57b, tw<=5) | Shor1=N/A, Chordal=7.2147%, SOS2=N/A | [36033.40, 38835.26] $/h | cliques=52, t=0.461s | PASS |
+| grid:case118_ieee (118b, tw<=4) | Shor1=N/A, Chordal=14.2958%, SOS2=N/A | [96712.91, 112844.97] $/h | cliques=109, t=4.646s | PASS |
 | obs:wb2:vm2:2 | val=0.95271 | [0.91947, 1.04449] | width=0.12502 | PASS |
 | obs:case3_lmbd:pflow:0 | val=51.39298 | [48.32811, 53.37447] | width=5.04636 | PASS |
 | em:maxwell_bound (M=16) | SEARU=22.776 <= Local=23.767 | Global=33.686 | ratio=0.7056 | PASS |
