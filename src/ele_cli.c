@@ -62,7 +62,9 @@ static void print_usage(void) {
         "  ele_cli lab validate-thermal <thermal.csv> [--sp <out.sp>] [--cert <out.json>] [--json <out.json>]\n"
         "  ele_cli lab validate-csi <csi.csv> [--s2p <out.s2p>] [--cert <out.json>] [--json <out.json>]\n"
         "  ele_cli lab validate-power <power.csv> [--sp <out.sp>] [--cert <out.json>] [--json <out.json>]\n"
-        "  ele_cli cert-verify <cert.elecert.json>\n"
+        "  ele_cli cert-verify <cert.elecert.json|cert.elecert.bin>\n"
+        "  ele_cli cert-pack <in.elecert.json> <out.elecert.bin>\n"
+        "  ele_cli cert-unpack <in.elecert.bin> <out.elecert.json>\n"
         "  ele_cli field-to-circuit --peec <file.peec> --sp <file.sp> --motor <file.motor> [--out-dir <dir>] [--json <out.json>]\n"
         "  ele_cli bench --dir <benchmarks> --out <bench.json> --cert-dir <certs>\n"
         "  ele_cli atlas [--dir <benchmarks>] [--out <atlas.json>] [--cert-dir <certs>]\n",
@@ -804,7 +806,7 @@ static int cmd_lab_thermal(const char *csv_path, const char *sp_path,
     cert.lb_val = 0.0;
     cert.ub_val = spice_rmse_c;
 
-    if (cert_path != NULL && ele_cert_write_json(cert_path, &cert) != 0) {
+    if (cert_path != NULL && ele_cert_write_auto(cert_path, &cert) != 0) {
         free(tb); free(nl); free(res);
         return 1;
     }
@@ -1068,7 +1070,7 @@ static int cmd_lab_power(const char *csv_path, const char *sp_path,
     cert.lb_val = 0.0;
     cert.ub_val = spice_rmse_mv;
 
-    if (cert_path != NULL && ele_cert_write_json(cert_path, &cert) != 0) {
+    if (cert_path != NULL && ele_cert_write_auto(cert_path, &cert) != 0) {
         free(pb); free(nl); free(res);
         return 1;
     }
@@ -1368,7 +1370,7 @@ static int cmd_lab_csi(const char *csv_path, const char *s2p_path,
     snprintf(pres->cert.pillar, sizeof(pres->cert.pillar), "lab");
     snprintf(pres->cert.kind, sizeof(pres->cert.kind), "cardputer_rf_csi");
 
-    if (cert_path != NULL && ele_cert_write_json(cert_path, &pres->cert) != 0) {
+    if (cert_path != NULL && ele_cert_write_auto(cert_path, &pres->cert) != 0) {
         free(frames); free(snp); free(pres);
         return 1;
     }
@@ -1635,6 +1637,16 @@ int main(int argc, char **argv) {
         printf("cert-verify %s -> %s (rc=%d)\n", argv[2], (rc == 0) ? "PASS" : "FAIL", rc);
         return (rc == 0) ? 0 : 1;
     }
+    if (strcmp(argv[1], "cert-pack") == 0 && argc >= 4) {
+        int rc = ele_cert_pack_file(argv[2], argv[3]);
+        printf("cert-pack %s -> %s (%s, rc=%d)\n", argv[2], argv[3], (rc == 0) ? "OK" : "FAIL", rc);
+        return (rc == 0) ? 0 : 1;
+    }
+    if (strcmp(argv[1], "cert-unpack") == 0 && argc >= 4) {
+        int rc = ele_cert_unpack_file(argv[2], argv[3]);
+        printf("cert-unpack %s -> %s (%s, rc=%d)\n", argv[2], argv[3], (rc == 0) ? "OK" : "FAIL", rc);
+        return (rc == 0) ? 0 : 1;
+    }
 
     if (strcmp(argv[1], "em") == 0 && argc >= 3) {
         if (strcmp(argv[2], "passivity") == 0 && argc >= 4) {
@@ -1648,7 +1660,7 @@ int main(int argc, char **argv) {
             ele_snp_t snp;
             ele_em_passivity_res_t res;
             if (ele_snp_load(in_p, 0, &snp) != 0 || ele_em_certify_snp(&snp, &res) != 0) return 1;
-            if (cert_p != NULL && ele_cert_write_json(cert_p, &res.cert) != 0) return 1;
+            if (cert_p != NULL && ele_cert_write_auto(cert_p, &res.cert) != 0) return 1;
             if (lean_p != NULL && ele_cert_emit_lean(lean_p, mod_n, &res.cert) != 0) return 1;
             if (json_p != NULL) {
                 FILE *fp = fopen(json_p, "w");
@@ -1678,7 +1690,7 @@ int main(int argc, char **argv) {
             }
             ele_em_fdtd_res_t res;
             if (ele_em_fdtd_run(er, sig, nx, ny, nt, s2p_p, &res) != 0) return 1;
-            if (cert_p != NULL && ele_cert_write_json(cert_p, &res.passivity.cert) != 0) return 1;
+            if (cert_p != NULL && ele_cert_write_auto(cert_p, &res.passivity.cert) != 0) return 1;
             if (json_p != NULL) {
                 FILE *fp = fopen(json_p, "w");
                 if (fp != NULL) {
@@ -1701,7 +1713,7 @@ int main(int argc, char **argv) {
             ele_peec_spec_t ps;
             ele_em_peec_res_t res;
             if (ele_em_peec_load(in_p, &ps) != 0 || ele_em_peec_extract(&ps, s2p_p, &res) != 0) return 1;
-            if (cert_p != NULL && ele_cert_write_json(cert_p, &res.passivity.cert) != 0) return 1;
+            if (cert_p != NULL && ele_cert_write_auto(cert_p, &res.passivity.cert) != 0) return 1;
             if (json_p != NULL) {
                 FILE *fp = fopen(json_p, "w");
                 if (fp != NULL) {
@@ -1776,7 +1788,7 @@ int main(int argc, char **argv) {
                 return 1;
             }
             ele_em_bound_res_t *bres = &ex->base;
-            if (cert_p != NULL && ele_cert_write_json(cert_p, &bres->cert) != 0) { free(ex); return 1; }
+            if (cert_p != NULL && ele_cert_write_auto(cert_p, &bres->cert) != 0) { free(ex); return 1; }
             if (lean_p != NULL && ele_cert_emit_lean(lean_p, mod_n, &bres->cert) != 0) { free(ex); return 1; }
             if (json_p != NULL) {
                 FILE *fp = fopen(json_p, "w");
@@ -1836,7 +1848,7 @@ int main(int argc, char **argv) {
                 free(bf);
                 return 1;
             }
-            if (cert_p != NULL && ele_cert_write_json(cert_p, &bf->cert) != 0) { free(bf); return 1; }
+            if (cert_p != NULL && ele_cert_write_auto(cert_p, &bf->cert) != 0) { free(bf); return 1; }
             if (lean_p != NULL && ele_em_bode_fano_emit_lean(lean_p, mod_n, bf) != 0) { free(bf); return 1; }
             if (json_p != NULL) {
                 FILE *fp = fopen(json_p, "w");
@@ -1881,7 +1893,7 @@ int main(int argc, char **argv) {
                 free(kres);
                 return 1;
             }
-            if (cert_p != NULL && ele_cert_write_json(cert_p, &kres->cert) != 0) { free(kres); return 1; }
+            if (cert_p != NULL && ele_cert_write_auto(cert_p, &kres->cert) != 0) { free(kres); return 1; }
             if (lean_p != NULL && ele_cert_emit_lean(lean_p, mod_n, &kres->cert) != 0) { free(kres); return 1; }
             if (json_p != NULL) {
                 FILE *fp = fopen(json_p, "w");
@@ -1924,7 +1936,7 @@ int main(int argc, char **argv) {
                 free(sim);
                 return 1;
             }
-            if (cert_p != NULL && ele_cert_write_json(cert_p, &sim->cert) != 0) { free(sim); return 1; }
+            if (cert_p != NULL && ele_cert_write_auto(cert_p, &sim->cert) != 0) { free(sim); return 1; }
             if (json_p != NULL) {
                 FILE *fp = fopen(json_p, "w");
                 if (fp != NULL) {
@@ -1968,7 +1980,7 @@ int main(int argc, char **argv) {
             ele_ckt_netlist_t nl;
             ele_ckt_run_res_t res;
             if (ele_ckt_load(in_p, &nl) != 0 || ele_ckt_run_all(&nl, corners, &res) != 0) return 1;
-            if (cert_p != NULL && ele_cert_write_json(cert_p, &res.cert) != 0) return 1;
+            if (cert_p != NULL && ele_cert_write_auto(cert_p, &res.cert) != 0) return 1;
             if (lean_p != NULL && ele_cert_emit_lean(lean_p, mod_n, &res.cert) != 0) return 1;
             if (json_p != NULL) {
                 FILE *fp = fopen(json_p, "w");
@@ -1994,7 +2006,7 @@ int main(int argc, char **argv) {
             ele_ckt_netlist_t nl;
             ele_ckt_eye_res_t res;
             if (ele_ckt_load(in_p, &nl) != 0 || ele_ckt_si_eye(&nl, rate, &res) != 0) return 1;
-            if (cert_p != NULL && ele_cert_write_json(cert_p, &res.cert) != 0) return 1;
+            if (cert_p != NULL && ele_cert_write_auto(cert_p, &res.cert) != 0) return 1;
             if (json_p != NULL) {
                 FILE *fp = fopen(json_p, "w");
                 if (fp != NULL) {
@@ -2028,7 +2040,7 @@ int main(int argc, char **argv) {
         memset(&sw, 0, sizeof(sw));
         if (ele_motor_load(in_p, &ms) != 0 || ele_motor_solve_op(&ms, rpm, tq, &op) != 0) return 1;
         if (do_sweep && ele_motor_sweep_and_foc(&ms, tq, &sw) != 0) return 1;
-        if (cert_p != NULL && ele_cert_write_json(cert_p, &op.cert) != 0) return 1;
+        if (cert_p != NULL && ele_cert_write_auto(cert_p, &op.cert) != 0) return 1;
         if (lean_p != NULL && ele_cert_emit_lean(lean_p, mod_n, &op.cert) != 0) return 1;
         if (json_p != NULL) {
             FILE *fp = fopen(json_p, "w");
@@ -2082,7 +2094,7 @@ int main(int argc, char **argv) {
             ele_grid_t g;
             ele_grid_opf_res_t opf;
             if (ele_grid_load(in_p, &g) != 0 || ele_grid_acopf(&g, &opf) != 0) return 1;
-            if (cert_p != NULL && ele_cert_write_json(cert_p, &opf.cert) != 0) return 1;
+            if (cert_p != NULL && ele_cert_write_auto(cert_p, &opf.cert) != 0) return 1;
             if (lean_p != NULL && ele_cert_emit_lean(lean_p, mod_n, &opf.cert) != 0) return 1;
             if (json_p != NULL) {
                 FILE *fp = fopen(json_p, "w");
@@ -2211,7 +2223,7 @@ int main(int argc, char **argv) {
                 free(g); free(ores);
                 return 1;
             }
-            if (cert_p != NULL && ele_cert_write_json(cert_p, &ores->cert) != 0) { free(g); free(ores); return 1; }
+            if (cert_p != NULL && ele_cert_write_auto(cert_p, &ores->cert) != 0) { free(g); free(ores); return 1; }
             if (json_p != NULL) {
                 FILE *fp = fopen(json_p, "w");
                 if (fp != NULL) {
@@ -2248,7 +2260,7 @@ int main(int argc, char **argv) {
             ele_grid_t g;
             ele_grid_emt_res_t emt;
             if (ele_grid_load(in_p, &g) != 0 || ele_grid_emt(&g, fault_bus, tc, trip_br, &emt) != 0) return 1;
-            if (cert_p != NULL && ele_cert_write_json(cert_p, &emt.cert) != 0) return 1;
+            if (cert_p != NULL && ele_cert_write_auto(cert_p, &emt.cert) != 0) return 1;
             if (lean_p != NULL && ele_cert_emit_lean(lean_p, mod_n, &emt.cert) != 0) return 1;
             if (json_p != NULL) {
                 FILE *fp = fopen(json_p, "w");

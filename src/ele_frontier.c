@@ -1998,7 +1998,15 @@ int ele_grid_acopf_chordal(const ele_grid_t *g, const char *cert_out_path,
     const char *status_str = certified ? "CERTIFIED" : "VETOED";
 
     if (cert_out_path != NULL) {
-        FILE *cf = fopen(cert_out_path, "w");
+        size_t clen = strlen(cert_out_path);
+        int want_bin = (clen >= 4U && strcmp(cert_out_path + clen - 4U, ".bin") == 0);
+        char tmp_json[576] = {0};
+        const char *json_target = cert_out_path;
+        if (want_bin) {
+            snprintf(tmp_json, sizeof(tmp_json), "%s.tmp_json", cert_out_path);
+            json_target = tmp_json;
+        }
+        FILE *cf = fopen(json_target, "w");
         if (cf == NULL) {
             free(S_all_int); free(L_all_int); free(mu_cl); free(w_cl_int); free(A_int_edge);
             free(ev_buf); free(vec_buf); free(best_Z);
@@ -2084,6 +2092,13 @@ int ele_grid_acopf_chordal(const ele_grid_t *g, const char *cert_out_path,
         fprintf(cf, "  ]\n");
         fprintf(cf, "}\n");
         fclose(cf);
+        if (want_bin) {
+            if (ele_cert_pack_file(tmp_json, cert_out_path) != 0) {
+                remove(tmp_json);
+                return -1;
+            }
+            remove(tmp_json);
+        }
     }
 
     out->converged = feas_best ? 1 : 0;
@@ -2555,7 +2570,7 @@ static void sos2_fill_fallback(const ele_grid_t *g, const ele_grid_opf_res_t *sh
     out->cert.ub_int = shor1->cert.c_ub_int;
     out->cert.limit_hi_int = shor1->cert.c_ub_int;
     if (cert_out_path != NULL) {
-        (void)ele_cert_write_json(cert_out_path, &out->cert);
+        (void)ele_cert_write_auto(cert_out_path, &out->cert);
     }
 }
 
@@ -3526,10 +3541,18 @@ int ele_grid_acopf_sos2_cert(const ele_grid_t *g, const char *cert_out_path,
             out->cert.psd.ok = 1;
             memcpy(out->cert.psd.A, best_Q_all, (size_t)d_even * (size_t)d_even * sizeof(int64_t));
             memcpy(out->cert.psd.L, best_L_all, (size_t)d_even * (size_t)d_even * sizeof(int64_t));
-            if (cert_out_path != NULL) (void)ele_cert_write_json(cert_out_path, &out->cert);
+            if (cert_out_path != NULL) (void)ele_cert_write_auto(cert_out_path, &out->cert);
         } else if (cert_out_path != NULL) {
+            size_t clen = strlen(cert_out_path);
+            int want_bin = (clen >= 4U && strcmp(cert_out_path + clen - 4U, ".bin") == 0);
+            char tmp_json[576] = {0};
+            const char *json_target = cert_out_path;
+            if (want_bin) {
+                snprintf(tmp_json, sizeof(tmp_json), "%s.tmp_json", cert_out_path);
+                json_target = tmp_json;
+            }
             ele_f_i128 *A_sum = (ele_f_i128 *)calloc((size_t)d_even * (size_t)d_even, sizeof(ele_f_i128));
-            FILE *cf = fopen(cert_out_path, "w");
+            FILE *cf = fopen(json_target, "w");
             if (A_sum != NULL && cf != NULL) {
                 int max_dk = 0;
                 for (int c = 0; c < n_cl; ++c) {
@@ -3614,6 +3637,14 @@ int ele_grid_acopf_sos2_cert(const ele_grid_t *g, const char *cert_out_path,
                 fprintf(cf, "  ]\n}\n");
             }
             if (cf != NULL) fclose(cf);
+            if (want_bin) {
+                if (ele_cert_pack_file(tmp_json, cert_out_path) != 0) {
+                    remove(tmp_json);
+                    free(A_sum);
+                    return -1;
+                }
+                remove(tmp_json);
+            }
             free(A_sum);
         }
     } else {

@@ -35,7 +35,8 @@ def test_cli_subcommands(cli_path, tmpdir):
     v = run_cmd([cli_path, "--version"])
     assert "ELE 11.0.0" in v.stdout
     h = run_cmd([cli_path, "--help"])
-    for tok in ("field-to-circuit", "cert-verify", "chordal", "sos2", "observable",
+    for tok in ("field-to-circuit", "cert-verify", "cert-pack", "cert-unpack",
+                "chordal", "sos2", "observable",
                 "enforce-passivity", "bode-fano", "kyp-sim", "validate-power", "atlas"):
         assert tok in h.stdout, f"Missing '{tok}' in --help"
 
@@ -336,6 +337,75 @@ def test_tamper_rejection(cli_path, cert_dir, tmpdir):
     run_expect_fail([cli_path, "cert-verify", c12], "inflate lab power ub_int > limit_hi_int")
 
 
+def test_binary_wire(cli_path, cert_dir, tmpdir):
+    """Test canonical ELEC .elecert.bin pack/verify/unpack roundtrip and trailer tamper rejection."""
+    eng = EleEngine(cli_path=cli_path)
+    # Generate representative certs if cert_dir wasn't pre-populated
+    samples = []
+    for name, gen_cmd in [
+        ("em_microstrip.elecert.json", [cli_path, "em", "passivity", "benchmarks/em/microstrip_50ohm.s2p", "--cert"]),
+        ("em_bode_fano.elecert.json", [cli_path, "em", "bode-fano", "--cert"]),
+        ("em_kyp_3port.elecert.json", [cli_path, "em", "enforce-passivity", "benchmarks/em/nonpassive_wilkinson_3port.s3p", "--cert"]),
+        ("motor_ipmsm.elecert.json", [cli_path, "motor", "run", "benchmarks/ee/ev_ipmsm_150kw.motor", "--cert"]),
+        ("grid_ieee3_opf.elecert.json", [cli_path, "grid", "opf", "benchmarks/ee/ieee3_test.grid", "--cert"]),
+        ("grid_ieee9_emt.elecert.json", [cli_path, "grid", "emt", "benchmarks/ee/ieee9_wscc.grid", "--fault-bus", "7", "--t-clear", "0.12", "--cert"]),
+        ("chordal_case5_pjm.elecert.json", [cli_path, "grid", "chordal", "benchmarks/ee/pglib/pglib_opf_case5_pjm.m", "--cert"]),
+        ("sos2_case5_pjm.elecert.json", [cli_path, "grid", "sos2", "benchmarks/ee/pglib/pglib_opf_case5_pjm.m", "--cert"]),
+    ]:
+        p = os.path.join(cert_dir, name)
+        if not os.path.exists(p):
+            p = os.path.join(tmpdir, "src_" + name)
+            run_cmd(gen_cmd + [p])
+        samples.append((name, p))
+
+    # Include nonpassive veto cert if present
+    veto_p = os.path.join(cert_dir, "em_nonpassive_veto.elecert.json")
+    if os.path.exists(veto_p):
+        samples.append(("em_nonpassive_veto.elecert.json", veto_p))
+
+    for name, jpath in samples:
+        bpath = os.path.join(tmpdir, name + ".bin")
+        upath = os.path.join(tmpdir, name + ".unpacked.json")
+        bpath2 = os.path.join(tmpdir, name + ".2.bin")
+        eng.cert_pack(jpath, bpath)
+        with open(bpath, "rb") as bf:
+            raw_bin = bf.read()
+        assert raw_bin[:4] == b"ELEC", f"Missing ELEC magic on {bpath}"
+        assert eng.cert_verify(bpath)
+        eng.cert_unpack(bpath, upath)
+        assert eng.cert_verify(upath)
+
+        # Deterministic canonical round-trip: re-packing unpacked JSON gives identical bytes
+        eng.cert_pack(upath, bpath2)
+        with open(bpath2, "rb") as bf2:
+            assert bf2.read() == raw_bin, f"Non-canonical ELEC roundtrip on {name}"
+
+        # Lossless semantic equality between original JSON and unpacked JSON
+        with open(jpath) as f1, open(upath) as f2:
+            d1, d2 = json.load(f1), json.load(f2)
+        assert d1 == d2, f"Lossy JSON roundtrip on {name}"
+
+    # Direct --cert *.elecert.bin emission + Lean emission from .bin
+    direct_bin = os.path.join(tmpdir, "direct_chordal.elecert.bin")
+    direct_lean = os.path.join(tmpdir, "DirectChordal.lean")
+    run_cmd([cli_path, "grid", "chordal", "benchmarks/ee/wb2.grid",
+             "--cert", direct_bin, "--emit-lean", direct_lean, "--name", "DirectChordal"])
+    assert eng.cert_verify(direct_bin)
+    assert os.path.getsize(direct_lean) > 100
+
+    # Tamper rejection on ELEC binary: flip body byte, SHA-256 trailer byte, FNV trailer byte, magic
+    ref_bin = os.path.join(tmpdir, "em_microstrip.elecert.json.bin")
+    with open(ref_bin, "rb") as bf:
+        orig = bytearray(bf.read())
+    for label, idx in [("magic", 0), ("body", 16), ("sha256_trailer", len(orig) - 20), ("fnv_trailer", len(orig) - 1)]:
+        bad = bytearray(orig)
+        bad[idx] ^= 0x01
+        bad_p = os.path.join(tmpdir, f"bad_{label}.elecert.bin")
+        with open(bad_p, "wb") as bf:
+            bf.write(bad)
+        run_expect_fail([cli_path, "cert-verify", bad_p], f"ELEC binary tamper {label}")
+
+
 def main():
     ap = argparse.ArgumentParser(description="ELE v11.0.0 CLI & SDK Tests")
     ap.add_argument("--cli", default="build/ele_cli")
@@ -346,8 +416,9 @@ def main():
         test_cli_subcommands(args.cli, tmpdir)
         test_sdk(args.cli, tmpdir)
         test_tamper_rejection(args.cli, args.cert_dir, tmpdir)
+        test_binary_wire(args.cli, args.cert_dir, tmpdir)
 
-    print("  [TEST_TOOLS PASS] CLI subcommands + EleEngine/EleFastSession SDK + 12/12 Tamper-Rejection checks")
+    print("  [TEST_TOOLS PASS] CLI subcommands + EleEngine/EleFastSession SDK + 12/12 Tamper-Rejection + ELEC Binary Wire checks")
 
 
 if __name__ == "__main__":

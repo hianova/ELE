@@ -262,6 +262,14 @@ class EleEngine:
         self._run(["cert-verify", cert_path])
         return True
 
+    def cert_pack(self, json_in_path, bin_out_path):
+        self._run(["cert-pack", json_in_path, bin_out_path])
+        return True
+
+    def cert_unpack(self, bin_in_path, json_out_path):
+        self._run(["cert-unpack", bin_in_path, json_out_path])
+        return True
+
     def lab_validate_thermal(self, csv_path, sp_path=None, cert_path=None):
         with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as tf:
             jp = tf.name

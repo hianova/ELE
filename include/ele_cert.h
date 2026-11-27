@@ -9,10 +9,12 @@
 extern "C" {
 #endif
 
-#define ELE_VERSION_STRING "11.0.0"
-#define ELE_CERT_MAX_DIM   64
-#define ELE_CERT_MAX_PORTS 8
-#define ELE_CERT_PATH_MAX  512
+#define ELE_VERSION_STRING    "11.0.0"
+#define ELE_CERT_MAX_DIM      64
+#define ELE_CERT_MAX_PORTS    8
+#define ELE_CERT_PATH_MAX     512
+#define ELE_CERT_WIRE_MAGIC   0x43454C45U /* "ELEC" little-endian */
+#define ELE_CERT_WIRE_VERSION 1U
 
 typedef struct {
     int dim;
@@ -107,8 +109,12 @@ int ele_cert_cholesky_sdd_i64(int n, const int64_t *A_sym,
 int ele_verify_cholesky_sdd_i64(int n, const int64_t *A_sym,
                                 const int64_t *L_tri, int64_t mu_psd);
 
-/* Canonical .elecert.json writer & independent integer verifier */
+/* Canonical .elecert.json / "ELEC" .elecert.bin writers, packers & verifier */
 int ele_cert_write_json(const char *out_path, const ele_cert_record_t *rec);
+int ele_cert_write_bin(const char *out_path, const ele_cert_record_t *rec);
+int ele_cert_write_auto(const char *out_path, const ele_cert_record_t *rec);
+int ele_cert_pack_file(const char *json_in_path, const char *bin_out_path);
+int ele_cert_unpack_file(const char *bin_in_path, const char *json_out_path);
 int ele_cert_verify_file(const char *cert_path, int verify_input_hash);
 
 /* Standalone Lean 4 module emitters (import EleCert; 0 sorry, 0 native_decide) */
